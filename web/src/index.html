@@ -112,6 +112,190 @@
     cursor: pointer;
   }
 
+  .settings-btn {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 0.15s ease;
+  }
+
+  .settings-btn:hover {
+    border-color: var(--accent);
+  }
+
+  .settings-btn .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+
+  .settings-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 40;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  .settings-overlay.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .settings-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100vh;
+    width: min(380px, 92vw);
+    background: var(--panel-2);
+    border-left: 1px solid var(--border);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+    padding: 20px;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+    transform: translateX(100%);
+    transition: transform 0.2s ease;
+  }
+
+  .settings-panel.open {
+    transform: translateX(0);
+  }
+
+  .settings-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .settings-panel-header h2 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  button#settings-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 6px;
+  }
+
+  button#settings-close:hover {
+    color: var(--text);
+    background: var(--panel);
+  }
+
+  .settings-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .settings-field label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .settings-field textarea,
+  .settings-field input,
+  .settings-field select {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  .settings-field select {
+    cursor: pointer;
+  }
+
+  .settings-field textarea#setting-json-schema {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+
+  .settings-field textarea:focus,
+  .settings-field input:focus,
+  .settings-field select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .settings-field.invalid textarea {
+    border-color: var(--error);
+  }
+
+  .settings-field .field-hint {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .settings-field .field-error {
+    font-size: 11px;
+    color: var(--error);
+  }
+
+  .settings-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .settings-actions {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .settings-actions p {
+    margin: 0;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  button#settings-reset {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  button#settings-reset:hover {
+    border-color: var(--accent);
+  }
+
   main {
     flex: 1;
     overflow-y: auto;
@@ -317,16 +501,76 @@
     </div>
   </div>
   <div class="header-controls">
+    <button type="button" class="settings-btn" id="settings-btn">
+      ⚙ Настройки ответа
+      <span class="dot" id="settings-indicator" hidden></span>
+    </button>
+    <button type="button" class="settings-btn" id="new-session-btn" title="Очистить историю разговора. Сохранённые настройки не затрагиваются.">
+      ↻ Новая сессия
+    </button>
     <label class="debug-check">
       <input type="checkbox" id="debug-toggle">
       Показывать JSON запроса и ответа
     </label>
     <div class="session-stats">
       <span>Запросов: <b id="stat-requests">0</b></span>
-      <span>Токены за сессию: <b id="stat-tokens">0</b></span>
+      <span>Входящие ток.: <b id="stat-tokens-in">0</b></span>
+      <span>Исходящие ток.: <b id="stat-tokens-out">0</b></span>
     </div>
   </div>
 </header>
+
+<div class="settings-overlay" id="settings-overlay"></div>
+<div class="settings-panel" id="settings-panel">
+  <div class="settings-panel-header">
+    <h2>Настройки ответа</h2>
+    <button type="button" id="settings-close" aria-label="Закрыть">✕</button>
+  </div>
+
+  <div class="settings-field" id="json-schema-field">
+    <label for="setting-json-schema">JSON Schema ответа (response_format)</label>
+    <textarea id="setting-json-schema" rows="7" placeholder='{&#10;  "type": "object",&#10;  "properties": {&#10;    "answer": { "type": "string" }&#10;  },&#10;  "required": ["answer"]&#10;}'></textarea>
+    <span class="field-hint">Если задано — модель обязана ответить JSON-объектом по этой схеме.</span>
+    <span class="field-error" id="json-schema-error" hidden></span>
+  </div>
+
+  <div class="settings-field">
+    <label for="setting-max-tokens">Максимальная длина ответа (в токенах)</label>
+    <input type="number" id="setting-max-tokens" min="1" step="1" placeholder="без ограничения">
+  </div>
+
+  <div class="settings-field">
+    <label for="setting-stop">Стоп-последовательности (через запятую)</label>
+    <input type="text" id="setting-stop" placeholder="например: ###, КОНЕЦ">
+    <span class="field-hint">Генерация обрывается, как только модель выдаст одну из них.</span>
+  </div>
+
+  <div class="settings-row">
+    <div class="settings-field">
+      <label for="setting-temperature">Temperature</label>
+      <input type="number" id="setting-temperature" min="0" max="2" step="0.1" placeholder="по умолчанию">
+    </div>
+    <div class="settings-field">
+      <label for="setting-top-p">Top P</label>
+      <input type="number" id="setting-top-p" min="0" max="1" step="0.05" placeholder="по умолчанию">
+    </div>
+  </div>
+
+  <div class="settings-field">
+    <label for="setting-reasoning">Reasoning (режим рассуждений)</label>
+    <select id="setting-reasoning">
+      <option value="">Как у модели по умолчанию</option>
+      <option value="on">Включить</option>
+      <option value="off">Выключить</option>
+    </select>
+    <span class="field-hint">Работает у моделей с поддержкой thinking-режима (Qwen3, DeepSeek, GLM и т.п.). У остальных может не иметь эффекта.</span>
+  </div>
+
+  <div class="settings-actions">
+    <p>Всё необязательно — можно просто общаться в чате, ничего здесь не заполняя.</p>
+    <button type="button" id="settings-reset">Сбросить настройки ответа</button>
+  </div>
+</div>
 
 <main id="chat">
   <div class="empty-state" id="empty-state">
@@ -349,12 +593,136 @@ const emptyState = document.getElementById('empty-state');
 const promptEl = document.getElementById('prompt');
 const sendBtn = document.getElementById('send');
 const statRequests = document.getElementById('stat-requests');
-const statTokens = document.getElementById('stat-tokens');
+const statTokensIn = document.getElementById('stat-tokens-in');
+const statTokensOut = document.getElementById('stat-tokens-out');
 const debugToggle = document.getElementById('debug-toggle');
+const settingsBtn = document.getElementById('settings-btn');
+const settingsClose = document.getElementById('settings-close');
+const settingsOverlay = document.getElementById('settings-overlay');
+const settingsPanel = document.getElementById('settings-panel');
+const settingsIndicator = document.getElementById('settings-indicator');
+const jsonSchemaField = document.getElementById('json-schema-field');
+const jsonSchemaEl = document.getElementById('setting-json-schema');
+const jsonSchemaError = document.getElementById('json-schema-error');
+const maxTokensEl = document.getElementById('setting-max-tokens');
+const stopEl = document.getElementById('setting-stop');
+const temperatureEl = document.getElementById('setting-temperature');
+const topPEl = document.getElementById('setting-top-p');
+const reasoningEl = document.getElementById('setting-reasoning');
+const settingsResetBtn = document.getElementById('settings-reset');
+const newSessionBtn = document.getElementById('new-session-btn');
 
 let sessionRequests = 0;
-let sessionTokens = 0;
+let sessionTokensIn = 0;
+let sessionTokensOut = 0;
 let sending = false;
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem('challenger-settings');
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    jsonSchemaEl.value = s.jsonSchema || '';
+    maxTokensEl.value = s.maxTokens || '';
+    stopEl.value = s.stop || '';
+    temperatureEl.value = s.temperature || '';
+    topPEl.value = s.topP || '';
+    reasoningEl.value = s.reasoning || '';
+  } catch (e) { /* localStorage недоступен или битые данные — используем пустые поля */ }
+}
+
+// Возвращает распарсенную схему, null если поле пустое, или undefined при ошибке разбора JSON.
+function parseJsonSchema() {
+  const raw = jsonSchemaEl.value.trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return undefined;
+  }
+}
+
+function validateJsonSchema() {
+  const raw = jsonSchemaEl.value.trim();
+  if (!raw) {
+    jsonSchemaField.classList.remove('invalid');
+    jsonSchemaError.hidden = true;
+    return true;
+  }
+  const parsed = parseJsonSchema();
+  const valid = parsed !== undefined;
+  jsonSchemaField.classList.toggle('invalid', !valid);
+  jsonSchemaError.hidden = valid;
+  jsonSchemaError.textContent = valid ? '' : 'Это не валидный JSON — проверьте синтаксис схемы.';
+  return valid;
+}
+
+function updateSettingsIndicator() {
+  const active = jsonSchemaEl.value.trim() || maxTokensEl.value.trim() || stopEl.value.trim()
+    || temperatureEl.value.trim() || topPEl.value.trim() || reasoningEl.value;
+  settingsIndicator.hidden = !active;
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem('challenger-settings', JSON.stringify({
+      jsonSchema: jsonSchemaEl.value,
+      maxTokens: maxTokensEl.value,
+      stop: stopEl.value,
+      temperature: temperatureEl.value,
+      topP: topPEl.value,
+      reasoning: reasoningEl.value,
+    }));
+  } catch (e) { /* игнорируем — настройки просто не сохранятся между визитами */ }
+  updateSettingsIndicator();
+}
+
+jsonSchemaEl.addEventListener('input', () => {
+  validateJsonSchema();
+  saveSettings();
+});
+[maxTokensEl, stopEl, temperatureEl, topPEl].forEach((el) => {
+  el.addEventListener('input', saveSettings);
+});
+reasoningEl.addEventListener('change', saveSettings);
+
+function openSettings() {
+  settingsPanel.classList.add('open');
+  settingsOverlay.classList.add('open');
+}
+
+function closeSettings() {
+  settingsPanel.classList.remove('open');
+  settingsOverlay.classList.remove('open');
+}
+
+settingsBtn.addEventListener('click', () => {
+  if (settingsPanel.classList.contains('open')) {
+    closeSettings();
+  } else {
+    openSettings();
+  }
+});
+settingsClose.addEventListener('click', closeSettings);
+settingsOverlay.addEventListener('click', closeSettings);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && settingsPanel.classList.contains('open')) {
+    closeSettings();
+  }
+});
+
+settingsResetBtn.addEventListener('click', () => {
+  [jsonSchemaEl, maxTokensEl, stopEl, temperatureEl, topPEl].forEach((el) => {
+    el.value = '';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  reasoningEl.value = '';
+  reasoningEl.dispatchEvent(new Event('change', { bubbles: true }));
+});
+
+loadSettings();
+validateJsonSchema();
+updateSettingsIndicator();
 
 try {
   debugToggle.checked = localStorage.getItem('challenger-show-debug') === '1';
@@ -375,6 +743,24 @@ debugToggle.addEventListener('change', () => {
 function scrollToBottom() {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
+
+// Новая сессия: очищает только историю разговора и счётчики этой вкладки.
+// Сохранённые настройки (challenger-settings, challenger-show-debug) не трогаем —
+// они живут в localStorage независимо и должны пережить сброс диалога.
+function startNewSession() {
+  if (sending) return;
+  chatEl.innerHTML = '';
+  chatEl.appendChild(emptyState);
+  sessionRequests = 0;
+  sessionTokensIn = 0;
+  sessionTokensOut = 0;
+  statRequests.textContent = sessionRequests;
+  statTokensIn.textContent = sessionTokensIn;
+  statTokensOut.textContent = sessionTokensOut;
+  promptEl.focus();
+}
+
+newSessionBtn.addEventListener('click', startNewSession);
 
 function addRow(role, text) {
   emptyState.remove();
@@ -456,6 +842,12 @@ async function send() {
   const prompt = promptEl.value.trim();
   if (!prompt || sending) return;
 
+  if (!validateJsonSchema()) {
+    openSettings();
+    jsonSchemaEl.focus();
+    return;
+  }
+
   sending = true;
   sendBtn.disabled = true;
   promptEl.value = '';
@@ -465,10 +857,26 @@ async function send() {
   addTyping();
 
   try {
+    const maxTokensRaw = maxTokensEl.value.trim();
+    const maxTokens = maxTokensRaw ? parseInt(maxTokensRaw, 10) : null;
+    const stopList = stopEl.value.split(',').map((s) => s.trim()).filter(Boolean);
+    const temperature = temperatureEl.value.trim() ? parseFloat(temperatureEl.value) : null;
+    const topP = topPEl.value.trim() ? parseFloat(topPEl.value) : null;
+    const jsonSchema = parseJsonSchema() || null;
+    const reasoning = reasoningEl.value === 'on' ? true : reasoningEl.value === 'off' ? false : null;
+
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({
+        prompt,
+        json_schema: jsonSchema,
+        max_tokens: Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null,
+        stop: stopList,
+        reasoning,
+        temperature: Number.isFinite(temperature) ? temperature : null,
+        top_p: Number.isFinite(topP) ? topP : null,
+      }),
     });
     const data = await res.json();
     removeTyping();
@@ -485,11 +893,17 @@ async function send() {
       scrollToBottom();
 
       sessionRequests += 1;
-      if (data.usage && typeof data.usage.total_tokens === 'number') {
-        sessionTokens += data.usage.total_tokens;
+      if (data.usage) {
+        if (typeof data.usage.prompt_tokens === 'number') {
+          sessionTokensIn += data.usage.prompt_tokens;
+        }
+        if (typeof data.usage.completion_tokens === 'number') {
+          sessionTokensOut += data.usage.completion_tokens;
+        }
       }
       statRequests.textContent = sessionRequests;
-      statTokens.textContent = sessionTokens;
+      statTokensIn.textContent = sessionTokensIn;
+      statTokensOut.textContent = sessionTokensOut;
     }
   } catch (e) {
     removeTyping();

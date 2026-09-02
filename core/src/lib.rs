@@ -28,6 +28,41 @@ impl ChatMessage {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    stop: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<&'a serde_json::Value>,
+    /// Включает/выключает режим рассуждений ("thinking") у гибридных моделей
+    /// (Qwen3, DeepSeek, GLM и т.п.), которые поддерживают это поле в OpenAI-совместимом API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+}
+
+/// Необязательные настройки генерации ответа. Пустые/`None` значения означают отсутствие
+/// ограничения — поведение по умолчанию соответствует обычному общению без надстроек.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    /// Максимальная длина ответа в токенах.
+    pub max_tokens: Option<u32>,
+    /// Стоп-последовательности, после которых генерация обрывается.
+    pub stop: Vec<String>,
+    /// Температура сэмплирования (обычно 0.0–2.0): выше — разнообразнее и менее предсказуемо.
+    pub temperature: Option<f32>,
+    /// Nucleus sampling (обычно 0.0–1.0): доля вероятностной массы токенов-кандидатов.
+    pub top_p: Option<f32>,
+    /// Значение поля `response_format` для OpenAI-совместимого API (например,
+    /// `{"type":"json_schema","json_schema":{...}}`), заставляющее модель отвечать
+    /// в заданном JSON-формате.
+    pub response_format: Option<serde_json::Value>,
+    /// Явно включить (`Some(true)`) или выключить (`Some(false)`) режим рассуждений.
+    /// `None` — не переопределять, поведение модели по умолчанию.
+    pub reasoning: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +136,28 @@ impl LlmClient {
 
     /// Отправляет список сообщений в LLM и возвращает текст ответа вместе с расходом токенов.
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatCompletion> {
+        self.chat_with_options(messages, &ChatOptions::default()).await
+    }
+
+    /// То же самое, что [`LlmClient::chat`], но с настройками генерации: максимальная длина
+    /// ответа, стоп-последовательности, температура, top_p, формат ответа (`response_format`)
+    /// и включение/выключение режима рассуждений (`enable_thinking`).
+    pub async fn chat_with_options(
+        &self,
+        messages: &[ChatMessage],
+        options: &ChatOptions,
+    ) -> Result<ChatCompletion> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = ChatRequest { model: &self.model, messages };
+        let body = ChatRequest {
+            model: &self.model,
+            messages,
+            max_tokens: options.max_tokens,
+            stop: &options.stop,
+            temperature: options.temperature,
+            top_p: options.top_p,
+            response_format: options.response_format.as_ref(),
+            enable_thinking: options.reasoning,
+        };
         let request_json =
             serde_json::to_string_pretty(&body).context("не удалось сериализовать запрос")?;
 
