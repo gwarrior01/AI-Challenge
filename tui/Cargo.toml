@@ -1,0 +1,13 @@
+[package]
+name = "llm-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm-core = { path = "../core" }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures-util = "0.3"
+textwrap = "0.16"
+anyhow = "1"

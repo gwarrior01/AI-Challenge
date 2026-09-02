@@ -1,0 +1,13 @@
+[package]
+name = "llm-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "llm-cli"
+path = "src/main.rs"
+
+[dependencies]
+llm-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"

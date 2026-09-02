@@ -1,0 +1,12 @@
+[package]
+name = "llm-web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm-core = { path = "../core" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
