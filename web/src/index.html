@@ -534,7 +534,8 @@
     display: none;
   }
 
-  #view-challenge {
+  #view-challenge,
+  #view-temperature {
     overflow-y: auto;
     padding: 24px;
     gap: 20px;
@@ -900,6 +901,140 @@
 
   /* KaTeX по умолчанию рисует формулы чёрным текстом — подгоняем под тёмную тему. */
   .challenge-answer .katex { color: var(--text); font-size: 1.05em; }
+
+  /* ---------- Вкладка "Температура" ---------- */
+
+  .temp-intro {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .temp-intro label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .temp-intro textarea {
+    background: var(--challenge-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  .temp-intro textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .temp-controls {
+    display: flex;
+    align-items: flex-end;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .temp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .temp-field label {
+    font-size: 11px;
+  }
+
+  .temp-field input {
+    background: var(--challenge-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 13.5px;
+    font-family: inherit;
+    width: 130px;
+  }
+
+  .temp-field input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  button#temp-run {
+    border: none;
+    border-radius: 10px;
+    padding: 10px 20px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: white;
+  }
+
+  button#temp-run:hover { opacity: 0.92; }
+
+  button#temp-new-session {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    background: var(--panel-2);
+    color: var(--text);
+  }
+
+  button#temp-new-session:hover { border-color: var(--accent); }
+
+  .temp-progress {
+    font-size: 12px;
+    color: var(--muted);
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .temp-results {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-width: 1000px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .temp-result {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+
+  .temp-result-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .temp-result-index {
+    font-weight: 600;
+    color: var(--text);
+  }
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
@@ -937,6 +1072,7 @@
 <nav class="tabs">
   <button type="button" class="tab-btn active" id="tab-chat" data-view="view-chat">Чат</button>
   <button type="button" class="tab-btn" id="tab-challenge" data-view="view-challenge">Задача · 4 способа</button>
+  <button type="button" class="tab-btn" id="tab-temperature" data-view="view-temperature">Температура</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -1034,6 +1170,27 @@
     <div class="challenge-status" data-role="status" id="challenge-analysis-status"></div>
     <div class="challenge-answer" id="challenge-analysis-answer"></div>
   </div>
+</div>
+
+<div class="view" id="view-temperature" hidden>
+  <div class="temp-intro">
+    <label for="temp-prompt">Запрос к модели</label>
+    <textarea id="temp-prompt" rows="4" placeholder="Например: Назови случайное число от 1 до 100"></textarea>
+    <div class="temp-controls">
+      <div class="temp-field">
+        <label for="temp-value">Temperature</label>
+        <input type="number" id="temp-value" min="0" max="2" step="0.1" value="1">
+      </div>
+      <div class="temp-field">
+        <label for="temp-count">Количество запросов</label>
+        <input type="number" id="temp-count" min="1" max="100" step="1" value="20">
+      </div>
+      <button type="button" id="temp-run">Отправить N раз</button>
+      <button type="button" id="temp-new-session" title="Очистить вопрос и все ответы, начать заново">↻ Новая сессия</button>
+    </div>
+    <div class="temp-progress" id="temp-progress" hidden></div>
+  </div>
+  <div class="temp-results" id="temp-results"></div>
 </div>
 
 <script>
@@ -1909,6 +2066,131 @@ challengeTaskEl.addEventListener('keydown', (e) => {
     runChallenge();
   }
 });
+
+/* ---------- Вкладка "Температура" ---------- */
+/* Один и тот же запрос отправляется N раз подряд с заданной temperature —
+   удобно, чтобы наглядно увидеть, насколько сильно она влияет на разброс
+   ответов модели. Запросы идут строго по очереди (не параллельно) — так же,
+   как и для вкладки "Задача · 4 способа", это надёжнее для локальных LLM-
+   серверов с одним слотом инференса, которые иначе делят контекстное окно
+   между одновременными запросами. */
+
+const tempPromptEl = document.getElementById('temp-prompt');
+const tempValueEl = document.getElementById('temp-value');
+const tempCountEl = document.getElementById('temp-count');
+const tempRunBtn = document.getElementById('temp-run');
+const tempNewSessionBtn = document.getElementById('temp-new-session');
+const tempProgressEl = document.getElementById('temp-progress');
+const tempResultsEl = document.getElementById('temp-results');
+
+let tempRunning = false;
+let tempAbortController = null;
+
+async function askLlmWithTemperature(prompt, temperature, signal) {
+  const res = await fetch('/api/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, temperature }),
+    signal,
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(data.error || res.statusText);
+  }
+  return { answer: data.answer, usage: data.usage };
+}
+
+function addTempResultCard(index) {
+  const card = document.createElement('div');
+  card.className = 'temp-result';
+  card.innerHTML = `
+    <div class="temp-result-head">
+      <span class="temp-result-index">#${index}</span>
+      <span data-role="meta"></span>
+    </div>
+    <div class="challenge-answer" data-role="answer"></div>
+  `;
+  tempResultsEl.appendChild(card);
+  return card;
+}
+
+async function runTemperatureExperiment() {
+  const prompt = tempPromptEl.value.trim();
+  if (!prompt) return;
+
+  const parsedTemperature = parseFloat(tempValueEl.value);
+  const temperature = Number.isFinite(parsedTemperature) ? parsedTemperature : null;
+
+  let count = parseInt(tempCountEl.value, 10);
+  if (!Number.isInteger(count) || count < 1) count = 1;
+  if (count > 100) count = 100; // защита от случайно введённого огромного числа
+  tempCountEl.value = count;
+
+  tempRunning = true;
+  tempRunBtn.textContent = 'Остановить';
+  tempResultsEl.innerHTML = '';
+  tempProgressEl.hidden = false;
+  tempAbortController = new AbortController();
+
+  let received = 0;
+  let stoppedEarly = false;
+
+  for (let i = 1; i <= count; i++) {
+    tempProgressEl.textContent = `Запрос ${i} из ${count}…`;
+    const card = addTempResultCard(i);
+    const answerEl = card.querySelector('[data-role="answer"]');
+    const metaEl = card.querySelector('[data-role="meta"]');
+
+    try {
+      const result = await askLlmWithTemperature(prompt, temperature, tempAbortController.signal);
+      answerEl.innerHTML = renderMarkdown(result.answer);
+      renderMathIn(answerEl);
+      metaEl.textContent = formatUsage(result.usage);
+      received++;
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        card.remove();
+        stoppedEarly = true;
+        break;
+      }
+      answerEl.textContent = 'Ошибка: ' + (err && err.message ? err.message : err);
+      answerEl.classList.add('error');
+      received++;
+    }
+  }
+
+  tempProgressEl.textContent = stoppedEarly
+    ? `Остановлено: получено ${received} из ${count} ответов.`
+    : `Готово: получено ${received} из ${count} ответов.`;
+
+  tempRunning = false;
+  tempRunBtn.textContent = 'Отправить N раз';
+  tempAbortController = null;
+}
+
+tempRunBtn.addEventListener('click', () => {
+  if (tempRunning) {
+    if (tempAbortController) tempAbortController.abort();
+  } else {
+    runTemperatureExperiment();
+  }
+});
+
+// Новая сессия: если запросы ещё идут — сначала прерывает их, затем очищает
+// вопрос и все полученные ответы. Значения temperature и количества запросов
+// (это настройки эксперимента, а не сессия) не трогаем.
+function startNewTemperatureSession() {
+  if (tempRunning && tempAbortController) {
+    tempAbortController.abort();
+  }
+  tempPromptEl.value = '';
+  tempResultsEl.innerHTML = '';
+  tempProgressEl.hidden = true;
+  tempProgressEl.textContent = '';
+  tempPromptEl.focus();
+}
+
+tempNewSessionBtn.addEventListener('click', startNewTemperatureSession);
 </script>
 </body>
 </html>
