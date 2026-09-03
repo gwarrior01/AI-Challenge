@@ -14,6 +14,10 @@ use std::sync::Arc;
 #[derive(Clone)]
 struct AppState {
     client: Arc<LlmClient>,
+    /// Модель для запросов анализа решений (вкладка "Задача · 4 способа" -> "Проверить
+    /// решения моделью"). Задаётся через LLM_ANALYSIS_MODEL; если переменная не задана,
+    /// совпадает с основной моделью клиента.
+    analysis_model: Arc<String>,
     index_html: Arc<String>,
 }
 
@@ -40,6 +44,9 @@ struct AskRequest {
     /// поддерживают. `None` — не переопределять поведение модели по умолчанию.
     #[serde(default)]
     reasoning: Option<bool>,
+    /// Если true — запрос использует модель для анализа (LLM_ANALYSIS_MODEL) вместо основной.
+    #[serde(default)]
+    analysis: bool,
 }
 
 const INDEX_TEMPLATE: &str = include_str!("index.html");
@@ -76,7 +83,9 @@ async fn ask(
         reasoning: req.reasoning,
     };
 
-    match state.client.chat_with_options(&messages, &options).await {
+    let model: &str = if req.analysis { state.analysis_model.as_str() } else { state.client.model() };
+
+    match state.client.chat_with_model(model, &messages, &options).await {
         Ok(completion) => Json(serde_json::json!({
             "answer": completion.content,
             "usage": completion.usage,
@@ -90,10 +99,15 @@ async fn ask(
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = LlmClient::from_env()?;
-    let index_html = INDEX_TEMPLATE.replace("__MODEL_NAME__", client.model());
+    let analysis_model =
+        std::env::var("LLM_ANALYSIS_MODEL").unwrap_or_else(|_| client.model().to_string());
+    let index_html = INDEX_TEMPLATE
+        .replace("__MODEL_NAME__", client.model())
+        .replace("__ANALYSIS_MODEL_NAME__", &analysis_model);
 
     let state = AppState {
         client: Arc::new(client),
+        analysis_model: Arc::new(analysis_model),
         index_html: Arc::new(index_html),
     };
 

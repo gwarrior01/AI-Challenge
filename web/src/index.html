@@ -11,6 +11,10 @@
     --panel: #171a21;
     --panel-2: #1e222b;
     --border: #2a2f3a;
+    /* Нейтрально-серый (не чёрный) фон для полей ввода/вывода текста на вкладке
+       "Задача · 4 способа" — задача, эталонный ответ, промпты и ответы моделей. */
+    --challenge-surface: #34363c;
+    --challenge-surface-2: #3d3f46;
     --text: #e6e8ee;
     --muted: #8b93a3;
     --accent: #6c8dff;
@@ -489,7 +493,417 @@
 
   main::-webkit-scrollbar { width: 8px; }
   main::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .tabs {
+    display: flex;
+    gap: 8px;
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+
+  .tab-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 14px;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .tab-btn:hover {
+    color: var(--text);
+  }
+
+  .tab-btn.active {
+    color: var(--text);
+    background: var(--panel-2);
+    border-color: var(--border);
+  }
+
+  .view {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .view[hidden] {
+    display: none;
+  }
+
+  #view-challenge {
+    overflow-y: auto;
+    padding: 24px;
+    gap: 20px;
+  }
+
+  .challenge-intro {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .challenge-intro label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .challenge-intro label[for="challenge-correct-answer"] {
+    margin-top: 14px;
+  }
+
+  .challenge-intro textarea {
+    background: var(--challenge-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  .challenge-intro textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .challenge-intro input#challenge-correct-answer {
+    background: var(--challenge-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px;
+    color: var(--text);
+    font-size: 13.5px;
+    font-family: inherit;
+  }
+
+  .challenge-intro input#challenge-correct-answer:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .challenge-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .challenge-sequential-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .challenge-sequential-toggle input {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  button#challenge-solve,
+  button#challenge-analyze {
+    align-self: flex-start;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 20px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  button#challenge-solve {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: white;
+  }
+
+  button#challenge-analyze {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  button#challenge-analyze:hover:not(:disabled) { border-color: var(--accent); }
+  button#challenge-solve:hover { opacity: 0.92; }
+  button#challenge-solve:disabled,
+  button#challenge-analyze:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .challenge-analysis {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 1400px;
+    margin: 0 auto;
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+
+  .challenge-analysis h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .challenge-visibility-actions {
+    display: flex;
+    gap: 10px;
+    max-width: 1400px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .challenge-visibility-actions button {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .challenge-visibility-actions button:hover { border-color: var(--accent); }
+
+  .challenge-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    max-width: 1400px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  @media (max-width: 900px) {
+    .challenge-grid { grid-template-columns: 1fr; }
+  }
+
+  .challenge-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    min-height: 160px;
+    transition: opacity 0.15s ease;
+  }
+
+  .challenge-card.disabled {
+    opacity: 0.5;
+  }
+
+  .challenge-enable {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .challenge-enable input {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .challenge-card .card-hint,
+  .challenge-intro .card-hint {
+    margin: -6px 0 0;
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+
+  .challenge-status {
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 16px;
+  }
+
+  .challenge-prompt-toggle {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .challenge-prompt-toggle:hover { color: var(--text); border-color: var(--accent); }
+
+  .challenge-prompt {
+    background: var(--challenge-surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--muted);
+    max-height: 180px;
+    overflow: auto;
+  }
+
+  .challenge-answer {
+    background: var(--challenge-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13.5px;
+    line-height: 1.55;
+    word-wrap: break-word;
+  }
+
+  .challenge-answer:empty {
+    display: none;
+  }
+
+  .challenge-answer.error {
+    color: var(--error);
+    white-space: pre-wrap;
+  }
+
+  /* Markdown, отрендеренный из ответа модели */
+  .challenge-answer > :first-child { margin-top: 0; }
+  .challenge-answer > :last-child { margin-bottom: 0; }
+
+  .challenge-answer h1,
+  .challenge-answer h2,
+  .challenge-answer h3,
+  .challenge-answer h4,
+  .challenge-answer h5,
+  .challenge-answer h6 {
+    margin: 14px 0 6px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .challenge-answer h1 { font-size: 18px; }
+  .challenge-answer h2 { font-size: 16.5px; }
+  .challenge-answer h3 { font-size: 15px; }
+  .challenge-answer h4,
+  .challenge-answer h5,
+  .challenge-answer h6 { font-size: 13.5px; }
+
+  .challenge-answer p {
+    margin: 0 0 10px;
+  }
+
+  .challenge-answer ul,
+  .challenge-answer ol {
+    margin: 0 0 10px;
+    padding-left: 22px;
+  }
+
+  .challenge-answer li {
+    margin: 3px 0;
+  }
+
+  .challenge-answer li > ul,
+  .challenge-answer li > ol {
+    margin: 3px 0 3px;
+  }
+
+  .challenge-answer code {
+    background: var(--challenge-surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+
+  .challenge-answer pre {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    background: var(--challenge-surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+
+  .challenge-answer pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre;
+  }
+
+  .challenge-answer blockquote {
+    margin: 0 0 10px;
+    padding: 4px 12px;
+    border-left: 3px solid var(--accent);
+    color: var(--muted);
+  }
+
+  .challenge-answer hr {
+    margin: 14px 0;
+    border: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .challenge-answer a {
+    color: var(--accent);
+  }
+
+  .challenge-answer strong {
+    font-weight: 700;
+  }
+
+  .challenge-answer table {
+    border-collapse: collapse;
+    margin: 0 0 10px;
+    width: 100%;
+    font-size: 12.5px;
+  }
+
+  .challenge-answer th,
+  .challenge-answer td {
+    border: 1px solid var(--border);
+    padding: 5px 8px;
+    text-align: left;
+  }
+
+  .challenge-meta {
+    margin-top: auto;
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* KaTeX по умолчанию рисует формулы чёрным текстом — подгоняем под тёмную тему. */
+  .challenge-answer .katex { color: var(--text); font-size: 1.05em; }
 </style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/contrib/auto-render.min.js"></script>
 </head>
 <body>
 <header>
@@ -519,6 +933,11 @@
     </div>
   </div>
 </header>
+
+<nav class="tabs">
+  <button type="button" class="tab-btn active" id="tab-chat" data-view="view-chat">Чат</button>
+  <button type="button" class="tab-btn" id="tab-challenge" data-view="view-challenge">Задача · 4 способа</button>
+</nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
 <div class="settings-panel" id="settings-panel">
@@ -572,6 +991,7 @@
   </div>
 </div>
 
+<div class="view" id="view-chat">
 <main id="chat">
   <div class="empty-state" id="empty-state">
     <div class="brand-icon" style="margin: 0 auto 12px;">✦</div>
@@ -586,6 +1006,35 @@
   </div>
   <div class="hint">Enter — отправить · Shift+Enter — новая строка</div>
 </footer>
+</div>
+
+<div class="view" id="view-challenge" hidden>
+  <div class="challenge-intro">
+    <label for="challenge-task">Задача (логическая, алгоритмическая или аналитическая)</label>
+    <textarea id="challenge-task" rows="4" placeholder="Например: У фермера есть волк, коза и капуста..."></textarea>
+    <label for="challenge-correct-answer">Правильный ответ (эталон, необязательно)</label>
+    <input type="text" id="challenge-correct-answer" placeholder="Например: 54 кг">
+    <div class="challenge-actions">
+      <button type="button" id="challenge-solve">Решить четырьмя способами</button>
+      <button type="button" id="challenge-analyze" disabled>Проверить решения моделью</button>
+      <label class="challenge-sequential-toggle">
+        <input type="checkbox" id="challenge-sequential">
+        Выполнять по очереди (не параллельно)
+      </label>
+    </div>
+    <span class="card-hint">Модель для анализа: __ANALYSIS_MODEL_NAME__</span>
+  </div>
+  <div class="challenge-visibility-actions">
+    <button type="button" id="challenge-show-all">Показать все ответы</button>
+    <button type="button" id="challenge-hide-all">Скрыть все ответы</button>
+  </div>
+  <div class="challenge-grid" id="challenge-grid"></div>
+  <div class="challenge-analysis" id="challenge-analysis" hidden>
+    <h3>Анализ решений</h3>
+    <div class="challenge-status" data-role="status" id="challenge-analysis-status"></div>
+    <div class="challenge-answer" id="challenge-analysis-answer"></div>
+  </div>
+</div>
 
 <script>
 const chatEl = document.getElementById('chat');
@@ -914,6 +1363,552 @@ async function send() {
     promptEl.focus();
   }
 }
+
+/* ---------- Переключение вкладок ---------- */
+
+const tabButtons = document.querySelectorAll('.tab-btn');
+tabButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    tabButtons.forEach((b) => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('.view').forEach((v) => {
+      v.hidden = v.id !== btn.dataset.view;
+    });
+  });
+});
+
+/* ---------- Вкладка "Задача · 4 способа" ---------- */
+
+const challengeTaskEl = document.getElementById('challenge-task');
+const challengeCorrectAnswerEl = document.getElementById('challenge-correct-answer');
+const challengeSolveBtn = document.getElementById('challenge-solve');
+const challengeAnalyzeBtn = document.getElementById('challenge-analyze');
+const challengeShowAllBtn = document.getElementById('challenge-show-all');
+const challengeHideAllBtn = document.getElementById('challenge-hide-all');
+const challengeSequentialEl = document.getElementById('challenge-sequential');
+const challengeGrid = document.getElementById('challenge-grid');
+const challengeAnalysisPanel = document.getElementById('challenge-analysis');
+const challengeAnalysisStatus = document.getElementById('challenge-analysis-status');
+const challengeAnalysisAnswerEl = document.getElementById('challenge-analysis-answer');
+
+// Итоги последнего решения по каждому способу — используются при отправке
+// результатов на проверку модели. Ключ — id способа из challengeMethods.
+let challengeResults = {};
+
+// Каждый способ описывается функцией, которая по тексту задачи строит один или
+// несколько запросов к /api/ask и возвращает { answer, promptShown, usage }.
+// promptShown — что показать пользователю в свёрнутом блоке "промпт" карточки.
+const challengeMethods = [
+  {
+    id: 'direct',
+    title: '1. Прямой ответ',
+    hint: 'Без каких-либо дополнительных инструкций.',
+    async run(task) {
+      const completion = await askLlm(task);
+      return { answer: completion.answer, promptShown: task, usage: completion.usage };
+    },
+  },
+  {
+    id: 'stepwise',
+    title: '2. «Решай пошагово»',
+    hint: 'В промпт добавлена инструкция решать по шагам.',
+    async run(task) {
+      const prompt = `${task}\n\nРешай пошагово: распиши каждый шаг рассуждений, а в конце дай итоговый ответ.`;
+      const completion = await askLlm(prompt);
+      return { answer: completion.answer, promptShown: prompt, usage: completion.usage };
+    },
+  },
+  {
+    id: 'metaprompt',
+    title: '3. Сначала промпт, потом решение',
+    hint: 'Модель сама составляет промпт для решения задачи, затем этот промпт используется как есть.',
+    async run(task) {
+      const metaPrompt = `Составь подробный, хорошо структурированный промпт для LLM, который поможет качественно решить следующую задачу. Выведи только сам текст промпта, без пояснений и без markdown-разметки.\n\nЗадача:\n${task}`;
+      const metaCompletion = await askLlm(metaPrompt);
+      const generatedPrompt = metaCompletion.answer.trim();
+      const finalCompletion = await askLlm(generatedPrompt);
+      const usage = sumUsage(metaCompletion.usage, finalCompletion.usage);
+      const promptShown = `[Шаг 1 — запрос на составление промпта]\n${metaPrompt}\n\n[Сгенерированный промпт]\n${generatedPrompt}`;
+      return { answer: finalCompletion.answer, promptShown, usage };
+    },
+  },
+  {
+    id: 'experts',
+    title: '4. Группа экспертов',
+    hint: 'Аналитик, инженер и критик решают задачу каждый со своей позиции.',
+    async run(task) {
+      const prompt = `Реши задачу от лица группы из трёх экспертов, обсуждающих её по очереди:\n` +
+        `— Аналитик: раскладывает задачу на составляющие и формулирует условия/ограничения;\n` +
+        `— Инженер: предлагает конкретное решение или алгоритм;\n` +
+        `— Критик: проверяет решение инженера на ошибки и слабые места, поправляет при необходимости.\n\n` +
+        `Выведи ответ каждого эксперта отдельным блоком с его именем, а в конце — итоговый согласованный ответ на задачу.\n\n` +
+        `Задача:\n${task}`;
+      const completion = await askLlm(prompt);
+      return { answer: completion.answer, promptShown: prompt, usage: completion.usage };
+    },
+  },
+];
+
+/* ---------- Минимальный markdown-рендерер (без внешних зависимостей) ---------- */
+/* Поддержка: заголовки, жирный и курсивный текст, инлайн-код и блоки кода,
+   списки, цитаты, ссылки, горизонтальные линии и простые таблицы. */
+
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function renderInline(escapedText) {
+  let text = escapedText;
+  text = text.replace(/`([^`]+)`/g, (m, code) => `<code>${code}</code>`);
+  text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  text = text.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+  text = text.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return text;
+}
+
+function isTableSeparatorLine(line) {
+  return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line);
+}
+
+function splitTableRow(line) {
+  const trimmed = line.trim().replace(/^\||\|$/g, '');
+  return trimmed.split('|').map((cell) => cell.trim());
+}
+
+function renderMarkdown(raw) {
+  const lines = String(raw ?? '').replace(/\r\n/g, '\n').split('\n');
+  let html = '';
+  let i = 0;
+  let listType = null;
+
+  function closeList() {
+    if (listType) {
+      html += `</${listType}>`;
+      listType = null;
+    }
+  }
+
+  const isBlockStart = (line) =>
+    /^```/.test(line) ||
+    /^\s{0,3}#{1,6}\s/.test(line) ||
+    /^\s{0,3}>\s?/.test(line) ||
+    /^\s*[-*+]\s+/.test(line) ||
+    /^\s*\d+[.)]\s+/.test(line) ||
+    /^(-{3,}|\*{3,}|_{3,})\s*$/.test(line) ||
+    /^\s*\\\[\s*$/.test(line) ||
+    /^\s*\$\$\s*$/.test(line) ||
+    line.trim() === '';
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fenceMatch = line.match(/^```(\w*)\s*$/);
+    if (fenceMatch) {
+      closeList();
+      const lang = fenceMatch[1];
+      i++;
+      const codeLines = [];
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++;
+      const langClass = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+      html += `<pre><code${langClass}>${escapeHtml(codeLines.join('\n'))}</code></pre>`;
+      continue;
+    }
+
+    if (line.trim() === '') {
+      closeList();
+      i++;
+      continue;
+    }
+
+    const headingMatch = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      closeList();
+      const level = headingMatch[1].length;
+      html += `<h${level}>${renderInline(escapeHtml(headingMatch[2].trim()))}</h${level}>`;
+      i++;
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      closeList();
+      html += '<hr>';
+      i++;
+      continue;
+    }
+
+    if (/^\s{0,3}>\s?/.test(line)) {
+      closeList();
+      const quoteLines = [];
+      while (i < lines.length && /^\s{0,3}>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^\s{0,3}>\s?/, ''));
+        i++;
+      }
+      html += `<blockquote>${renderInline(escapeHtml(quoteLines.join('\n'))).replace(/\n/g, '<br>')}</blockquote>`;
+      continue;
+    }
+
+    // Блок display-математики \[ ... \] или $$ ... $$: модель обычно кладёт
+    // открывающий/закрывающий разделитель на отдельные строки. Если превратить
+    // переносы строк внутри такого блока в <br>, формула разрежется на
+    // несколько текстовых узлов DOM, и KaTeX не сможет найти пару разделителей
+    // в одном узле — поэтому здесь переносы не заменяются на <br>, а весь блок
+    // остаётся одним текстовым узлом.
+    const bracketMathStart = /^\s*\\\[\s*$/.test(line);
+    const dollarMathStart = /^\s*\$\$\s*$/.test(line);
+    if (bracketMathStart || dollarMathStart) {
+      closeList();
+      const closeRe = bracketMathStart ? /^\s*\\\]\s*$/ : /^\s*\$\$\s*$/;
+      const mathLines = [line];
+      i++;
+      while (i < lines.length && !closeRe.test(lines[i])) {
+        mathLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) {
+        mathLines.push(lines[i]);
+        i++;
+      }
+      html += `<p>${escapeHtml(mathLines.join('\n'))}</p>`;
+      continue;
+    }
+
+    // Таблица: строка с "|" и следующая строка-разделитель (---|---)
+    if (line.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+      closeList();
+      const headerCells = splitTableRow(line);
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+        bodyRows.push(splitTableRow(lines[i]));
+        i++;
+      }
+      html += '<table><thead><tr>' +
+        headerCells.map((c) => `<th>${renderInline(escapeHtml(c))}</th>`).join('') +
+        '</tr></thead><tbody>' +
+        bodyRows.map((row) => '<tr>' + row.map((c) => `<td>${renderInline(escapeHtml(c))}</td>`).join('') + '</tr>').join('') +
+        '</tbody></table>';
+      continue;
+    }
+
+    const ulMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ulMatch) {
+      if (listType !== 'ul') { closeList(); html += '<ul>'; listType = 'ul'; }
+      html += `<li>${renderInline(escapeHtml(ulMatch[1]))}</li>`;
+      i++;
+      continue;
+    }
+
+    const olMatch = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (olMatch) {
+      if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; }
+      html += `<li>${renderInline(escapeHtml(olMatch[1]))}</li>`;
+      i++;
+      continue;
+    }
+
+    closeList();
+    const paraLines = [line];
+    i++;
+    while (i < lines.length && !isBlockStart(lines[i]) &&
+           !(lines[i].includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1]))) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    html += `<p>${renderInline(escapeHtml(paraLines.join('\n'))).replace(/\n/g, '<br>')}</p>`;
+  }
+
+  closeList();
+  return html;
+}
+
+// Прогоняет LaTeX-формулы (\(...\), \[...\], $$...$$) внутри уже вставленного в DOM
+// HTML через KaTeX. Модель часто оборачивает формулы в эти разделители — их не
+// понимает наш markdown-рендерер, поэтому рендерим их отдельным проходом поверх.
+// Если библиотека не загрузилась (нет интернета/CDN недоступен), формулы остаются
+// как обычный текст — страница продолжает работать.
+function renderMathIn(el) {
+  if (typeof renderMathInElement !== 'function') return;
+  try {
+    renderMathInElement(el, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '\\[', right: '\\]', display: true },
+        { left: '\\(', right: '\\)', display: false },
+      ],
+      throwOnError: false,
+    });
+  } catch (e) { /* формулы просто останутся неотрендеренными */ }
+}
+
+function sumUsage(a, b) {
+  if (!a && !b) return null;
+  a = a || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  b = b || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  return {
+    prompt_tokens: (a.prompt_tokens || 0) + (b.prompt_tokens || 0),
+    completion_tokens: (a.completion_tokens || 0) + (b.completion_tokens || 0),
+    total_tokens: (a.total_tokens || 0) + (b.total_tokens || 0),
+  };
+}
+
+// Тонкая обёртка над /api/ask: бросает исключение при ошибке API, иначе
+// возвращает { answer, usage }. useAnalysisModel=true просит backend использовать
+// модель для анализа (LLM_ANALYSIS_MODEL), если она настроена.
+async function askLlm(prompt, useAnalysisModel) {
+  const res = await fetch('/api/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, analysis: !!useAnalysisModel }),
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(data.error || res.statusText);
+  }
+  return { answer: data.answer, usage: data.usage };
+}
+
+function buildChallengeCards() {
+  challengeGrid.innerHTML = '';
+  challengeMethods.forEach((method) => {
+    const card = document.createElement('div');
+    card.className = 'challenge-card';
+    card.dataset.method = method.id;
+    card.innerHTML = `
+      <label class="challenge-enable">
+        <input type="checkbox" data-role="enabled" checked>
+        <span>${method.title}</span>
+      </label>
+      <p class="card-hint">${method.hint}</p>
+      <div class="challenge-status" data-role="status"></div>
+      <button type="button" class="challenge-prompt-toggle" data-role="prompt-toggle" hidden>Показать промпт</button>
+      <div class="challenge-prompt" data-role="prompt" hidden></div>
+      <button type="button" class="challenge-prompt-toggle" data-role="answer-toggle" hidden>Скрыть ответ</button>
+      <div class="challenge-answer" data-role="answer"></div>
+      <div class="challenge-meta" data-role="meta"></div>
+    `;
+    challengeGrid.appendChild(card);
+
+    const toggle = card.querySelector('[data-role="prompt-toggle"]');
+    const promptBlock = card.querySelector('[data-role="prompt"]');
+    toggle.addEventListener('click', () => {
+      promptBlock.hidden = !promptBlock.hidden;
+      toggle.textContent = promptBlock.hidden ? 'Показать промпт' : 'Скрыть промпт';
+    });
+
+    const answerToggle = card.querySelector('[data-role="answer-toggle"]');
+    const answerBlock = card.querySelector('[data-role="answer"]');
+    answerToggle.addEventListener('click', () => {
+      answerBlock.hidden = !answerBlock.hidden;
+      answerToggle.textContent = answerBlock.hidden ? 'Показать ответ' : 'Скрыть ответ';
+    });
+
+    const enabledCheckbox = card.querySelector('[data-role="enabled"]');
+    enabledCheckbox.addEventListener('change', () => {
+      card.classList.toggle('disabled', !enabledCheckbox.checked);
+      updateChallengeSolveAvailability();
+    });
+  });
+}
+
+buildChallengeCards();
+
+// Кнопка "Решить" недоступна, если ни один способ не отмечен галочкой.
+function updateChallengeSolveAvailability() {
+  const anyEnabled = [...challengeGrid.querySelectorAll('[data-role="enabled"]')].some((cb) => cb.checked);
+  challengeSolveBtn.disabled = !anyEnabled || challengeSolving;
+}
+
+function setCardStatus(card, html) {
+  card.querySelector('[data-role="status"]').innerHTML = html;
+}
+
+let challengeSolving = false;
+
+async function runChallenge() {
+  const task = challengeTaskEl.value.trim();
+  if (!task || challengeSolving) return;
+
+  const cards = challengeGrid.querySelectorAll('.challenge-card');
+  const anyEnabled = [...cards].some((card) => card.querySelector('[data-role="enabled"]').checked);
+  if (!anyEnabled) return;
+
+  challengeSolving = true;
+  challengeSolveBtn.disabled = true;
+  challengeAnalyzeBtn.disabled = true;
+  challengeResults = {};
+  challengeAnalysisPanel.hidden = true;
+  challengeAnalysisAnswerEl.innerHTML = '';
+  challengeAnalysisStatus.textContent = '';
+
+  const sequential = challengeSequentialEl.checked;
+  const enabledEntries = [];
+
+  cards.forEach((card, i) => {
+    const enabled = card.querySelector('[data-role="enabled"]').checked;
+    const toggle = card.querySelector('[data-role="prompt-toggle"]');
+    const promptBlock = card.querySelector('[data-role="prompt"]');
+    toggle.hidden = true;
+    promptBlock.hidden = true;
+    promptBlock.textContent = '';
+    const answerToggle = card.querySelector('[data-role="answer-toggle"]');
+    const answerBlock = card.querySelector('[data-role="answer"]');
+    answerToggle.hidden = true;
+    answerToggle.textContent = 'Скрыть ответ';
+    answerBlock.hidden = false;
+    answerBlock.textContent = '';
+    answerBlock.classList.remove('error');
+    card.querySelector('[data-role="meta"]').textContent = '';
+
+    if (!enabled) {
+      setCardStatus(card, 'отключено');
+      return;
+    }
+    // В последовательном режиме способ ещё не запущен — покажем "в очереди",
+    // а не "решается", чтобы не создавать впечатление, что все идут одновременно.
+    setCardStatus(
+      card,
+      sequential ? 'в очереди…' : '<span class="typing"><span></span><span></span><span></span></span> решается…'
+    );
+    enabledEntries.push({ method: challengeMethods[i], card });
+  });
+
+  if (sequential) {
+    // По очереди: каждый следующий способ стартует только после того, как
+    // предыдущий получил ответ (или ошибку) — так каждый запрос получает
+    // полное контекстное окно модели, а не делит его с остальными тремя.
+    for (const { method, card } of enabledEntries) {
+      await runChallengeMethod(method, card, task);
+    }
+  } else {
+    // Все включённые способы запускаются одновременно и независимо — карточка
+    // обновляется сразу по готовности своего результата, не дожидаясь остальных.
+    await Promise.allSettled(
+      enabledEntries.map(({ method, card }) => runChallengeMethod(method, card, task))
+    );
+  }
+
+  challengeSolving = false;
+  updateChallengeSolveAvailability();
+  challengeAnalyzeBtn.disabled = !Object.values(challengeResults).some((r) => !r.isError);
+}
+
+// Выполняет один способ решения на заданной карточке и записывает результат
+// в challengeResults. Никогда не бросает исключение — ошибка обрабатывается
+// внутри и отображается прямо в карточке.
+async function runChallengeMethod(method, card, task) {
+  setCardStatus(card, '<span class="typing"><span></span><span></span><span></span></span> решается…');
+  try {
+    const result = await method.run(task);
+    setCardStatus(card, 'готово');
+    const toggle = card.querySelector('[data-role="prompt-toggle"]');
+    const promptBlock = card.querySelector('[data-role="prompt"]');
+    if (result.promptShown) {
+      toggle.hidden = false;
+      promptBlock.textContent = result.promptShown;
+    }
+    const answerEl = card.querySelector('[data-role="answer"]');
+    answerEl.innerHTML = renderMarkdown(result.answer);
+    renderMathIn(answerEl);
+    card.querySelector('[data-role="answer-toggle"]').hidden = false;
+    card.querySelector('[data-role="meta"]').textContent = formatUsage(result.usage);
+    challengeResults[method.id] = { title: method.title, answer: result.answer, isError: false };
+  } catch (err) {
+    setCardStatus(card, 'ошибка');
+    const answerEl = card.querySelector('[data-role="answer"]');
+    const message = 'Ошибка: ' + (err && err.message ? err.message : err);
+    answerEl.textContent = message;
+    answerEl.classList.add('error');
+    card.querySelector('[data-role="answer-toggle"]').hidden = false;
+    challengeResults[method.id] = { title: method.title, answer: message, isError: true };
+  }
+}
+
+/* ---------- Проверка решений моделью ---------- */
+
+let challengeAnalyzing = false;
+
+async function runChallengeAnalysis() {
+  if (challengeAnalyzing) return;
+  const task = challengeTaskEl.value.trim();
+  if (!task) return;
+
+  const entries = challengeMethods
+    .map((method) => challengeResults[method.id])
+    .filter(Boolean);
+  if (entries.length === 0) return;
+
+  challengeAnalyzing = true;
+  challengeAnalyzeBtn.disabled = true;
+  challengeAnalysisPanel.hidden = false;
+  challengeAnalysisAnswerEl.innerHTML = '';
+  challengeAnalysisAnswerEl.classList.remove('error');
+  challengeAnalysisStatus.innerHTML = '<span class="typing"><span></span><span></span><span></span></span> анализируется…';
+
+  const correctAnswer = challengeCorrectAnswerEl.value.trim();
+
+  const solutionsText = entries
+    .map((entry, idx) => {
+      const note = entry.isError ? ' (способ завершился ошибкой, а не решением)' : '';
+      return `Способ ${idx + 1} — ${entry.title}${note}:\n${entry.answer}`;
+    })
+    .join('\n\n');
+
+  const prompt =
+    `Ниже — задача, эталонный правильный ответ (если указан) и решения этой задачи, ` +
+    `полученные четырьмя разными способами обращения к LLM. Проанализируй каждое решение по отдельности: ` +
+    `дай ему вердикт — "верно", "неверно" или "близко к верному, но с неточностью" — и кратко объясни почему, ` +
+    `сравнивая итоговый ответ каждого способа с эталоном. В конце дай общий вывод: какой способ решения ` +
+    `оказался надёжнее для этой задачи.\n\n` +
+    `Задача:\n${task}\n\n` +
+    `Эталонный правильный ответ: ${correctAnswer || 'не указан — оцени решения по своему пониманию задачи'}\n\n` +
+    `${solutionsText}`;
+
+  try {
+    const completion = await askLlm(prompt, true);
+    challengeAnalysisStatus.textContent = 'готово';
+    challengeAnalysisAnswerEl.innerHTML = renderMarkdown(completion.answer);
+    renderMathIn(challengeAnalysisAnswerEl);
+  } catch (err) {
+    challengeAnalysisStatus.textContent = 'ошибка';
+    const message = 'Ошибка: ' + (err && err.message ? err.message : err);
+    challengeAnalysisAnswerEl.textContent = message;
+    challengeAnalysisAnswerEl.classList.add('error');
+  } finally {
+    challengeAnalyzing = false;
+    challengeAnalyzeBtn.disabled = false;
+  }
+}
+
+challengeAnalyzeBtn.addEventListener('click', runChallengeAnalysis);
+
+function setAllAnswersHidden(hidden) {
+  challengeGrid.querySelectorAll('.challenge-card').forEach((card) => {
+    const answerToggle = card.querySelector('[data-role="answer-toggle"]');
+    const answerBlock = card.querySelector('[data-role="answer"]');
+    if (answerToggle.hidden) return; // ответа ещё нет — нечего скрывать/показывать
+    answerBlock.hidden = hidden;
+    answerToggle.textContent = hidden ? 'Показать ответ' : 'Скрыть ответ';
+  });
+}
+
+challengeShowAllBtn.addEventListener('click', () => setAllAnswersHidden(false));
+challengeHideAllBtn.addEventListener('click', () => setAllAnswersHidden(true));
+
+challengeSolveBtn.addEventListener('click', runChallenge);
+challengeTaskEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    runChallenge();
+  }
+});
 </script>
 </body>
 </html>

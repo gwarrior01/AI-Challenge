@@ -34,7 +34,8 @@ Required:
 
 Optional:
 
-- `LLM_MODEL` — model name (defaults to `gpt-4o-mini`).
+- `LLM_MODEL` — model name (defaults to `gpt-4o-mini`). Used for every request in the CLI, TUI, and web chat, and as the default for the web UI's "Задача · 4 способа" tab (all four solving methods, plus the analysis step below if `LLM_ANALYSIS_MODEL` isn't set).
+- `LLM_ANALYSIS_MODEL` — optional, web UI only. Overrides the model used specifically by the "Задача · 4 способа" tab's "Проверить решения моделью" button (the step that reviews the four solutions against the reference answer). Useful for pointing solving and grading at different models — e.g. a cheaper/faster model solves the task four ways, while a stronger model judges the results. If unset, that request falls back to `LLM_MODEL`.
 
 Set them directly in your shell:
 
@@ -42,6 +43,7 @@ Set them directly in your shell:
 export LLM_API_URL="https://api.openai.com/v1"
 export LLM_API_KEY="sk-..."
 export LLM_MODEL="gpt-4o-mini"
+export LLM_ANALYSIS_MODEL="gpt-4o"   # optional — see above
 ```
 
 Or copy `.env.example` to `.env` and load it before running (e.g. `set -a && source .env && set +a`, or use `direnv`) — the code itself does not read `.env` files, only process environment variables.
@@ -66,7 +68,10 @@ cargo run -p llm-cli
 cargo run -p llm-web
 ```
 
-Starts a server at `http://localhost:8080` — a dark-themed chat page (`POST /api/ask` backend) with message bubbles, a typing indicator, and a token counter (per request + running session total).
+Starts a server at `http://localhost:8080` — a dark-themed page (`POST /api/ask` backend) with two tabs:
+
+- **Чат** — a regular chat with message bubbles, a typing indicator, and a token counter (per request + running session total).
+- **Задача · 4 способа** — enter one logical/algorithmic/analytical task and an optional reference answer, then solve it four ways in parallel: a direct answer, a "think step by step" prompt, a two-step "model writes the solving prompt, then it's used" flow, and a multi-expert (analyst/engineer/critic) prompt. Each card renders Markdown and LaTeX (`\(...\)`, `\[...\]`, `$$...$$`) via KaTeX, can be shown/hidden individually or all at once, and — once at least one method has answered — a "Проверить решения моделью" button sends all four solutions (plus the reference answer, if given) to the model for grading: which ones are correct, wrong, or close. That grading call uses `LLM_ANALYSIS_MODEL` if set, otherwise `LLM_MODEL`.
 
 ## Running the TUI
 

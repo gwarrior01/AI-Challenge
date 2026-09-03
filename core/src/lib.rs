@@ -147,9 +147,21 @@ impl LlmClient {
         messages: &[ChatMessage],
         options: &ChatOptions,
     ) -> Result<ChatCompletion> {
+        self.chat_with_model(&self.model, messages, options).await
+    }
+
+    /// То же самое, что [`LlmClient::chat_with_options`], но с явным указанием модели —
+    /// не той, что задана клиенту по умолчанию (`LLM_MODEL`). Полезно, когда для отдельных
+    /// запросов (например, для анализа) нужна другая модель того же API.
+    pub async fn chat_with_model(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &ChatOptions,
+    ) -> Result<ChatCompletion> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
-            model: &self.model,
+            model,
             messages,
             max_tokens: options.max_tokens,
             stop: &options.stop,
