@@ -467,7 +467,8 @@
 
   textarea::placeholder { color: var(--muted); }
 
-  button#send {
+  button#send,
+  button#agent-chat-send {
     border: none;
     border-radius: 10px;
     padding: 10px 18px;
@@ -480,9 +481,9 @@
     white-space: nowrap;
   }
 
-  button#send:hover { opacity: 0.92; }
-  button#send:active { transform: scale(0.97); }
-  button#send:disabled { opacity: 0.4; cursor: not-allowed; }
+  button#send:hover, button#agent-chat-send:hover { opacity: 0.92; }
+  button#send:active, button#agent-chat-send:active { transform: scale(0.97); }
+  button#send:disabled, button#agent-chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .hint {
     text-align: center;
@@ -1035,6 +1036,242 @@
     font-weight: 600;
     color: var(--text);
   }
+
+  /* ---------- Вкладка "Агенты" ---------- */
+
+  .agents-create {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 640px;
+    margin: 0 auto;
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+  }
+
+  .agents-create h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .agents-create textarea,
+  .agents-create input,
+  .agents-create select {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  .agents-create textarea:focus,
+  .agents-create input:focus,
+  .agents-create select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  button#agent-create-btn {
+    align-self: flex-start;
+    border: none;
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-weight: 600;
+    font-size: 13.5px;
+    cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: white;
+  }
+
+  button#agent-create-btn:hover { opacity: 0.92; }
+  button#agent-create-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .agent-mode-toggle {
+    display: flex;
+    gap: 8px;
+  }
+
+  .agent-mode-btn {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .agent-mode-btn:hover { color: var(--text); }
+
+  .agent-mode-btn.active {
+    color: var(--text);
+    border-color: var(--accent);
+    background: var(--panel);
+  }
+
+  .agent-advanced-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* Author-правило display:flex выше перебивает дефолтный [hidden]{display:none}
+     браузера — явно возвращаем скрытие, когда атрибут hidden выставлен через JS. */
+  .agent-advanced-fields[hidden] {
+    display: none;
+  }
+
+  .agents-list {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .agent-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+
+  .agent-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .agent-card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+  }
+
+  .agent-status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex-shrink: 0;
+  }
+
+  .agent-status-dot.running {
+    background: #4caf7d;
+    box-shadow: 0 0 0 3px rgba(76, 175, 125, 0.18);
+  }
+
+  .agent-card-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .agent-card-actions button {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .agent-card-actions button:hover { border-color: var(--accent); }
+  .agent-card-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .agent-card-meta {
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+
+  .agent-message {
+    font-size: 13px;
+    line-height: 1.45;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--panel-2);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-width: 85%;
+  }
+
+  .agent-message.user {
+    background: var(--user-bubble);
+    align-self: flex-end;
+  }
+
+  .agent-message.assistant {
+    align-self: flex-start;
+  }
+
+  .agent-message.error {
+    color: var(--error);
+    align-self: flex-start;
+  }
+
+  /* ---------- Полноэкранный чат с агентом ---------- */
+
+  .agent-chat-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+
+  .agent-chat-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+  }
+
+  .agent-chat-main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .agent-chat-main .agent-message {
+    max-width: min(680px, 85%);
+    font-size: 14.5px;
+    line-height: 1.5;
+    padding: 12px 16px;
+    border-radius: 14px;
+  }
+
+  .agent-chat-footer {
+    border-top: 1px solid var(--border);
+    padding: 16px 24px 20px;
+  }
+
+  .agent-chat-footer .composer {
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .agent-chat-footer textarea:disabled {
+    opacity: 0.5;
+  }
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
@@ -1073,6 +1310,7 @@
   <button type="button" class="tab-btn active" id="tab-chat" data-view="view-chat">Чат</button>
   <button type="button" class="tab-btn" id="tab-challenge" data-view="view-challenge">Задача · 4 способа</button>
   <button type="button" class="tab-btn" id="tab-temperature" data-view="view-temperature">Температура</button>
+  <button type="button" class="tab-btn" id="tab-agents" data-view="view-agents">Агенты</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -1191,6 +1429,80 @@
     <div class="temp-progress" id="temp-progress" hidden></div>
   </div>
   <div class="temp-results" id="temp-results"></div>
+</div>
+
+<div class="view" id="view-agents" hidden>
+  <div class="agents-create">
+    <h3>Новый агент</h3>
+    <div class="agent-mode-toggle">
+      <button type="button" class="agent-mode-btn active" id="agent-mode-quick" data-mode="quick">Быстро</button>
+      <button type="button" class="agent-mode-btn" id="agent-mode-advanced" data-mode="advanced">Расширенно</button>
+    </div>
+    <div class="settings-field">
+      <label for="agent-name">Имя агента</label>
+      <input type="text" id="agent-name" placeholder="например: Переводчик">
+    </div>
+    <div class="settings-field">
+      <label for="agent-system">Системный промпт</label>
+      <textarea id="agent-system" rows="3" placeholder="необязательно"></textarea>
+    </div>
+    <span class="card-hint" id="agent-mode-hint">Остальные параметры (модель, лимиты, temperature и т.д.) останутся по умолчанию. Нужно задать их явно — переключитесь на «Расширенно».</span>
+    <div class="agent-advanced-fields" id="agent-advanced-fields" hidden>
+      <div class="settings-row">
+        <div class="settings-field">
+          <label for="agent-model">Модель</label>
+          <input type="text" id="agent-model" placeholder="по умолчанию: __MODEL_NAME__">
+        </div>
+        <div class="settings-field">
+          <label for="agent-max-tokens">Макс. токенов ответа</label>
+          <input type="number" id="agent-max-tokens" min="1" step="1" placeholder="без ограничения">
+        </div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-field">
+          <label for="agent-temperature">Temperature</label>
+          <input type="number" id="agent-temperature" min="0" max="2" step="0.1" placeholder="по умолчанию">
+        </div>
+        <div class="settings-field">
+          <label for="agent-top-p">Top P</label>
+          <input type="number" id="agent-top-p" min="0" max="1" step="0.05" placeholder="по умолчанию">
+        </div>
+      </div>
+      <div class="settings-field">
+        <label for="agent-reasoning">Reasoning</label>
+        <select id="agent-reasoning">
+          <option value="">Как у модели по умолчанию</option>
+          <option value="on">Включить</option>
+          <option value="off">Выключить</option>
+        </select>
+      </div>
+      <label class="debug-check">
+        <input type="checkbox" id="agent-show-tokens">
+        Показывать количество использованных токенов в ответах агента
+      </label>
+    </div>
+    <button type="button" id="agent-create-btn">Добавить агента</button>
+    <span class="field-error" id="agent-create-error" hidden></span>
+  </div>
+  <div class="agents-list" id="agents-list"></div>
+</div>
+
+<div class="view" id="view-agent-chat" hidden>
+  <div class="agent-chat-header">
+    <button type="button" id="agent-chat-back" class="settings-btn">← Назад к агентам</button>
+    <div class="agent-chat-title">
+      <span class="agent-status-dot" id="agent-chat-status-dot"></span>
+      <strong id="agent-chat-name"></strong>
+      <span class="card-hint" id="agent-chat-meta"></span>
+    </div>
+  </div>
+  <main class="agent-chat-main" id="agent-chat-main"></main>
+  <footer class="agent-chat-footer">
+    <div class="composer">
+      <textarea id="agent-chat-input" placeholder="Написать агенту..." rows="1"></textarea>
+      <button type="button" id="agent-chat-send">Отправить</button>
+    </div>
+  </footer>
 </div>
 
 <script>
@@ -2191,6 +2503,332 @@ function startNewTemperatureSession() {
 }
 
 tempNewSessionBtn.addEventListener('click', startNewTemperatureSession);
+
+/* ---------- Вкладка "Агенты" ---------- */
+/* Агент — отдельная сущность на бэкенде (не просто вызов API): у него есть
+   конфигурация (системный промпт, модель, лимиты, показывать ли токены) и
+   жизненный цикл запущен/остановлен. Эта вкладка — панель управления: создать,
+   запустить/остановить, удалить агента, и мини-чат с уже запущенным. */
+
+const agentsListEl = document.getElementById('agents-list');
+const agentNameEl = document.getElementById('agent-name');
+const agentSystemEl = document.getElementById('agent-system');
+const agentModelEl = document.getElementById('agent-model');
+const agentMaxTokensEl = document.getElementById('agent-max-tokens');
+const agentTemperatureEl = document.getElementById('agent-temperature');
+const agentTopPEl = document.getElementById('agent-top-p');
+const agentReasoningEl = document.getElementById('agent-reasoning');
+const agentShowTokensEl = document.getElementById('agent-show-tokens');
+const agentCreateBtn = document.getElementById('agent-create-btn');
+const agentCreateError = document.getElementById('agent-create-error');
+const agentModeButtons = document.querySelectorAll('.agent-mode-btn');
+const agentAdvancedFields = document.getElementById('agent-advanced-fields');
+const agentModeHint = document.getElementById('agent-mode-hint');
+const viewAgents = document.getElementById('view-agents');
+const viewAgentChat = document.getElementById('view-agent-chat');
+const agentChatBackBtn = document.getElementById('agent-chat-back');
+const agentChatStatusDot = document.getElementById('agent-chat-status-dot');
+const agentChatNameEl = document.getElementById('agent-chat-name');
+const agentChatMetaEl = document.getElementById('agent-chat-meta');
+const agentChatMainEl = document.getElementById('agent-chat-main');
+const agentChatInputEl = document.getElementById('agent-chat-input');
+const agentChatSendBtn = document.getElementById('agent-chat-send');
+
+// Локальная история переписки с каждым агентом (по имени) — только для этой
+// вкладки браузера, не сохраняется на сервере и не переживает перезагрузку.
+const agentChats = {};
+// Режим создания: 'quick' — только имя и системный промпт (остальное по
+// умолчанию), 'advanced' — полный набор параметров.
+let agentCreateMode = 'quick';
+// Имя агента, чей полноэкранный чат сейчас открыт (null — если список).
+let currentAgentChatName = null;
+
+agentModeButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    agentCreateMode = btn.dataset.mode;
+    agentModeButtons.forEach((b) => b.classList.toggle('active', b === btn));
+    const advanced = agentCreateMode === 'advanced';
+    agentAdvancedFields.hidden = !advanced;
+    agentModeHint.hidden = advanced;
+  });
+});
+
+function agentMetaLine(config) {
+  const parts = [];
+  parts.push('модель: ' + (config.model || '__MODEL_NAME__ (по умолчанию)'));
+  parts.push('токены: ' + (config.show_tokens ? 'показывать' : 'скрывать'));
+  if (config.temperature !== null && config.temperature !== undefined) parts.push('temperature: ' + config.temperature);
+  if (config.top_p !== null && config.top_p !== undefined) parts.push('top_p: ' + config.top_p);
+  if (config.max_tokens !== null && config.max_tokens !== undefined) parts.push('макс. токенов: ' + config.max_tokens);
+  if (config.reasoning === true) parts.push('reasoning: вкл');
+  if (config.reasoning === false) parts.push('reasoning: выкл');
+  return parts.join(' · ');
+}
+
+function renderAgentMessage(msg) {
+  const row = document.createElement('div');
+  row.className = 'agent-message ' + msg.role;
+  const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
+  row.textContent = prefix + msg.text;
+  return row;
+}
+
+// Последний известный снимок списка агентов — используется, чтобы обновить
+// шапку полноэкранного чата (статус, метаданные) без лишнего запроса к серверу.
+let lastAgentsSnapshot = [];
+
+function renderAgents(agents) {
+  lastAgentsSnapshot = agents;
+  agentsListEl.innerHTML = '';
+  if (!agents.length) {
+    agentsListEl.innerHTML = '<p class="card-hint">Агентов пока нет — добавьте первого выше.</p>';
+    return;
+  }
+
+  agents.forEach((info) => {
+    const name = info.config.name;
+    if (!agentChats[name]) agentChats[name] = [];
+
+    const card = document.createElement('div');
+    card.className = 'agent-card';
+
+    const head = document.createElement('div');
+    head.className = 'agent-card-head';
+
+    const title = document.createElement('div');
+    title.className = 'agent-card-title';
+    title.innerHTML = `<span class="agent-status-dot ${info.running ? 'running' : 'stopped'}"></span><strong></strong>`;
+    title.querySelector('strong').textContent = name;
+
+    const actions = document.createElement('div');
+    actions.className = 'agent-card-actions';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.textContent = info.running ? 'Остановить' : 'Запустить';
+    toggleBtn.addEventListener('click', async () => {
+      toggleBtn.disabled = true;
+      try {
+        await fetch(`/api/agents/${encodeURIComponent(name)}/${info.running ? 'stop' : 'start'}`, { method: 'POST' });
+        await fetchAgents();
+      } finally {
+        toggleBtn.disabled = false;
+      }
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Удалить';
+    deleteBtn.addEventListener('click', async () => {
+      if (!confirm(`Удалить агента «${name}»?`)) return;
+      await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      delete agentChats[name];
+      await fetchAgents();
+    });
+
+    actions.appendChild(toggleBtn);
+    actions.appendChild(deleteBtn);
+    head.appendChild(title);
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'agent-card-meta';
+    meta.textContent = agentMetaLine(info.config);
+    card.appendChild(meta);
+
+    if (info.config.system_prompt) {
+      const sys = document.createElement('div');
+      sys.className = 'challenge-prompt';
+      sys.textContent = info.config.system_prompt;
+      card.appendChild(sys);
+    }
+
+    const openChatBtn = document.createElement('button');
+    openChatBtn.type = 'button';
+    openChatBtn.className = 'challenge-prompt-toggle';
+    openChatBtn.textContent = 'Открыть чат →';
+    openChatBtn.addEventListener('click', () => openAgentChat(name));
+    card.appendChild(openChatBtn);
+
+    agentsListEl.appendChild(card);
+  });
+
+  // Открытый полноэкранный чат мог устареть (статус агента изменился, пока
+  // мы были в списке) — обновляем его шапку и доступность поля ввода.
+  if (currentAgentChatName) {
+    updateAgentChatHeader(currentAgentChatName);
+  }
+}
+
+async function fetchAgents() {
+  try {
+    const res = await fetch('/api/agents');
+    const data = await res.json();
+    renderAgents(data.agents || []);
+  } catch (e) {
+    agentsListEl.innerHTML = '<p class="card-hint">Не удалось загрузить список агентов.</p>';
+  }
+}
+
+/* ---------- Полноэкранный чат с агентом ---------- */
+
+function findAgentInfo(name) {
+  return lastAgentsSnapshot.find((a) => a.config.name === name) || null;
+}
+
+function updateAgentChatHeader(name) {
+  const info = findAgentInfo(name);
+  const running = info ? info.running : false;
+  agentChatStatusDot.className = 'agent-status-dot ' + (running ? 'running' : 'stopped');
+  agentChatNameEl.textContent = name;
+  agentChatMetaEl.textContent = info ? agentMetaLine(info.config) + (running ? '' : ' · остановлен') : 'агент не найден';
+  agentChatInputEl.disabled = !running;
+  agentChatSendBtn.disabled = !running;
+  agentChatInputEl.placeholder = running ? 'Написать агенту...' : 'Сначала запустите агента (вкладка «Агенты»)';
+}
+
+function renderAgentChatMessages(name) {
+  agentChatMainEl.innerHTML = '';
+  (agentChats[name] || []).forEach((msg) => agentChatMainEl.appendChild(renderAgentMessage(msg)));
+  agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+}
+
+function openAgentChat(name) {
+  currentAgentChatName = name;
+  if (!agentChats[name]) agentChats[name] = [];
+  updateAgentChatHeader(name);
+  renderAgentChatMessages(name);
+  viewAgents.hidden = true;
+  viewAgentChat.hidden = false;
+  agentChatInputEl.focus();
+}
+
+function closeAgentChat() {
+  currentAgentChatName = null;
+  viewAgentChat.hidden = true;
+  viewAgents.hidden = false;
+  fetchAgents();
+}
+
+agentChatBackBtn.addEventListener('click', closeAgentChat);
+
+async function sendAgentChatMessage() {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const prompt = agentChatInputEl.value.trim();
+  if (!prompt) return;
+  agentChatInputEl.value = '';
+  agentChatSendBtn.disabled = true;
+
+  const userMsg = { role: 'user', text: prompt };
+  agentChats[name].push(userMsg);
+  agentChatMainEl.appendChild(renderAgentMessage(userMsg));
+  agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    });
+    const data = await res.json();
+    const msg = data.error ? { role: 'error', text: data.error } : { role: 'assistant', text: data.answer };
+    agentChats[name].push(msg);
+    if (currentAgentChatName === name) {
+      agentChatMainEl.appendChild(renderAgentMessage(msg));
+    }
+  } catch (e) {
+    const msg = { role: 'error', text: 'Ошибка сети: ' + e };
+    agentChats[name].push(msg);
+    if (currentAgentChatName === name) {
+      agentChatMainEl.appendChild(renderAgentMessage(msg));
+    }
+  } finally {
+    if (currentAgentChatName === name) {
+      agentChatSendBtn.disabled = false;
+      agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+      agentChatInputEl.focus();
+    }
+  }
+}
+
+agentChatInputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendAgentChatMessage();
+  }
+});
+agentChatSendBtn.addEventListener('click', sendAgentChatMessage);
+
+agentCreateBtn.addEventListener('click', async () => {
+  const name = agentNameEl.value.trim();
+  agentCreateError.hidden = true;
+  if (!name) {
+    agentCreateError.textContent = 'Укажите имя агента.';
+    agentCreateError.hidden = false;
+    return;
+  }
+
+  // В быстром режиме расширенные поля игнорируются, даже если в них остался
+  // текст от предыдущего переключения на "Расширенно", — агент получает
+  // только имя и системный промпт, всё остальное берётся по умолчанию.
+  const advanced = agentCreateMode === 'advanced';
+  const maxTokensRaw = advanced ? agentMaxTokensEl.value.trim() : '';
+  const maxTokens = maxTokensRaw ? parseInt(maxTokensRaw, 10) : null;
+  const temperature = advanced && agentTemperatureEl.value.trim() ? parseFloat(agentTemperatureEl.value) : null;
+  const topP = advanced && agentTopPEl.value.trim() ? parseFloat(agentTopPEl.value) : null;
+  const reasoning = advanced && agentReasoningEl.value === 'on' ? true : advanced && agentReasoningEl.value === 'off' ? false : null;
+  const model = advanced ? agentModelEl.value.trim() || null : null;
+  const showTokens = advanced ? agentShowTokensEl.checked : false;
+
+  agentCreateBtn.disabled = true;
+  try {
+    const res = await fetch('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        system_prompt: agentSystemEl.value.trim() || null,
+        model,
+        show_tokens: showTokens,
+        max_tokens: Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null,
+        temperature: Number.isFinite(temperature) ? temperature : null,
+        top_p: Number.isFinite(topP) ? topP : null,
+        reasoning,
+      }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      agentCreateError.textContent = data.error;
+      agentCreateError.hidden = false;
+      return;
+    }
+    agentNameEl.value = '';
+    agentSystemEl.value = '';
+    agentModelEl.value = '';
+    agentMaxTokensEl.value = '';
+    agentTemperatureEl.value = '';
+    agentTopPEl.value = '';
+    agentReasoningEl.value = '';
+    agentShowTokensEl.checked = false;
+    document.getElementById('agent-mode-quick').click();
+    await fetchAgents();
+  } catch (e) {
+    agentCreateError.textContent = 'Ошибка сети: ' + e;
+    agentCreateError.hidden = false;
+  } finally {
+    agentCreateBtn.disabled = false;
+  }
+});
+
+// Список агентов обновляется при каждом переходе на вкладку — так статусы
+// (запущен/остановлен) всегда актуальны, даже если их поменяли в другом
+// интерфейсе (CLI, TUI) с тем же файлом реестра.
+document.getElementById('tab-agents').addEventListener('click', () => {
+  currentAgentChatName = null;
+  fetchAgents();
+});
 </script>
 </body>
 </html>

@@ -2,12 +2,12 @@
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     response::Html,
     routing::{get, post},
     Json, Router,
 };
-use llm_core::{ChatMessage, ChatOptions, LlmClient};
+use llm_core::{AgentConfig, AgentManager, ChatMessage, ChatOptions, LlmClient};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -19,6 +19,10 @@ struct AppState {
     /// совпадает с основной моделью клиента.
     analysis_model: Arc<String>,
     index_html: Arc<String>,
+    /// Реестр именованных агентов (вкладка "Агенты"): у каждого своя конфигурация и
+    /// жизненный цикл (запущен/остановлен), запросы обрабатывает сам агент, а не
+    /// прямой вызов клиента.
+    agents: Arc<AgentManager>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +51,31 @@ struct AskRequest {
     /// Если true — запрос использует модель для анализа (LLM_ANALYSIS_MODEL) вместо основной.
     #[serde(default)]
     analysis: bool,
+}
+
+/// Тело запроса на создание агента (вкладка "Агенты").
+#[derive(Deserialize)]
+struct CreateAgentRequest {
+    name: String,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    show_tokens: bool,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    reasoning: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AgentAskRequest {
+    prompt: String,
 }
 
 const INDEX_TEMPLATE: &str = include_str!("index.html");
@@ -96,6 +125,69 @@ async fn ask(
     }
 }
 
+/// Возвращает список всех агентов с их конфигурацией и статусом запуска.
+async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "agents": state.agents.list() }))
+}
+
+/// Добавляет нового агента (по умолчанию — остановленного).
+async fn create_agent(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAgentRequest>,
+) -> Json<serde_json::Value> {
+    let config = AgentConfig {
+        name: req.name,
+        system_prompt: req.system_prompt.filter(|s| !s.trim().is_empty()),
+        model: req.model.filter(|s| !s.trim().is_empty()),
+        show_tokens: req.show_tokens,
+        max_tokens: req.max_tokens.filter(|&n| n > 0),
+        temperature: req.temperature,
+        top_p: req.top_p,
+        reasoning: req.reasoning,
+    };
+    match state.agents.create(config) {
+        Ok(info) => Json(serde_json::json!({ "agent": info })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+async fn start_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    match state.agents.start(&name) {
+        Ok(info) => Json(serde_json::json!({ "agent": info })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+async fn stop_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    match state.agents.stop(&name) {
+        Ok(info) => Json(serde_json::json!({ "agent": info })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+async fn delete_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    match state.agents.remove(&name) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Пересылает запрос конкретному агенту. Если агент остановлен или не найден,
+/// возвращает ошибку — обращения к LLM не происходит.
+async fn ask_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AgentAskRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.handle_request(&req.prompt).await {
+        Ok(reply) => Json(serde_json::json!({ "answer": reply.text, "usage": reply.usage })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = LlmClient::from_env()?;
@@ -104,16 +196,23 @@ async fn main() -> Result<()> {
     let index_html = INDEX_TEMPLATE
         .replace("__MODEL_NAME__", client.model())
         .replace("__ANALYSIS_MODEL_NAME__", &analysis_model);
+    let agents = Arc::new(AgentManager::from_env(client.clone()));
 
     let state = AppState {
         client: Arc::new(client),
         analysis_model: Arc::new(analysis_model),
         index_html: Arc::new(index_html),
+        agents,
     };
 
     let app = Router::new()
         .route("/", get(index))
         .route("/api/ask", post(ask))
+        .route("/api/agents", get(list_agents).post(create_agent))
+        .route("/api/agents/:name", axum::routing::delete(delete_agent))
+        .route("/api/agents/:name/start", post(start_agent))
+        .route("/api/agents/:name/stop", post(stop_agent))
+        .route("/api/agents/:name/ask", post(ask_agent))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";

@@ -4,6 +4,9 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod agent;
+pub use agent::{Agent, AgentConfig, AgentInfo, AgentManager, AgentReply};
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
