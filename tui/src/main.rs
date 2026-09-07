@@ -809,14 +809,7 @@ fn draw_chat(frame: &mut Frame, state: &DrawState) {
             Color::Reset,
         )
     };
-    let input_para = Paragraph::new(input).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .title(input_title),
-    );
-    frame.render_widget(input_para, chunks[3]);
+    render_input_box(frame, chunks[3], input, input_title, border_color);
 }
 
 /// Короткая строка с ключевыми параметрами конфигурации агента — используется
@@ -949,6 +942,34 @@ fn draw_agents_list(frame: &mut Frame, state: &DrawState) {
     frame.render_widget(detail, chunks[3]);
 }
 
+/// Рендерит поле ввода с переносом длинных строк по ширине и автопрокруткой
+/// к последней введённой строке. Без переноса `Paragraph` обрезает (а не
+/// переносит) строки шире области — это делает невидимым «хвост» длинного
+/// или вставленного многострочного сообщения, из-за чего казалось, что текст
+/// вылезает за рамки поля и не даёт увидеть, что реально введено.
+fn render_input_box(frame: &mut Frame, area: Rect, input: &str, title: String, border_color: Color) {
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let visible_height = area.height.saturating_sub(2);
+
+    let mut lines: Vec<Line<'static>> = textwrap::wrap(input, inner_width)
+        .into_iter()
+        .map(|s| Line::from(s.into_owned()))
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    let scroll_y = (lines.len() as u16).saturating_sub(visible_height);
+
+    let input_para = Paragraph::new(lines).scroll((scroll_y, 0)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .title(title),
+    );
+    frame.render_widget(input_para, area);
+}
+
 fn summary_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray)),
@@ -1038,14 +1059,7 @@ fn draw_agent_create(frame: &mut Frame, state: &DrawState) {
         chunks[2],
     );
 
-    let input_para = Paragraph::new(state.input).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(wizard.step.label()),
-    );
-    frame.render_widget(input_para, chunks[3]);
+    render_input_box(frame, chunks[3], state.input, wizard.step.label().to_string(), Color::Cyan);
 }
 
 /// Первый шаг создания агента: выбор между быстрым режимом (только имя и
@@ -1154,14 +1168,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     } else {
         (" Запрос — Enter отправить, Esc назад к списку агентов ".to_string(), Color::Reset)
     };
-    let input_para = Paragraph::new(state.input).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .title(input_title),
-    );
-    frame.render_widget(input_para, chunks[3]);
+    render_input_box(frame, chunks[3], state.input, input_title, border_color);
 }
 
 fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> Vec<Line<'static>> {
