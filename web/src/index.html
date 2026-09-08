@@ -2534,9 +2534,15 @@ const agentChatMainEl = document.getElementById('agent-chat-main');
 const agentChatInputEl = document.getElementById('agent-chat-input');
 const agentChatSendBtn = document.getElementById('agent-chat-send');
 
-// Локальная история переписки с каждым агентом (по имени) — только для этой
-// вкладки браузера, не сохраняется на сервере и не переживает перезагрузку.
+// Локальная история переписки с каждым агентом (по имени), отображаемая в
+// полноэкранном чате. Настоящее хранилище истории — SQLite на сервере (см.
+// /api/agents/:name/history); при первом открытии чата с агентом в этой
+// вкладке история подгружается оттуда, поэтому диалог виден и после
+// перезагрузки страницы/перезапуска сервера.
 const agentChats = {};
+// Имена агентов, для которых история уже подгружена с сервера в этой вкладке
+// (чтобы не запрашивать её повторно при каждом открытии чата).
+const agentChatsHistoryLoaded = new Set();
 // Режим создания: 'quick' — только имя и системный промпт (остальное по
 // умолчанию), 'advanced' — полный набор параметров.
 let agentCreateMode = 'quick';
@@ -2623,6 +2629,7 @@ function renderAgents(agents) {
       if (!confirm(`Удалить агента «${name}»?`)) return;
       await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE' });
       delete agentChats[name];
+      agentChatsHistoryLoaded.delete(name);
       await fetchAgents();
     });
 
@@ -2694,7 +2701,7 @@ function renderAgentChatMessages(name) {
   agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
 }
 
-function openAgentChat(name) {
+async function openAgentChat(name) {
   currentAgentChatName = name;
   if (!agentChats[name]) agentChats[name] = [];
   updateAgentChatHeader(name);
@@ -2702,6 +2709,21 @@ function openAgentChat(name) {
   viewAgents.hidden = true;
   viewAgentChat.hidden = false;
   agentChatInputEl.focus();
+
+  if (!agentChatsHistoryLoaded.has(name)) {
+    agentChatsHistoryLoaded.add(name);
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(name)}/history`);
+      const data = await res.json();
+      const restored = (data.messages || [])
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role, text: m.content }));
+      agentChats[name] = restored.concat(agentChats[name]);
+      if (currentAgentChatName === name) renderAgentChatMessages(name);
+    } catch (e) {
+      // не удалось подгрузить историю с сервера — продолжаем с тем, что уже отображено
+    }
+  }
 }
 
 function closeAgentChat() {

@@ -188,6 +188,21 @@ async fn ask_agent(
     }
 }
 
+/// Возвращает историю диалога агента, восстановленную из SQLite — используется
+/// интерфейсом, чтобы показать прежние сообщения при открытии чата, даже если
+/// сервер был перезапущен после последнего обращения к агенту.
+async fn agent_history(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let messages: Vec<serde_json::Value> = agent
+        .history()
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+    Json(serde_json::json!({ "messages": messages }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = LlmClient::from_env()?;
@@ -196,7 +211,7 @@ async fn main() -> Result<()> {
     let index_html = INDEX_TEMPLATE
         .replace("__MODEL_NAME__", client.model())
         .replace("__ANALYSIS_MODEL_NAME__", &analysis_model);
-    let agents = Arc::new(AgentManager::from_env(client.clone()));
+    let agents = Arc::new(AgentManager::from_env(client.clone())?);
 
     let state = AppState {
         client: Arc::new(client),
@@ -213,6 +228,7 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/start", post(start_agent))
         .route("/api/agents/:name/stop", post(stop_agent))
         .route("/api/agents/:name/ask", post(ask_agent))
+        .route("/api/agents/:name/history", get(agent_history))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";

@@ -15,8 +15,9 @@
 //! тоже возвращает в список агентов/чат соответственно) — можно сделать это в
 //! любой момент, даже пока агент ещё генерирует ответ: запрос продолжает
 //! выполняться в фоне, а ответ появится в истории этого агента независимо от
-//! того, какой экран открыт. Каждый запущенный агент помнит историю диалога в
-//! рамках своего запуска (сбрасывается при повторном запуске 's').
+//! того, какой экран открыт. История диалога каждого агента хранится в SQLite
+//! (AGENTS_STORE_PATH) и переживает и остановку/запуск, и перезапуск всего
+//! приложения — при повторном открытии чата агент помнит прошлые сообщения.
 
 use anyhow::Result;
 use crossterm::{
@@ -25,7 +26,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
-use llm_core::{AgentConfig, AgentInfo, AgentManager, ChatCompletion, LlmClient, Usage};
+use llm_core::{AgentConfig, AgentInfo, AgentManager, ChatCompletion, ChatMessage, LlmClient, Usage};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -53,6 +54,18 @@ struct HistoryItem {
     text: String,
     /// (JSON запроса, JSON ответа) — заполняется только для ответов ассистента в прямом чате.
     debug: Option<(String, String)>,
+}
+
+/// Преобразует сообщение из истории агента (роль "user"/"assistant", хранимой
+/// в SQLite) в элемент для отображения в чате — используется при открытии
+/// чата с агентом, чтобы показать восстановленный после перезапуска диалог.
+fn history_item_from_message(message: &ChatMessage) -> HistoryItem {
+    let role = match message.role.as_str() {
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => Role::System,
+    };
+    HistoryItem { role, text: message.content.clone(), debug: None }
 }
 
 #[derive(Default)]
@@ -343,7 +356,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // виджету. Отслеживаем предыдущий экран и при каждой смене форсируем полную
     // перерисовку терминала, чтобы такой "хвост" не оставался виден.
     let mut previous_screen = screen;
-    let agent_manager = AgentManager::from_env(client.clone());
+    let agent_manager = AgentManager::from_env(client.clone())?;
     let mut agents_selected: usize = 0;
     let mut confirm_delete: Option<String> = None;
     let mut wizard: Option<CreateWizard> = None;
@@ -531,7 +544,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         if let Some(info) = agents_snapshot.get(agents_selected) {
                                             if info.running {
                                                 let name = info.config.name.clone();
-                                                agent_histories.entry(name.clone()).or_default();
+                                                agent_histories.entry(name.clone()).or_insert_with(|| {
+                                                    agent_manager
+                                                        .get(&name)
+                                                        .map(|agent| {
+                                                            agent
+                                                                .history()
+                                                                .iter()
+                                                                .map(history_item_from_message)
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default()
+                                                });
                                                 agent_chat_name = Some(name);
                                                 screen = Screen::AgentChat;
                                                 follow_bottom = true;

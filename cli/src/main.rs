@@ -25,7 +25,8 @@
 //!   --reasoning on|off
 //!
 //! Обязательные переменные окружения: LLM_API_URL, LLM_API_KEY (см. .env.example).
-//! Реестр агентов хранится в файле AGENTS_STORE_PATH (по умолчанию agents.json).
+//! Реестр агентов и история их диалогов хранятся в SQLite-файле AGENTS_STORE_PATH
+//! (по умолчанию agents.db) — после перезапуска агент помнит прошлые сообщения.
 
 use anyhow::{anyhow, bail, Result};
 use llm_core::{Agent, AgentConfig, AgentManager, LlmClient};
@@ -97,7 +98,7 @@ fn format_usage(usage: &llm_core::Usage) -> String {
 /// Разбирает и выполняет подкоманды `llm-cli agent ...`.
 async fn run_agent_cli(args: &[String]) -> Result<()> {
     let client = LlmClient::from_env()?;
-    let manager = AgentManager::from_env(client);
+    let manager = AgentManager::from_env(client)?;
 
     match args.first().map(String::as_str) {
         Some("list") => {
@@ -147,6 +148,7 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             manager.start(&name)?;
             let agent = manager.get(&name).expect("агент только что запущен");
             println!("Агент «{name}» запущен. Введите запрос, `stop` или Ctrl+D — остановить и выйти.\n");
+            print_restored_history(&agent);
             run_agent_chat(&manager, agent).await
         }
         Some("stop") => {
@@ -226,6 +228,26 @@ fn parse_agent_add_flags(name: String, flags: &[String]) -> Result<AgentConfig> 
         i += 1;
     }
     Ok(config)
+}
+
+/// Печатает восстановленную из БД историю диалога (если она не пуста) —
+/// например, после перезапуска приложения, когда агент помнит прошлые
+/// сообщения и продолжает разговор, как будто его не выключали.
+fn print_restored_history(agent: &Agent) {
+    let history = agent.history();
+    if history.is_empty() {
+        return;
+    }
+    println!("— восстановлена история диалога ({} сообщений) —", history.len());
+    for message in &history {
+        let label = match message.role.as_str() {
+            "user" => "Вы",
+            "assistant" => agent.name(),
+            other => other,
+        };
+        println!("[{label}] {}", message.content);
+    }
+    println!();
 }
 
 /// Интерактивный чат с конкретным запущенным агентом. Завершается по Ctrl+D или

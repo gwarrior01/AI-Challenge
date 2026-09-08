@@ -3,3 +3,7 @@
 .env
 .DS_Store
 agents.json
+agents.db
+agents.db-journal
+agents.db-wal
+agents.db-shm
