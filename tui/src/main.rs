@@ -54,18 +54,44 @@ struct HistoryItem {
     text: String,
     /// (JSON запроса, JSON ответа) — заполняется только для ответов ассистента в прямом чате.
     debug: Option<(String, String)>,
+    /// Токены этого конкретного сообщения: prompt_tokens для запроса пользователя,
+    /// completion_tokens для ответа ассистента — API отдаёт их одной суммой на весь
+    /// обмен (см. агент.rs), поэтому раскладываются по паре сообщений при построении
+    /// истории (см. [`history_items_from_messages`]). `None`, если неизвестны.
+    tokens: Option<u32>,
 }
 
-/// Преобразует сообщение из истории агента (роль "user"/"assistant", хранимой
-/// в SQLite) в элемент для отображения в чате — используется при открытии
-/// чата с агентом, чтобы показать восстановленный после перезапуска диалог.
-fn history_item_from_message(message: &ChatMessage) -> HistoryItem {
-    let role = match message.role.as_str() {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => Role::System,
-    };
-    HistoryItem { role, text: message.content.clone(), debug: None }
+/// Преобразует историю агента (роль + текст + метрики токенов, хранимые в SQLite)
+/// в элементы для отображения в чате — используется при открытии чата с агентом,
+/// чтобы показать восстановленный после перезапуска диалог с токенами под каждым
+/// сообщением, как в веб-интерфейсе. Токены приходят от API одной суммой на весь
+/// обмен и хранятся на сообщении ассистента — раскладываем prompt_tokens на
+/// предыдущее сообщение пользователя, completion_tokens оставляем на ответе.
+fn history_items_from_messages(messages: &[(ChatMessage, Option<Usage>)]) -> Vec<HistoryItem> {
+    let mut items: Vec<HistoryItem> = messages
+        .iter()
+        .map(|(message, usage)| {
+            let role = match message.role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => Role::System,
+            };
+            let tokens = if matches!(role, Role::Assistant) { usage.map(|u| u.completion_tokens) } else { None };
+            HistoryItem { role, text: message.content.clone(), debug: None, tokens }
+        })
+        .collect();
+    for (i, (_, usage)) in messages.iter().enumerate() {
+        let Some(usage) = usage else { continue };
+        if i == 0 {
+            continue;
+        }
+        if let Role::User = items[i - 1].role {
+            if items[i - 1].tokens.is_none() {
+                items[i - 1].tokens = Some(usage.prompt_tokens);
+            }
+        }
+    }
+    items
 }
 
 #[derive(Default)]
@@ -242,7 +268,9 @@ impl CreateWizard {
 }
 
 enum AppEvent {
-    DirectResponse(Result<ChatCompletion>),
+    /// `prompt` — то, что было отправлено (нужно, чтобы дописать его в chat_history
+    /// вместе с ответом — см. обработчик события).
+    DirectResponse { prompt: String, result: Result<ChatCompletion> },
     AgentResponse { name: String, result: Result<llm_core::AgentReply> },
 }
 
@@ -257,6 +285,12 @@ struct DrawState<'a> {
     spinner_frame: usize,
     stats: &'a SessionStats,
     last_usage: Option<Usage>,
+    /// total_tokens самого последнего ответа открытого агента — как его вернула
+    /// модель, без нашего суммирования (None — вне экрана чата с агентом, или
+    /// агент ещё не отвечал).
+    context_tokens: Option<u64>,
+    /// Размер контекстного окна модели открытого агента (None — вне экрана чата с агентом).
+    context_window: Option<u32>,
     show_debug: bool,
     agents: &'a [AgentInfo],
     agents_selected: usize,
@@ -333,6 +367,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                F2 — управление агентами."
             .to_string(),
         debug: None,
+        tokens: None,
     }];
     let mut waiting = false;
     // Имя агента, чей ответ сейчас ожидается (None — если ждём прямой чат).
@@ -342,6 +377,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut spinner_frame = 0usize;
     let mut stats = SessionStats::default();
     let mut last_usage: Option<Usage> = None;
+    // Память прямого чата: сервер (веб) её ни в чём не хранит, история просто
+    // пересылается целиком с каждым новым запросом — здесь то же самое, только
+    // накопитель живёт в памяти процесса, а не в браузерной вкладке. Сбрасывается
+    // явно по Ctrl+N (аналог "Новая сессия" в вебе), не переживает выход из TUI.
+    let mut chat_history: Vec<ChatMessage> = Vec::new();
+    // total_tokens самого последнего обмена прямого чата — как его вернула модель,
+    // без нашего суммирования (см. context_bar в draw_chat).
+    let mut chat_context_tokens: Option<u64> = None;
     let mut show_debug = false;
     // Текущая позиция скролла чата и флаг "прижато к низу" (авто-прокрутка к новым сообщениям).
     let mut scroll: u16 = 0;
@@ -362,7 +405,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut wizard: Option<CreateWizard> = None;
     let mut agent_chat_name: Option<String> = None;
     let mut agent_histories: HashMap<String, Vec<HistoryItem>> = HashMap::new();
-    let mut agent_last_usage: HashMap<String, Usage> = HashMap::new();
+    // total_tokens самого последнего ответа каждого агента — как его вернула
+    // модель, без нашего суммирования (см. context_bar в draw_agent_chat).
+    // При первом открытии чата восстанавливается из истории в SQLite.
+    let mut agent_context_tokens: HashMap<String, u64> = HashMap::new();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut events = EventStream::new();
@@ -408,9 +454,21 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             .and_then(|n| agent_manager.get(n))
             .map(|a| a.is_running())
             .unwrap_or(false);
-        let screen_last_usage = match &screen {
-            Screen::AgentChat => agent_chat_name.as_ref().and_then(|n| agent_last_usage.get(n)).copied(),
-            _ => last_usage,
+        let screen_context_tokens = match &screen {
+            Screen::AgentChat => agent_chat_name.as_ref().and_then(|n| agent_context_tokens.get(n)).copied(),
+            Screen::Chat => chat_context_tokens,
+            _ => None,
+        };
+        // Размер контекстного окна не зависит от истории — у агента берём прямо из
+        // его снимка (см. Agent::context_window), у прямого чата — тот же глобальный
+        // LlmClient::context_window (у него нет своей модели/конфигурации, как у агента).
+        let screen_context_window = match &screen {
+            Screen::AgentChat => agent_chat_name
+                .as_ref()
+                .and_then(|n| agents_snapshot.iter().find(|a| &a.config.name == n))
+                .map(|a| a.context_window),
+            Screen::Chat => Some(client.context_window()),
+            _ => None,
         };
 
         let draw_state = DrawState {
@@ -423,7 +481,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             waiting_agent: waiting_agent.as_deref(),
             spinner_frame,
             stats: &stats,
-            last_usage: screen_last_usage,
+            last_usage,
+            context_tokens: screen_context_tokens,
+            context_window: screen_context_window,
             show_debug,
             agents: &agents_snapshot,
             agents_selected,
@@ -463,6 +523,23 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                     show_debug = !show_debug;
                                 }
+                                // Ctrl+N вместо простого 'n' — поле ввода тут текстовое, обычная
+                                // 'n' должна просто печататься. Аналог кнопки "Новая сессия" в вебе:
+                                // очищает и видимую историю, и память, которая уходит в запрос.
+                                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    history.clear();
+                                    history.push(HistoryItem {
+                                        role: Role::System,
+                                        text: "Новая сессия — история сброшена.".to_string(),
+                                        debug: None,
+                                        tokens: None,
+                                    });
+                                    chat_history.clear();
+                                    chat_context_tokens = None;
+                                    stats = SessionStats::default();
+                                    last_usage = None;
+                                    follow_bottom = true;
+                                }
                                 KeyCode::PageUp => {
                                     follow_bottom = false;
                                     scroll = scroll.saturating_sub(PAGE_STEP);
@@ -481,14 +558,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         role: Role::User,
                                         text: prompt.clone(),
                                         debug: None,
+                                        tokens: None,
                                     });
                                     waiting = true;
 
                                     let client = client.clone();
                                     let tx = tx.clone();
+                                    // Пересылаем всю накопленную историю + новое сообщение — модель
+                                    // должна видеть предыдущие реплики (см. chat_history выше).
+                                    let mut messages = chat_history.clone();
+                                    messages.push(ChatMessage::user(prompt.clone()));
                                     tokio::spawn(async move {
-                                        let response = client.ask(&prompt).await;
-                                        let _ = tx.send(AppEvent::DirectResponse(response));
+                                        let response = client.chat(&messages).await;
+                                        let _ = tx.send(AppEvent::DirectResponse { prompt, result: response });
                                     });
                                 }
                                 KeyCode::Char(c) if !waiting => input.push(c),
@@ -505,7 +587,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                             agent_chat_name = None;
                                         }
                                         agent_histories.remove(&pending);
-                                        agent_last_usage.remove(&pending);
+                                        agent_context_tokens.remove(&pending);
                                     }
                                     confirm_delete = None;
                                     continue;
@@ -547,14 +629,20 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 agent_histories.entry(name.clone()).or_insert_with(|| {
                                                     agent_manager
                                                         .get(&name)
-                                                        .map(|agent| {
-                                                            agent
-                                                                .history()
-                                                                .iter()
-                                                                .map(history_item_from_message)
-                                                                .collect()
-                                                        })
+                                                        .map(|agent| history_items_from_messages(&agent.history_with_usage()))
                                                         .unwrap_or_default()
+                                                });
+                                                // total_tokens последнего обмена из истории — то же число,
+                                                // что вернула модель, без нашего суммирования.
+                                                agent_context_tokens.entry(name.clone()).or_insert_with(|| {
+                                                    agent_manager
+                                                        .get(&name)
+                                                        .and_then(|agent| {
+                                                            agent.history_with_usage().into_iter().rev().find_map(
+                                                                |(_, usage)| usage.map(|u| u.total_tokens as u64),
+                                                            )
+                                                        })
+                                                        .unwrap_or(0)
                                                 });
                                                 agent_chat_name = Some(name);
                                                 screen = Screen::AgentChat;
@@ -634,6 +722,20 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     input.clear();
                                 }
                                 KeyCode::Tab => show_debug = !show_debug,
+                                // Ctrl+S вместо простого 's' — здесь поле ввода текстовое (не
+                                // список команд, как в Screen::AgentsList), поэтому обычная 's'
+                                // должна просто печататься в сообщение.
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(name) = agent_chat_name.clone() {
+                                        if let Some(agent) = agent_manager.get(&name) {
+                                            let _ = if agent.is_running() {
+                                                agent_manager.stop(&name)
+                                            } else {
+                                                agent_manager.start(&name)
+                                            };
+                                        }
+                                    }
+                                }
                                 KeyCode::PageUp => {
                                     follow_bottom = false;
                                     scroll = scroll.saturating_sub(PAGE_STEP);
@@ -654,6 +756,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 role: Role::User,
                                                 text: prompt.clone(),
                                                 debug: None,
+                                                tokens: None,
                                             });
                                             waiting = true;
                                             waiting_agent = Some(name.clone());
@@ -689,36 +792,58 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             }
             Some(app_event) = rx.recv() => {
                 match app_event {
-                    AppEvent::DirectResponse(Ok(completion)) => {
+                    AppEvent::DirectResponse { prompt, result: Ok(completion) } => {
+                        let response_tokens = completion.usage.map(|u| u.completion_tokens);
                         if let Some(usage) = completion.usage {
                             stats.requests += 1;
                             stats.tokens += usage.total_tokens as u64;
                             last_usage = Some(usage);
+                            chat_context_tokens = Some(usage.total_tokens as u64);
+                            if let Some(last) = history.last_mut() {
+                                if matches!(last.role, Role::User) && last.tokens.is_none() {
+                                    last.tokens = Some(usage.prompt_tokens);
+                                }
+                            }
                         }
+                        // В память кладём независимо от того, пришёл ли usage, — модель должна
+                        // помнить этот обмен в любом случае.
+                        chat_history.push(ChatMessage::user(prompt));
+                        chat_history.push(ChatMessage::assistant(completion.content.clone()));
                         history.push(HistoryItem {
                             role: Role::Assistant,
                             text: completion.content,
                             debug: Some((completion.request_json, completion.response_json)),
+                            tokens: response_tokens,
                         });
                     }
-                    AppEvent::DirectResponse(Err(err)) => {
+                    AppEvent::DirectResponse { result: Err(err), .. } => {
                         history.push(HistoryItem {
                             role: Role::Error,
                             text: format!("{err:#}"),
                             debug: None,
+                            tokens: None,
                         });
                     }
                     AppEvent::AgentResponse { name, result } => {
                         let entry = agent_histories.entry(name.clone()).or_default();
                         match result {
                             Ok(reply) => {
+                                let response_tokens = reply.usage.map(|u| u.completion_tokens);
                                 if let Some(usage) = reply.usage {
-                                    agent_last_usage.insert(name, usage);
+                                    if let Some(last) = entry.last_mut() {
+                                        if matches!(last.role, Role::User) && last.tokens.is_none() {
+                                            last.tokens = Some(usage.prompt_tokens);
+                                        }
+                                    }
+                                }
+                                if let Some(usage) = reply.usage {
+                                    agent_context_tokens.insert(name, usage.total_tokens as u64);
                                 }
                                 entry.push(HistoryItem {
                                     role: Role::Assistant,
                                     text: reply.text,
                                     debug: None,
+                                    tokens: response_tokens,
                                 });
                             }
                             Err(err) => {
@@ -726,6 +851,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     role: Role::Error,
                                     text: format!("{err:#}"),
                                     debug: None,
+                                    tokens: None,
                                 });
                             }
                         }
@@ -762,6 +888,8 @@ fn draw_chat(frame: &mut Frame, state: &DrawState) {
         spinner_frame,
         stats,
         last_usage,
+        context_tokens,
+        context_window,
         show_debug,
         ..
     } = *state;
@@ -783,7 +911,7 @@ fn draw_chat(frame: &mut Frame, state: &DrawState) {
         Span::styled(client.model(), Style::default().fg(Color::Cyan)),
         Span::raw("  ·  "),
         debug_status,
-        Span::raw("  ·  F2 агенты"),
+        Span::raw("  ·  F2 агенты  ·  Ctrl+N новая сессия"),
     ]))
     .block(
         Block::default()
@@ -812,14 +940,24 @@ fn draw_chat(frame: &mut Frame, state: &DrawState) {
         .scroll((scroll, 0));
     frame.render_widget(chat, chunks[1]);
 
-    let stats_line = match last_usage {
+    let mut stats_spans = vec![Span::raw(match last_usage {
         Some(usage) => format!(
             " Последний запрос: {} + {} = {} ток.  ·  За сессию: {} запрос(ов), {} ток.",
             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, stats.requests, stats.tokens
         ),
         None => " Расход токенов появится после первого ответа".to_string(),
-    };
-    let stats_para = Paragraph::new(stats_line).style(Style::default().fg(Color::DarkGray));
+    })];
+    // Заполнение контекста — total_tokens САМОГО ПОСЛЕДНЕГО обмена (как его вернула
+    // модель, без нашего суммирования), а не сумма по сессии — та же логика, что и
+    // в чате агента (см. context_bar) и в вебе.
+    if let Some(window) = context_window {
+        let used = context_tokens.unwrap_or(0);
+        let percent = if window == 0 { 0 } else { ((used as f64 / window as f64) * 100.0).min(100.0).round() as u32 };
+        stats_spans.push(Span::raw("  ·  Контекст: "));
+        stats_spans.push(Span::styled(context_bar(used, window, 20), Style::default().fg(context_bar_color(percent))));
+        stats_spans.push(Span::raw(format!(" {percent}% ({}/{})", format_tokens(used), format_tokens(window as u64))));
+    }
+    let stats_para = Paragraph::new(Line::from(stats_spans)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(stats_para, chunks[2]);
 
     let (input_title, border_color) = if waiting {
@@ -1134,6 +1272,44 @@ fn draw_agent_create_mode_choice(frame: &mut Frame, chunks: &[Rect; 4]) {
     );
 }
 
+/// Сокращённая запись количества токенов (как formatTokenCount в веб-интерфейсе):
+/// 96000 → "96K", 1234567 → "1.2M" — иначе большие числа неудобно читать в узкой
+/// строке статуса терминала.
+fn format_tokens(n: u64) -> String {
+    fn trimmed(v: f64) -> String {
+        let s = format!("{v:.1}");
+        s.trim_end_matches(".0").to_string()
+    }
+    if n >= 1_000_000 {
+        format!("{}M", trimmed(n as f64 / 1_000_000.0))
+    } else if n >= 1000 {
+        format!("{}K", trimmed(n as f64 / 1000.0))
+    } else {
+        n.to_string()
+    }
+}
+
+/// Текстовая полоса заполнения контекстного окна — терминал не рисует круги, как
+/// веб-интерфейс, поэтому здесь тот же смысл передаёт горизонтальная полоса из
+/// символов-блоков.
+fn context_bar(used: u64, window: u32, width: usize) -> String {
+    let ratio = if window == 0 { 0.0 } else { (used as f64 / window as f64).min(1.0) };
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Зелёный → жёлтый → красный по мере приближения к лимиту контекста — те же
+/// пороги, что и у кольца в веб-интерфейсе (см. contextRingColor в index.html).
+fn context_bar_color(percent: u32) -> Color {
+    if percent >= 90 {
+        Color::Red
+    } else if percent >= 70 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
 fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let area = frame.area();
     let chunks = layout_chunks_with_input_height(area, INPUT_HEIGHT_AGENT_CHAT);
@@ -1147,6 +1323,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::raw("  ·  агент: "),
         Span::styled(name, Style::default().fg(Color::Cyan)),
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
+        Span::raw("  ·  Ctrl+S старт/стоп"),
     ]))
     .block(
         Block::default()
@@ -1171,14 +1348,28 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         .scroll((state.scroll, 0));
     frame.render_widget(chat, chunks[1]);
 
-    let stats_line = match state.last_usage {
-        Some(usage) => format!(
-            " Последний запрос: {} + {} = {} ток.",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        ),
-        None => " Расход токенов появится после первого ответа агента".to_string(),
+    // Заполнение контекстного окна — числитель это total_tokens САМОГО ПОСЛЕДНЕГО
+    // ответа (как его вернула модель, без нашего суммирования — так же теперь
+    // делает и веб-интерфейс, см. agentChatStats.usedTokens в index.html),
+    // знаменатель — размер окна модели агента. Токены отдельного запроса/ответа
+    // показываются под каждым сообщением в самом диалоге (см. history_item_to_lines).
+    let context_line = match state.context_window {
+        Some(window) => {
+            let used = state.context_tokens.unwrap_or(0);
+            let percent = if window == 0 {
+                0
+            } else {
+                ((used as f64 / window as f64) * 100.0).min(100.0).round() as u32
+            };
+            Line::from(vec![
+                Span::raw(" Контекст: "),
+                Span::styled(context_bar(used, window, 24), Style::default().fg(context_bar_color(percent))),
+                Span::raw(format!(" {percent}% ({}/{})", format_tokens(used), format_tokens(window as u64))),
+            ])
+        }
+        None => Line::from(" Расход токенов появится после первого ответа агента"),
     };
-    frame.render_widget(Paragraph::new(stats_line).style(Style::default().fg(Color::DarkGray)), chunks[2]);
+    frame.render_widget(Paragraph::new(context_line).style(Style::default().fg(Color::DarkGray)), chunks[2]);
 
     let (input_title, border_color) = if this_agent_waiting {
         (format!(" Ожидание ответа {} ", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow)
@@ -1188,7 +1379,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
             Color::DarkGray,
         )
     } else if !state.agent_chat_running {
-        (" Агент остановлен — вернитесь (Esc) и запустите его (s) ".to_string(), Color::DarkGray)
+        (" Агент остановлен — Ctrl+S запустить (или Esc и 's' в списке) ".to_string(), Color::DarkGray)
     } else {
         (" Запрос — Enter отправить, Esc назад к списку агентов ".to_string(), Color::Reset)
     };
@@ -1230,6 +1421,21 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
             ]));
         }
     }
+    // Токены этого конкретного сообщения — как в веб-интерфейсе, прямо под
+    // текстом: "токены запроса" у сообщения пользователя, "токены ответа" у
+    // ответа ассистента (см. HistoryItem::tokens).
+    if let Some(tokens) = item.tokens {
+        let token_label = match item.role {
+            Role::User => "токены запроса",
+            Role::Assistant => "токены ответа",
+            _ => "токены",
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(prefix_width)),
+            Span::styled(format!("{token_label}: {tokens}"), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
     if show_debug {
         if let Some((request_json, response_json)) = &item.debug {
             lines.push(debug_heading_line("→ Запрос модели (JSON):"));
@@ -1257,4 +1463,45 @@ fn debug_body_lines(json: &str, width: usize) -> Vec<Line<'static>> {
         .into_iter()
         .map(|part| Line::from(Span::raw(part.into_owned())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// usage приходит от API одной суммой на весь обмен и хранится в БД только на
+    /// сообщении ассистента (см. Db::append_message в agent.rs) — эта проверка
+    /// фиксирует, что history_items_from_messages правильно раскладывает её:
+    /// prompt_tokens уходит на предшествующее сообщение пользователя, а
+    /// completion_tokens остаётся на самом ответе.
+    #[test]
+    fn pairs_usage_across_user_and_assistant_messages() {
+        let usage1 = Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+        let usage2 = Usage { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 };
+        let messages = vec![
+            (ChatMessage::user("привет"), None),
+            (ChatMessage::assistant("здравствуйте"), Some(usage1)),
+            (ChatMessage::user("как дела"), None),
+            (ChatMessage::assistant("хорошо"), Some(usage2)),
+        ];
+
+        let items = history_items_from_messages(&messages);
+
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].tokens, Some(10)); // запрос пользователя #1
+        assert_eq!(items[1].tokens, Some(5)); // ответ ассистента #1
+        assert_eq!(items[2].tokens, Some(20)); // запрос пользователя #2
+        assert_eq!(items[3].tokens, Some(8)); // ответ ассистента #2
+    }
+
+    /// Сообщение без usage (например, ассистент так и не ответил) не должно
+    /// падать и должно оставлять токены неизвестными (None), а не паниковать
+    /// на индексации предыдущего элемента.
+    #[test]
+    fn leaves_tokens_none_without_usage() {
+        let messages = vec![(ChatMessage::user("привет"), None)];
+        let items = history_items_from_messages(&messages);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tokens, None);
+    }
 }

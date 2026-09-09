@@ -22,6 +22,8 @@
     --user-bubble: #2a3550;
     --assistant-bubble: #1e222b;
     --error: #ff6b6b;
+    --ok: #4ade80;
+    --warn: #fbbf24;
     --radius: 14px;
   }
 
@@ -97,6 +99,102 @@
   }
 
   .session-stats b {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Круглый индикатор заполнения контекстного окна: кольцо SVG (закрашивается
+     дугой по мере роста процента) + подпись "использовано / всего" рядом. Цвет
+     дуги смещается зелёный → жёлтый → красный по мере приближения к лимиту, чтобы
+     было видно на глаз, когда контекст скоро закончится. */
+  .ctx-meter {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Author-правило display:flex выше перебивает дефолтный [hidden]{display:none}
+     браузера — явно возвращаем скрытие, когда атрибут hidden выставлен через JS.
+     Без этого при переключении на агента без данных индикатор не скрывался бы и
+     показывал бы устаревшие числа предыдущего агента (см. updateContextMeter). */
+  .ctx-meter[hidden] {
+    display: none;
+  }
+
+  /* Свой тултип вместо нативного title — тот показывается с задержкой и не всегда
+     всплывает надёжно; этот виден сразу же при наведении на кольцо или подпись. */
+  .ctx-tooltip {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 11.5px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    white-space: nowrap;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-4px);
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    pointer-events: none;
+    z-index: 20;
+  }
+
+  .ctx-meter:hover .ctx-tooltip {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+  }
+
+  .ctx-ring {
+    position: relative;
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+  }
+
+  .ctx-ring svg {
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+  }
+
+  .ctx-ring-track {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 4;
+  }
+
+  .ctx-ring-fill {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 4;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;
+  }
+
+  .ctx-ring-percent {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .ctx-meter-label {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.3;
+  }
+
+  .ctx-meter-label b {
     color: var(--text);
     font-variant-numeric: tabular-nums;
   }
@@ -1224,6 +1322,14 @@
     align-self: flex-start;
   }
 
+  .agent-message-meta {
+    display: block;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
   /* ---------- Полноэкранный чат с агентом ---------- */
 
   .agent-chat-header {
@@ -1302,6 +1408,17 @@
       <span>Запросов: <b id="stat-requests">0</b></span>
       <span>Входящие ток.: <b id="stat-tokens-in">0</b></span>
       <span>Исходящие ток.: <b id="stat-tokens-out">0</b></span>
+    </div>
+    <div class="ctx-meter" id="chat-ctx-meter" hidden>
+      <div class="ctx-ring">
+        <svg viewBox="0 0 40 40">
+          <circle class="ctx-ring-track" cx="20" cy="20" r="16"></circle>
+          <circle class="ctx-ring-fill" cx="20" cy="20" r="16"></circle>
+        </svg>
+        <span class="ctx-ring-percent"></span>
+      </div>
+      <span class="ctx-meter-label"></span>
+      <span class="ctx-tooltip"></span>
     </div>
   </div>
 </header>
@@ -1495,6 +1612,18 @@
       <strong id="agent-chat-name"></strong>
       <span class="card-hint" id="agent-chat-meta"></span>
     </div>
+    <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
+    <div class="ctx-meter" id="agent-ctx-meter" hidden>
+      <div class="ctx-ring">
+        <svg viewBox="0 0 40 40">
+          <circle class="ctx-ring-track" cx="20" cy="20" r="16"></circle>
+          <circle class="ctx-ring-fill" cx="20" cy="20" r="16"></circle>
+        </svg>
+        <span class="ctx-ring-percent"></span>
+      </div>
+      <span class="ctx-meter-label"></span>
+      <span class="ctx-tooltip"></span>
+    </div>
   </div>
   <main class="agent-chat-main" id="agent-chat-main"></main>
   <footer class="agent-chat-footer">
@@ -1513,6 +1642,7 @@ const sendBtn = document.getElementById('send');
 const statRequests = document.getElementById('stat-requests');
 const statTokensIn = document.getElementById('stat-tokens-in');
 const statTokensOut = document.getElementById('stat-tokens-out');
+const chatCtxMeterEl = document.getElementById('chat-ctx-meter');
 const debugToggle = document.getElementById('debug-toggle');
 const settingsBtn = document.getElementById('settings-btn');
 const settingsClose = document.getElementById('settings-close');
@@ -1534,6 +1664,11 @@ let sessionRequests = 0;
 let sessionTokensIn = 0;
 let sessionTokensOut = 0;
 let sending = false;
+// Память обычного чата: сервер сам её не хранит (в отличие от именованных агентов,
+// у которых история в SQLite) — вкладка накапливает {role, content} здесь и отправляет
+// целиком с каждым новым запросом. Живёт только в этой вкладке до "Новая сессия" или
+// перезагрузки страницы — не персистится.
+let chatHistory = [];
 
 function loadSettings() {
   try {
@@ -1675,6 +1810,8 @@ function startNewSession() {
   statRequests.textContent = sessionRequests;
   statTokensIn.textContent = sessionTokensIn;
   statTokensOut.textContent = sessionTokensOut;
+  chatHistory = [];
+  updateContextMeter(chatCtxMeterEl, null, null);
   promptEl.focus();
 }
 
@@ -1714,6 +1851,67 @@ function removeTyping() {
 function formatUsage(usage) {
   if (!usage) return 'токены: недоступно';
   return `токены: ${usage.prompt_tokens} + ${usage.completion_tokens} = ${usage.total_tokens}`;
+}
+
+function formatRequestTokens(usage) {
+  return 'токены запроса: ' + (usage ? usage.prompt_tokens : 'недоступно');
+}
+
+function formatResponseTokens(usage) {
+  return 'токены ответа: ' + (usage ? usage.completion_tokens : 'недоступно');
+}
+
+/* ---------- Индикатор заполнения контекстного окна ---------- */
+
+const CTX_RING_RADIUS = 16;
+const CTX_RING_CIRCUMFERENCE = 2 * Math.PI * CTX_RING_RADIUS;
+
+function formatTokenCount(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+  return String(n);
+}
+
+// Зелёный → жёлтый → красный по мере приближения к лимиту контекста, чтобы было
+// видно на глаз, когда он скоро закончится.
+function contextRingColor(percent) {
+  if (percent >= 90) return 'var(--error)';
+  if (percent >= 70) return 'var(--warn)';
+  return 'var(--ok)';
+}
+
+// Обновляет кольцо + подпись внутри контейнера .ctx-meter (см. разметку в шапках
+// чатов). Скрывает индикатор целиком, если размер контекстного окна модели
+// неизвестен — показывать процент без знаменателя было бы бессмысленно.
+function updateContextMeter(container, usedTokens, contextWindow) {
+  if (!container) return;
+  if (!contextWindow || typeof usedTokens !== 'number') {
+    container.hidden = true;
+    // Помимо скрытия — стираем цифры предыдущего агента, а не только прячем их:
+    // иначе при переключении на агента без данных остаются видны чужие числа
+    // (см. .ctx-meter[hidden] в CSS — display:flex у контейнера перебивал бы
+    // скрытие сам по себе, но это вторая, самостоятельная защита от утечки).
+    container.querySelector('.ctx-ring-percent').textContent = '';
+    container.querySelector('.ctx-meter-label').textContent = '';
+    container.title = '';
+    const tooltip = container.querySelector('.ctx-tooltip');
+    if (tooltip) tooltip.textContent = '';
+    return;
+  }
+  container.hidden = false;
+  const percent = Math.max(0, Math.min(100, Math.round((usedTokens / contextWindow) * 100)));
+  const fill = container.querySelector('.ctx-ring-fill');
+  fill.style.strokeDasharray = String(CTX_RING_CIRCUMFERENCE);
+  fill.style.strokeDashoffset = String(CTX_RING_CIRCUMFERENCE * (1 - percent / 100));
+  fill.style.stroke = contextRingColor(percent);
+  container.querySelector('.ctx-ring-percent').textContent = percent + '%';
+  container.querySelector('.ctx-meter-label').innerHTML =
+    'Контекст: <b>' + formatTokenCount(usedTokens) + '</b> / ' + formatTokenCount(contextWindow);
+  const tooltipText =
+    `Размер контекстного окна: ${contextWindow} токенов · использовано: ${usedTokens} (${percent}%)`;
+  container.title = tooltipText;
+  const tooltip = container.querySelector('.ctx-tooltip');
+  if (tooltip) tooltip.textContent = tooltipText;
 }
 
 function addDebugBlock(bubble, requestJson, responseJson) {
@@ -1771,7 +1969,7 @@ async function send() {
   promptEl.value = '';
   autoGrow();
 
-  addRow('user', prompt);
+  const userBubble = addRow('user', prompt);
   addTyping();
 
   try {
@@ -1788,6 +1986,7 @@ async function send() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt,
+        history: chatHistory,
         json_schema: jsonSchema,
         max_tokens: Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null,
         stop: stopList,
@@ -1802,13 +2001,32 @@ async function send() {
     if (!res.ok || data.error) {
       addRow('error', 'Ошибка: ' + (data.error || res.statusText));
     } else {
+      const userMeta = document.createElement('span');
+      userMeta.className = 'meta';
+      userMeta.textContent = formatRequestTokens(data.usage);
+      userBubble.appendChild(userMeta);
+
       const bubble = addRow('assistant', data.answer);
       const meta = document.createElement('span');
       meta.className = 'meta';
-      meta.textContent = formatUsage(data.usage);
+      meta.textContent = formatResponseTokens(data.usage);
       bubble.appendChild(meta);
       addDebugBlock(bubble, data.requestJson, data.responseJson);
       scrollToBottom();
+
+      // Дописываем в память чата — именно это отправится с СЛЕДУЮЩИМ запросом,
+      // чтобы модель видела предыдущие сообщения (см. history в /api/ask).
+      chatHistory.push({ role: 'user', content: prompt });
+      chatHistory.push({ role: 'assistant', content: data.answer });
+
+      // Заполнение контекста — total_tokens этого обмена (как его вернула модель,
+      // без нашего суммирования), а не сумма по всем предыдущим запросам — та же
+      // логика, что и в чате агента.
+      updateContextMeter(
+        chatCtxMeterEl,
+        data.usage ? data.usage.total_tokens : null,
+        data.context_window
+      );
 
       sessionRequests += 1;
       if (data.usage) {
@@ -2527,12 +2745,14 @@ const agentModeHint = document.getElementById('agent-mode-hint');
 const viewAgents = document.getElementById('view-agents');
 const viewAgentChat = document.getElementById('view-agent-chat');
 const agentChatBackBtn = document.getElementById('agent-chat-back');
+const agentChatToggleBtn = document.getElementById('agent-chat-toggle');
 const agentChatStatusDot = document.getElementById('agent-chat-status-dot');
 const agentChatNameEl = document.getElementById('agent-chat-name');
 const agentChatMetaEl = document.getElementById('agent-chat-meta');
 const agentChatMainEl = document.getElementById('agent-chat-main');
 const agentChatInputEl = document.getElementById('agent-chat-input');
 const agentChatSendBtn = document.getElementById('agent-chat-send');
+const agentCtxMeterEl = document.getElementById('agent-ctx-meter');
 
 // Локальная история переписки с каждым агентом (по имени), отображаемая в
 // полноэкранном чате. Настоящее хранилище истории — SQLite на сервере (см.
@@ -2543,6 +2763,27 @@ const agentChats = {};
 // Имена агентов, для которых история уже подгружена с сервера в этой вкладке
 // (чтобы не запрашивать её повторно при каждом открытии чата).
 const agentChatsHistoryLoaded = new Set();
+// Токены по каждому агенту (по имени): usedTokens — total_tokens САМОГО
+// ПОСЛЕДНЕГО обмена (используется как числитель кольца заполнения контекста,
+// знаменатель — contextWindow). Берём именно последний total_tokens, а не
+// сумму по всем обменам, — это число в точности то, что вернула модель,
+// без вычислений с нашей стороны (сумма по диалогу была бы нашим собственным
+// подсчётом и росла бы быстрее, чем реальный контекст). Токены отдельного
+// запроса/ответа показываются прямо под соответствующим сообщением
+// (см. renderAgentMessage) — это отдельная метрика.
+const agentChatStats = {};
+
+function ensureAgentChatStats(name) {
+  if (!agentChatStats[name]) {
+    agentChatStats[name] = { usedTokens: null, contextWindow: null };
+  }
+  return agentChatStats[name];
+}
+
+function updateAgentChatStats(name) {
+  const stats = ensureAgentChatStats(name);
+  updateContextMeter(agentCtxMeterEl, stats.usedTokens, stats.contextWindow);
+}
 // Режим создания: 'quick' — только имя и системный промпт (остальное по
 // умолчанию), 'advanced' — полный набор параметров.
 let agentCreateMode = 'quick';
@@ -2561,8 +2802,7 @@ agentModeButtons.forEach((btn) => {
 
 function agentMetaLine(config) {
   const parts = [];
-  parts.push('модель: ' + (config.model || '__MODEL_NAME__ (по умолчанию)'));
-  parts.push('токены: ' + (config.show_tokens ? 'показывать' : 'скрывать'));
+  parts.push('модель: ' + (config.model || '__MODEL_NAME__'));
   if (config.temperature !== null && config.temperature !== undefined) parts.push('temperature: ' + config.temperature);
   if (config.top_p !== null && config.top_p !== undefined) parts.push('top_p: ' + config.top_p);
   if (config.max_tokens !== null && config.max_tokens !== undefined) parts.push('макс. токенов: ' + config.max_tokens);
@@ -2571,12 +2811,50 @@ function agentMetaLine(config) {
   return parts.join(' · ');
 }
 
+// Токены конкретного обмена приходят от API одной суммой на весь запрос
+// (см. агент.rs), поэтому prompt_tokens показываем под сообщением
+// пользователя ("сколько ушло в запрос"), а completion_tokens — под ответом
+// ассистента ("сколько получили в ответ").
 function renderAgentMessage(msg) {
   const row = document.createElement('div');
   row.className = 'agent-message ' + msg.role;
   const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
-  row.textContent = prefix + msg.text;
+  const text = document.createElement('span');
+  text.textContent = prefix + msg.text;
+  row.appendChild(text);
+
+  const tokens = msg.role === 'user' ? msg.requestTokens : msg.role === 'assistant' ? msg.responseTokens : null;
+  if (typeof tokens === 'number') {
+    setAgentMessageTokens(row, msg.role, tokens);
+  }
   return row;
+}
+
+function setAgentMessageTokens(row, role, tokens) {
+  let meta = row.querySelector('.agent-message-meta');
+  if (!meta) {
+    meta = document.createElement('span');
+    meta.className = 'agent-message-meta';
+    row.appendChild(meta);
+  }
+  meta.textContent = (role === 'user' ? 'токены запроса: ' : 'токены ответа: ') + tokens;
+}
+
+// Токены пары "запрос-ответ" от API приходят одной суммой на сообщении
+// ассистента (prompt_tokens относится к предыдущему сообщению пользователя,
+// completion_tokens — к самому ответу). Раскладываем их по сообщениям, чтобы
+// renderAgentMessage мог показать нужное число под каждым из них.
+function applyAgentTokenMeta(messages) {
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (msg.role !== 'assistant' || !msg.usage) continue;
+    msg.responseTokens = msg.usage.completion_tokens;
+    const prev = messages[i - 1];
+    if (prev && prev.role === 'user' && prev.requestTokens == null) {
+      prev.requestTokens = msg.usage.prompt_tokens;
+    }
+  }
+  return messages;
 }
 
 // Последний известный снимок списка агентов — используется, чтобы обновить
@@ -2630,6 +2908,7 @@ function renderAgents(agents) {
       await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE' });
       delete agentChats[name];
       agentChatsHistoryLoaded.delete(name);
+      delete agentChatStats[name];
       await fetchAgents();
     });
 
@@ -2692,7 +2971,14 @@ function updateAgentChatHeader(name) {
   agentChatMetaEl.textContent = info ? agentMetaLine(info.config) + (running ? '' : ' · остановлен') : 'агент не найден';
   agentChatInputEl.disabled = !running;
   agentChatSendBtn.disabled = !running;
-  agentChatInputEl.placeholder = running ? 'Написать агенту...' : 'Сначала запустите агента (вкладка «Агенты»)';
+  agentChatInputEl.placeholder = running ? 'Написать агенту...' : 'Сначала запустите агента';
+  agentChatToggleBtn.hidden = !info;
+  agentChatToggleBtn.textContent = running ? '⏸ Остановить' : '▶ Запустить';
+
+  if (info && typeof info.context_window === 'number') {
+    ensureAgentChatStats(name).contextWindow = info.context_window;
+  }
+  updateAgentChatStats(name);
 }
 
 function renderAgentChatMessages(name) {
@@ -2717,8 +3003,20 @@ async function openAgentChat(name) {
       const data = await res.json();
       const restored = (data.messages || [])
         .filter((m) => m.role === 'user' || m.role === 'assistant')
-        .map((m) => ({ role: m.role, text: m.content }));
-      agentChats[name] = restored.concat(agentChats[name]);
+        .map((m) => ({ role: m.role, text: m.content, usage: m.usage || null }));
+      agentChats[name] = applyAgentTokenMeta(restored.concat(agentChats[name]));
+      const stats = ensureAgentChatStats(name);
+      // Заполнение контекста — total_tokens самого последнего обмена в истории
+      // (именно такую историю агент отправит в следующем запросе), а не сумма
+      // по всем обменам.
+      const lastWithUsage = [...agentChats[name]].reverse().find((m) => m.usage);
+      if (lastWithUsage) {
+        stats.usedTokens = lastWithUsage.usage.total_tokens;
+      }
+      if (typeof data.context_window === 'number') {
+        stats.contextWindow = data.context_window;
+      }
+      if (currentAgentChatName === name) updateAgentChatStats(name);
       if (currentAgentChatName === name) renderAgentChatMessages(name);
     } catch (e) {
       // не удалось подгрузить историю с сервера — продолжаем с тем, что уже отображено
@@ -2735,6 +3033,20 @@ function closeAgentChat() {
 
 agentChatBackBtn.addEventListener('click', closeAgentChat);
 
+agentChatToggleBtn.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const info = findAgentInfo(name);
+  const running = info ? info.running : false;
+  agentChatToggleBtn.disabled = true;
+  try {
+    await fetch(`/api/agents/${encodeURIComponent(name)}/${running ? 'stop' : 'start'}`, { method: 'POST' });
+    await fetchAgents();
+  } finally {
+    agentChatToggleBtn.disabled = false;
+  }
+});
+
 async function sendAgentChatMessage() {
   const name = currentAgentChatName;
   if (!name) return;
@@ -2745,7 +3057,8 @@ async function sendAgentChatMessage() {
 
   const userMsg = { role: 'user', text: prompt };
   agentChats[name].push(userMsg);
-  agentChatMainEl.appendChild(renderAgentMessage(userMsg));
+  const userRow = renderAgentMessage(userMsg);
+  agentChatMainEl.appendChild(userRow);
   agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
 
   try {
@@ -2756,9 +3069,24 @@ async function sendAgentChatMessage() {
     });
     const data = await res.json();
     const msg = data.error ? { role: 'error', text: data.error } : { role: 'assistant', text: data.answer };
+    if (!data.error && data.usage) {
+      userMsg.requestTokens = data.usage.prompt_tokens;
+      msg.responseTokens = data.usage.completion_tokens;
+      if (currentAgentChatName === name) setAgentMessageTokens(userRow, 'user', userMsg.requestTokens);
+    }
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
       agentChatMainEl.appendChild(renderAgentMessage(msg));
+    }
+    if (!data.error) {
+      const stats = ensureAgentChatStats(name);
+      if (data.usage) {
+        stats.usedTokens = data.usage.total_tokens;
+      }
+      if (typeof data.context_window === 'number') {
+        stats.contextWindow = data.context_window;
+      }
+      if (currentAgentChatName === name) updateAgentChatStats(name);
     }
   } catch (e) {
     const msg = { role: 'error', text: 'Ошибка сети: ' + e };

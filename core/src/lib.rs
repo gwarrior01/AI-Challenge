@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub use agent::{Agent, AgentConfig, AgentInfo, AgentManager, AgentReply};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -112,10 +112,20 @@ pub struct LlmClient {
     base_url: String,
     api_key: String,
     model: String,
+    /// Размер контекстного окна из LLM_CONTEXT_WINDOW, если он задан — иначе
+    /// используется [`DEFAULT_CONTEXT_WINDOW`] (см. [`LlmClient::context_window`]).
+    context_window_override: Option<u32>,
 }
 
+/// Запасной размер контекстного окна, когда LLM_CONTEXT_WINDOW не задан. OpenAI-совместимый
+/// API не сообщает реальный лимит модели в ответе на chat/completions, а у разных провайдеров
+/// (OpenAI, Ollama, LM Studio, OpenRouter...) нет единого способа узнать его программно —
+/// поэтому точное значение для своей модели нужно указывать явно через переменную окружения.
+const DEFAULT_CONTEXT_WINDOW: u32 = 262_000;
+
 impl LlmClient {
-    /// Читает LLM_API_URL, LLM_API_KEY и (опционально) LLM_MODEL из переменных окружения.
+    /// Читает LLM_API_URL, LLM_API_KEY, (опционально) LLM_MODEL и LLM_CONTEXT_WINDOW
+    /// из переменных окружения.
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("LLM_API_URL").context(
             "не задана переменная окружения LLM_API_URL (например https://api.openai.com/v1)",
@@ -123,18 +133,28 @@ impl LlmClient {
         let api_key = std::env::var("LLM_API_KEY")
             .context("не задана переменная окружения LLM_API_KEY")?;
         let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let context_window_override = std::env::var("LLM_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok());
 
         Ok(Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            context_window_override,
         })
     }
 
     /// Название используемой модели.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Размер контекстного окна: значение из LLM_CONTEXT_WINDOW, если оно задано,
+    /// иначе [`DEFAULT_CONTEXT_WINDOW`].
+    pub fn context_window(&self) -> u32 {
+        self.context_window_override.unwrap_or(DEFAULT_CONTEXT_WINDOW)
     }
 
     /// Отправляет список сообщений в LLM и возвращает текст ответа вместе с расходом токенов.

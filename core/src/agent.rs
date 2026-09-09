@@ -62,10 +62,17 @@ impl AgentConfig {
 pub struct AgentInfo {
     pub config: AgentConfig,
     pub running: bool,
+    /// Размер контекстного окна (см. [`LlmClient::context_window`]) — используется
+    /// интерфейсом для индикатора заполнения контекста. Числитель этого индикатора —
+    /// total_tokens самого последнего ответа (см. [`AgentReply::usage`]), а не сумма
+    /// по всему диалогу: так это число всегда в точности то, что вернула модель,
+    /// без вычислений с нашей стороны.
+    pub context_window: u32,
 }
 
 /// Результат обработки запроса агентом: итоговый текст (уже с учётом
-/// `show_tokens`) и сырые метрики расхода токенов.
+/// `show_tokens`) и сырые метрики расхода токенов за этот запрос — как их
+/// вернула модель, без пересчёта.
 #[derive(Debug, Clone)]
 pub struct AgentReply {
     pub text: String,
@@ -84,13 +91,16 @@ pub struct Agent {
     /// заново из актуальной конфигурации при каждом запросе), восстановленная
     /// из SQLite при создании агента. Каждое новое сообщение дописывается и в
     /// эту память, и в БД — без этого при перезапуске приложения агент забывал
-    /// бы прошлые реплики и начинал разговор с чистого листа.
-    history: Mutex<Vec<ChatMessage>>,
+    /// бы прошлые реплики и начинал разговор с чистого листа. Токены хранятся
+    /// рядом с каждым сообщением (см. [`Self::history_with_usage`]) — API
+    /// отдаёт их одной суммой на весь обмен, поэтому у сообщения пользователя
+    /// значение всегда `None`, а у ответа ассистента — метрики этого обмена.
+    history: Mutex<Vec<(ChatMessage, Option<Usage>)>>,
     db: Arc<Db>,
 }
 
 impl Agent {
-    fn new(config: AgentConfig, client: LlmClient, db: Arc<Db>, history: Vec<ChatMessage>) -> Self {
+    fn new(config: AgentConfig, client: LlmClient, db: Arc<Db>, history: Vec<(ChatMessage, Option<Usage>)>) -> Self {
         let name = config.name.clone();
         Self {
             name,
@@ -117,6 +127,13 @@ impl Agent {
     /// Текущая история диалога (для отображения в интерфейсах, например при
     /// открытии чата с агентом после перезапуска приложения).
     pub fn history(&self) -> Vec<ChatMessage> {
+        self.history.lock().expect("история агента отравлена паникой").iter().map(|(m, _)| m.clone()).collect()
+    }
+
+    /// История диалога вместе с метриками токенов каждого сообщения — для
+    /// веб-интерфейса, которому нужно показать расход токенов рядом с каждым
+    /// запросом и ответом, а не только суммарно по диалогу.
+    pub fn history_with_usage(&self) -> Vec<(ChatMessage, Option<Usage>)> {
         self.history.lock().expect("история агента отравлена паникой").clone()
     }
 
@@ -131,8 +148,13 @@ impl Agent {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    /// Размер контекстного окна (см. [`LlmClient::context_window`]).
+    pub fn context_window(&self) -> u32 {
+        self.client.context_window()
+    }
+
     pub fn info(&self) -> AgentInfo {
-        AgentInfo { config: self.config(), running: self.is_running() }
+        AgentInfo { config: self.config(), running: self.is_running(), context_window: self.context_window() }
     }
 
     /// Принимает запрос пользователя и обращается к LLM через API, добавляя его
@@ -152,7 +174,7 @@ impl Agent {
         }
         {
             let history = self.history.lock().expect("история агента отравлена паникой");
-            messages.extend(history.iter().cloned());
+            messages.extend(history.iter().map(|(m, _)| m.clone()));
         }
         messages.push(ChatMessage::user(prompt));
 
@@ -171,15 +193,18 @@ impl Agent {
         let assistant_message = ChatMessage::assistant(completion.content.clone());
         {
             let mut history = self.history.lock().expect("история агента отравлена паникой");
-            history.push(user_message.clone());
-            history.push(assistant_message.clone());
+            history.push((user_message.clone(), None));
+            history.push((assistant_message.clone(), completion.usage));
         }
         // Лучшая попытка: ответ уже получен и не должен потеряться для
         // пользователя из-за сбоя записи в БД — при ошибке лишь предупреждаем.
-        if let Err(err) = self.db.append_message(&self.name, &user_message) {
+        if let Err(err) = self.db.append_message(&self.name, &user_message, None) {
             eprintln!("не удалось сохранить сообщение пользователя в БД: {err:#}");
         }
-        if let Err(err) = self.db.append_message(&self.name, &assistant_message) {
+        // Метрики токенов приходят от API одной суммой на весь обмен (запрос +
+        // ответ), поэтому сохраняем их при сообщении ассистента — иначе они
+        // задвоились бы при подсчёте суммы по диалогу.
+        if let Err(err) = self.db.append_message(&self.name, &assistant_message, completion.usage) {
             eprintln!("не удалось сохранить ответ агента в БД: {err:#}");
         }
 
@@ -187,7 +212,7 @@ impl Agent {
         if config.show_tokens {
             if let Some(usage) = completion.usage {
                 text.push_str(&format!(
-                    "\n\n[токены: запрос {} + ответ {} = всего {}]",
+                    "\n\n[токены: запрос {} + ответ {} = {}]",
                     usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
                 ));
             }
@@ -215,16 +240,37 @@ impl Db {
                  running INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS messages (
-                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                 agent_name TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
-                 role       TEXT NOT NULL,
-                 content    TEXT NOT NULL,
-                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_name       TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+                 role             TEXT NOT NULL,
+                 content          TEXT NOT NULL,
+                 created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 prompt_tokens     INTEGER,
+                 completion_tokens INTEGER,
+                 total_tokens      INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_messages_agent_name ON messages(agent_name);",
         )
         .context("не удалось создать таблицы БД агентов")?;
+        Self::migrate_token_columns(&conn).context("не удалось обновить схему БД агентов")?;
         Ok(Self(Mutex::new(conn)))
+    }
+
+    /// Добавляет столбцы токенов в таблицу `messages`, созданную более ранней
+    /// версией приложения (до появления подсчёта токенов за сообщение) — без этой
+    /// миграции у уже существующих файлов БД агентов (`agents.db`) не было бы
+    /// этих столбцов и `append_message`/`load_messages` завершались бы ошибкой.
+    fn migrate_token_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+        let existing: Vec<String> =
+            stmt.query_map([], |row| row.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for column in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+            if !existing.iter().any(|c| c == column) {
+                conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} INTEGER"), [])?;
+            }
+        }
+        Ok(())
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -252,14 +298,26 @@ impl Db {
             .collect()
     }
 
-    /// Загружает историю сообщений одного агента в порядке их появления.
-    fn load_messages(&self, name: &str) -> Result<Vec<ChatMessage>> {
+    /// Загружает историю сообщений одного агента в порядке их появления, вместе
+    /// с метриками токенов (см. [`Agent::history_with_usage`]).
+    fn load_messages(&self, name: &str) -> Result<Vec<(ChatMessage, Option<Usage>)>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT role, content FROM messages WHERE agent_name = ?1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT role, content, prompt_tokens, completion_tokens, total_tokens \
+             FROM messages WHERE agent_name = ?1 ORDER BY id ASC",
+        )?;
         let rows = stmt
             .query_map([name], |row| {
-                Ok(ChatMessage { role: row.get(0)?, content: row.get(1)? })
+                let prompt_tokens: Option<u32> = row.get(2)?;
+                let completion_tokens: Option<u32> = row.get(3)?;
+                let total_tokens: Option<u32> = row.get(4)?;
+                let usage = match (prompt_tokens, completion_tokens, total_tokens) {
+                    (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
+                        Some(Usage { prompt_tokens, completion_tokens, total_tokens })
+                    }
+                    _ => None,
+                };
+                Ok((ChatMessage { role: row.get(0)?, content: row.get(1)? }, usage))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -288,10 +346,18 @@ impl Db {
         Ok(())
     }
 
-    fn append_message(&self, agent_name: &str, message: &ChatMessage) -> Result<()> {
+    fn append_message(&self, agent_name: &str, message: &ChatMessage, usage: Option<Usage>) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO messages (agent_name, role, content) VALUES (?1, ?2, ?3)",
-            rusqlite::params![agent_name, message.role, message.content],
+            "INSERT INTO messages (agent_name, role, content, prompt_tokens, completion_tokens, total_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                agent_name,
+                message.role,
+                message.content,
+                usage.map(|u| u.prompt_tokens),
+                usage.map(|u| u.completion_tokens),
+                usage.map(|u| u.total_tokens),
+            ],
         )?;
         Ok(())
     }

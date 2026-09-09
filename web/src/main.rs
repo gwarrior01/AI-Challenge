@@ -28,6 +28,12 @@ struct AppState {
 #[derive(Deserialize)]
 struct AskRequest {
     prompt: String,
+    /// Предыдущие сообщения диалога — присылает браузер (хранит их у себя в памяти вкладки,
+    /// пока пользователь не нажмёт "Новая сессия"). Сервер не хранит историю обычного чата
+    /// сам — в отличие от именованных агентов, у которых она в SQLite; здесь сервер просто
+    /// пересылает то, что прислал клиент, добавляя новое сообщение пользователя.
+    #[serde(default)]
+    history: Vec<ChatMessage>,
     /// JSON Schema желаемого формата ответа — необязательная, задаётся в настройках интерфейса.
     /// Если задана, модели передаётся системная инструкция и нативный response_format.
     #[serde(default)]
@@ -101,6 +107,7 @@ async fn ask(
             "json_schema": { "name": "response", "schema": schema, "strict": true },
         }));
     }
+    messages.extend(req.history);
     messages.push(ChatMessage::user(req.prompt));
 
     let options = ChatOptions {
@@ -120,6 +127,7 @@ async fn ask(
             "usage": completion.usage,
             "requestJson": completion.request_json,
             "responseJson": completion.response_json,
+            "context_window": state.client.context_window(),
         })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
@@ -183,7 +191,11 @@ async fn ask_agent(
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     match agent.handle_request(&req.prompt).await {
-        Ok(reply) => Json(serde_json::json!({ "answer": reply.text, "usage": reply.usage })),
+        Ok(reply) => Json(serde_json::json!({
+            "answer": reply.text,
+            "usage": reply.usage,
+            "context_window": agent.context_window(),
+        })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -196,11 +208,14 @@ async fn agent_history(State(state): State<AppState>, Path(name): Path<String>) 
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     let messages: Vec<serde_json::Value> = agent
-        .history()
+        .history_with_usage()
         .into_iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .map(|(m, usage)| serde_json::json!({ "role": m.role, "content": m.content, "usage": usage }))
         .collect();
-    Json(serde_json::json!({ "messages": messages }))
+    Json(serde_json::json!({
+        "messages": messages,
+        "context_window": agent.context_window(),
+    }))
 }
 
 #[tokio::main]
