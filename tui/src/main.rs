@@ -5,11 +5,14 @@
 //!     Tab — показать/скрыть сырой JSON запроса/ответа.
 //!   • Агенты (F2) — управление именованными агентами из общего реестра
 //!     (тот же AGENTS_STORE_PATH, что у CLI и веб-интерфейса): список, создание
-//!     (n), запуск/остановка (s), удаление (d), чат с запущенным (Enter).
+//!     (n), запуск/остановка (s), удаление (d), чат с запущенным (Enter). В чате
+//!     с агентом Tab так же показывает/скрывает JSON запроса/ответа — но только
+//!     для сообщений этой сессии, история из SQLite его не несёт.
 //!
 //! Создание агента (n) начинается с выбора режима: быстрый — только имя и
 //! системный промпт, остальные параметры берутся по умолчанию; расширенный —
-//! полный набор (модель, лимиты, temperature, top_p, reasoning, показ токенов).
+//! полный набор (модель, лимиты, temperature, top_p, reasoning, показ токенов,
+//! сжатие контекста).
 //!
 //! F2 переключает между экранами Чат ⇄ Агенты (из экрана создания/чата с агентом
 //! тоже возвращает в список агентов/чат соответственно) — можно сделать это в
@@ -47,6 +50,10 @@ enum Role {
     Assistant,
     System,
     Error,
+    /// Момент пересчёта сводки сжатого контекста (см.
+    /// AgentConfig::context_compression) — отдельная от System роль, чтобы
+    /// этот момент визуально выделялся среди обычных информационных сообщений.
+    Compression,
 }
 
 struct HistoryItem {
@@ -118,10 +125,11 @@ enum CreateStep {
     TopP,
     Reasoning,
     ShowTokens,
+    ContextCompression,
 }
 
 const CREATE_STEPS_TOTAL_QUICK: usize = 2;
-const CREATE_STEPS_TOTAL_ADVANCED: usize = 8;
+const CREATE_STEPS_TOTAL_ADVANCED: usize = 9;
 
 impl CreateStep {
     fn label(&self) -> &'static str {
@@ -134,6 +142,7 @@ impl CreateStep {
             CreateStep::TopP => " Top P, число (Enter — по умолчанию) ",
             CreateStep::Reasoning => " Reasoning: on / off (Enter — по умолчанию) ",
             CreateStep::ShowTokens => " Показывать токены в ответах? y/n ",
+            CreateStep::ContextCompression => " Сжимать контекст диалога в сводку? y/n ",
         }
     }
 
@@ -147,6 +156,7 @@ impl CreateStep {
             CreateStep::TopP => 6,
             CreateStep::Reasoning => 7,
             CreateStep::ShowTokens => 8,
+            CreateStep::ContextCompression => 9,
         }
     }
 
@@ -164,7 +174,8 @@ impl CreateStep {
             Temperature => Some(TopP),
             TopP => Some(Reasoning),
             Reasoning => Some(ShowTokens),
-            ShowTokens => None,
+            ShowTokens => Some(ContextCompression),
+            ContextCompression => None,
         }
     }
 }
@@ -255,6 +266,10 @@ impl CreateWizard {
             CreateStep::ShowTokens => {
                 self.config.show_tokens = matches!(value.to_lowercase().as_str(), "y" | "yes" | "д" | "да");
             }
+            CreateStep::ContextCompression => {
+                self.config.context_compression =
+                    matches!(value.to_lowercase().as_str(), "y" | "yes" | "д" | "да");
+            }
         }
 
         match self.step.next(quick) {
@@ -291,6 +306,10 @@ struct DrawState<'a> {
     context_tokens: Option<u64>,
     /// Размер контекстного окна модели открытого агента (None — вне экрана чата с агентом).
     context_window: Option<u32>,
+    /// Живой статус сжатия контекста открытого агента (см.
+    /// llm_core::CompressionInfo) — None вне экрана чата с агентом, если у него
+    /// выключено сжатие, или если его пока не удалось определить.
+    agent_compression: Option<llm_core::CompressionInfo>,
     show_debug: bool,
     agents: &'a [AgentInfo],
     agents_selected: usize,
@@ -470,6 +489,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             Screen::Chat => Some(client.context_window()),
             _ => None,
         };
+        // Тот же снимок agents_snapshot, что и выше, — CompressionInfo в нём уже
+        // посчитан на момент вызова agent_manager.list() (см. Agent::info()), без
+        // отдельного похода к агенту.
+        let screen_agent_compression = match &screen {
+            Screen::AgentChat => agent_chat_name
+                .as_ref()
+                .and_then(|n| agents_snapshot.iter().find(|a| &a.config.name == n))
+                .and_then(|a| a.compression),
+            _ => None,
+        };
 
         let draw_state = DrawState {
             screen,
@@ -484,6 +513,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             last_usage,
             context_tokens: screen_context_tokens,
             context_window: screen_context_window,
+            agent_compression: screen_agent_compression,
             show_debug,
             agents: &agents_snapshot,
             agents_selected,
@@ -839,12 +869,31 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 if let Some(usage) = reply.usage {
                                     agent_context_tokens.insert(name, usage.total_tokens as u64);
                                 }
+                                let summarized = reply.summarized;
+                                let summary_covers = reply.summary_covers;
                                 entry.push(HistoryItem {
                                     role: Role::Assistant,
                                     text: reply.text,
-                                    debug: None,
+                                    // Tab (см. show_debug) показывает/скрывает это так же,
+                                    // как и в прямом чате — раньше у ответов агента debug
+                                    // всегда был пуст, потому что AgentReply не нёс JSON.
+                                    debug: Some((reply.request_json, reply.response_json)),
                                     tokens: response_tokens,
                                 });
+                                // Момент пересчёта сводки сжатого контекста — показываем его
+                                // отдельной строкой сразу после ответа, в рамках которого он
+                                // произошёл (см. AgentConfig::context_compression).
+                                if summarized {
+                                    entry.push(HistoryItem {
+                                        role: Role::Compression,
+                                        text: format!(
+                                            "Контекст сжат в сводку — она теперь охватывает {} более ранних сообщений.",
+                                            summary_covers.unwrap_or(0)
+                                        ),
+                                        debug: None,
+                                        tokens: None,
+                                    });
+                                }
                             }
                             Err(err) => {
                                 entry.push(HistoryItem {
@@ -994,6 +1043,10 @@ fn agent_meta_line(config: &AgentConfig) -> String {
     if let Some(r) = config.reasoning {
         parts.push(format!("reasoning: {}", if r { "on" } else { "off" }));
     }
+    parts.push(format!(
+        "сжатие контекста: {}",
+        if config.context_compression { "вкл" } else { "выкл" }
+    ));
     parts.join(" · ")
 }
 
@@ -1202,6 +1255,10 @@ fn draw_agent_create(frame: &mut Frame, state: &DrawState) {
             },
         ));
         lines.push(summary_line("Показывать токены", if wizard.config.show_tokens { "да" } else { "нет" }));
+        lines.push(summary_line(
+            "Сжатие контекста",
+            if wizard.config.context_compression { "да" } else { "нет" },
+        ));
     }
     if let Some(err) = &wizard.error {
         lines.push(Line::from(""));
@@ -1250,7 +1307,10 @@ fn draw_agent_create_mode_choice(frame: &mut Frame, chunks: &[Rect; 4]) {
         Line::from(""),
         Line::from(vec![
             Span::styled("2 / a", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw("  —  Расширенно: модель, лимиты токенов, temperature, top_p, reasoning, показ токенов"),
+            Span::raw(
+                "  —  Расширенно: модель, лимиты токенов, temperature, top_p, reasoning, \
+                 показ токенов, сжатие контекста",
+            ),
         ]),
     ])
     .block(
@@ -1336,7 +1396,8 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let chat_title = if this_agent_waiting {
         format!(" Диалог {} ", SPINNER_FRAMES[state.spinner_frame])
     } else {
-        " Диалог — PageUp/PageDown скролл, End в конец, Esc назад к списку агентов ".to_string()
+        " Диалог — PageUp/PageDown скролл, End в конец, Tab JSON запроса/ответа, Esc назад к списку агентов "
+            .to_string()
     };
     let chat = Paragraph::new(state.chat_lines.to_vec())
         .block(
@@ -1361,11 +1422,22 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
             } else {
                 ((used as f64 / window as f64) * 100.0).min(100.0).round() as u32
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::raw(" Контекст: "),
                 Span::styled(context_bar(used, window, 24), Style::default().fg(context_bar_color(percent))),
                 Span::raw(format!(" {percent}% ({}/{})", format_tokens(used), format_tokens(window as u64))),
-            ])
+            ];
+            // Наглядно показывает, сколько сообщений осталось до следующего пересчёта
+            // сводки — прямо рядом с заполнением контекста (см. CompressionInfo).
+            if let Some(compression) = state.agent_compression {
+                spans.push(Span::raw("  ·  🗜 ещё "));
+                spans.push(Span::styled(
+                    compression.messages_until_summary.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::raw(" сообщ. до сжатия"));
+            }
+            Line::from(spans)
         }
         None => Line::from(" Расход токенов появится после первого ответа агента"),
     };
@@ -1392,6 +1464,7 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
         Role::Assistant => ("LLM", Color::Green),
         Role::System => ("Инфо", Color::DarkGray),
         Role::Error => ("Ошибка", Color::Red),
+        Role::Compression => ("Сжатие", Color::Yellow),
     };
 
     let prefix_width = label.chars().count() + 2;

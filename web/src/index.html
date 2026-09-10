@@ -199,6 +199,31 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* Наглядно показывает, сколько сообщений осталось до следующего пересчёта
+     сводки при включённом сжатии контекста (см. setting-context-compression /
+     agent-context-compression) — стоит рядом с индикатором заполнения контекста
+     в шапке чата с агентом. */
+  .ctx-pending-badge {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    border: 1px dashed var(--border);
+    border-radius: 999px;
+    padding: 4px 10px;
+  }
+
+  .ctx-pending-badge[hidden] {
+    display: none;
+  }
+
+  .ctx-pending-badge b {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
   .debug-check {
     display: flex;
     align-items: center;
@@ -425,6 +450,7 @@
 
   .row.user { justify-content: flex-end; }
   .row.assistant, .row.error { justify-content: flex-start; }
+  .row.compression { justify-content: center; }
 
   .bubble {
     max-width: min(680px, 85%);
@@ -453,6 +479,18 @@
     border: 1px solid rgba(255, 107, 107, 0.4);
     color: var(--error);
     border-bottom-left-radius: 4px;
+  }
+
+  .row.compression .bubble {
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+    padding: 5px 12px;
+    border-radius: 999px;
+    max-width: 90%;
+    text-align: center;
   }
 
   .meta {
@@ -1322,6 +1360,19 @@
     align-self: flex-start;
   }
 
+  .agent-message.compression {
+    align-self: center;
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+    padding: 5px 12px;
+    border-radius: 999px;
+    max-width: 90%;
+    text-align: center;
+  }
+
   .agent-message-meta {
     display: block;
     margin-top: 4px;
@@ -1476,6 +1527,14 @@
     <span class="field-hint">Работает у моделей с поддержкой thinking-режима (Qwen3, DeepSeek, GLM и т.п.). У остальных может не иметь эффекта.</span>
   </div>
 
+  <label class="debug-check">
+    <input type="checkbox" id="setting-context-compression">
+    Сжимать контекст диалога: каждые __CONTEXT_SUMMARY_CHUNK__ сообщений вся накопленная с прошлого раза
+    переписка сжимается той же моделью в сводку — она подставляется в запрос вместо полной истории, а между
+    пересчётами непросуммированный "хвост" отправляется как есть. Без галочки в каждый запрос уходит вся
+    история целиком, как раньше.
+  </label>
+
   <div class="settings-actions">
     <p>Всё необязательно — можно просто общаться в чате, ничего здесь не заполняя.</p>
     <button type="button" id="settings-reset">Сбросить настройки ответа</button>
@@ -1597,6 +1656,13 @@
         <input type="checkbox" id="agent-show-tokens">
         Показывать количество использованных токенов в ответах агента
       </label>
+      <label class="debug-check">
+        <input type="checkbox" id="agent-context-compression">
+        Сжимать контекст диалога: каждые 10 сообщений вся накопленная с прошлого раза переписка
+        сжимается той же моделью в сводку — она подставляется в запрос вместо полной истории, а
+        между пересчётами непросуммированный "хвост" отправляется как есть. Без галочки в каждый
+        запрос уходит вся история целиком.
+      </label>
     </div>
     <button type="button" id="agent-create-btn">Добавить агента</button>
     <span class="field-error" id="agent-create-error" hidden></span>
@@ -1613,6 +1679,10 @@
       <span class="card-hint" id="agent-chat-meta"></span>
     </div>
     <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
+    <label class="debug-check">
+      <input type="checkbox" id="agent-chat-debug-toggle">
+      JSON запроса/ответа
+    </label>
     <div class="ctx-meter" id="agent-ctx-meter" hidden>
       <div class="ctx-ring">
         <svg viewBox="0 0 40 40">
@@ -1624,6 +1694,7 @@
       <span class="ctx-meter-label"></span>
       <span class="ctx-tooltip"></span>
     </div>
+    <span class="ctx-pending-badge" id="agent-ctx-pending" hidden></span>
   </div>
   <main class="agent-chat-main" id="agent-chat-main"></main>
   <footer class="agent-chat-footer">
@@ -1657,8 +1728,19 @@ const stopEl = document.getElementById('setting-stop');
 const temperatureEl = document.getElementById('setting-temperature');
 const topPEl = document.getElementById('setting-top-p');
 const reasoningEl = document.getElementById('setting-reasoning');
+const contextCompressionEl = document.getElementById('setting-context-compression');
 const settingsResetBtn = document.getElementById('settings-reset');
 const newSessionBtn = document.getElementById('new-session-btn');
+
+// Должен совпадать с llm_core::context::CONTEXT_SUMMARY_CHUNK — подставляется сервером
+// при рендере страницы (см. web/src/main.rs), чтобы порог, по которому клиент решает
+// вызвать /api/summarize, не расходился с бэкендом. Единица счёта — сообщение
+// ПОЛЬЗОВАТЕЛЯ (один его запрос + один ответ ассистента = один "обмен"), а не отдельная
+// запись в chatHistory — см. RAW_MESSAGES_PER_EXCHANGE.
+const CONTEXT_SUMMARY_CHUNK = __CONTEXT_SUMMARY_CHUNK__;
+// В chatHistory (и в agentChats) каждый обмен хранится как два отдельных сообщения
+// (запрос + ответ) — должно совпадать с llm_core::context::RAW_MESSAGES_PER_EXCHANGE.
+const RAW_MESSAGES_PER_EXCHANGE = 2;
 
 let sessionRequests = 0;
 let sessionTokensIn = 0;
@@ -1669,6 +1751,13 @@ let sending = false;
 // целиком с каждым новым запросом. Живёт только в этой вкладке до "Новая сессия" или
 // перезагрузки страницы — не персистится.
 let chatHistory = [];
+// Сжатый контекст обычного чата (см. setting-context-compression): текст текущей
+// сводки и сколько сообщений chatHistory (считая от начала) она уже покрывает —
+// та же схема состояния, что у именованных агентов (см. CompressionState в
+// core/src/agent.rs), только хранится в браузере, а не в SQLite, — обычный чат
+// вообще не персистится на сервере.
+let chatSummary = '';
+let chatSummarizedCount = 0;
 
 function loadSettings() {
   try {
@@ -1681,6 +1770,7 @@ function loadSettings() {
     temperatureEl.value = s.temperature || '';
     topPEl.value = s.topP || '';
     reasoningEl.value = s.reasoning || '';
+    contextCompressionEl.checked = !!s.contextCompression;
   } catch (e) { /* localStorage недоступен или битые данные — используем пустые поля */ }
 }
 
@@ -1712,7 +1802,7 @@ function validateJsonSchema() {
 
 function updateSettingsIndicator() {
   const active = jsonSchemaEl.value.trim() || maxTokensEl.value.trim() || stopEl.value.trim()
-    || temperatureEl.value.trim() || topPEl.value.trim() || reasoningEl.value;
+    || temperatureEl.value.trim() || topPEl.value.trim() || reasoningEl.value || contextCompressionEl.checked;
   settingsIndicator.hidden = !active;
 }
 
@@ -1725,6 +1815,7 @@ function saveSettings() {
       temperature: temperatureEl.value,
       topP: topPEl.value,
       reasoning: reasoningEl.value,
+      contextCompression: contextCompressionEl.checked,
     }));
   } catch (e) { /* игнорируем — настройки просто не сохранятся между визитами */ }
   updateSettingsIndicator();
@@ -1738,6 +1829,7 @@ jsonSchemaEl.addEventListener('input', () => {
   el.addEventListener('input', saveSettings);
 });
 reasoningEl.addEventListener('change', saveSettings);
+contextCompressionEl.addEventListener('change', saveSettings);
 
 function openSettings() {
   settingsPanel.classList.add('open');
@@ -1771,6 +1863,8 @@ settingsResetBtn.addEventListener('click', () => {
   });
   reasoningEl.value = '';
   reasoningEl.dispatchEvent(new Event('change', { bubbles: true }));
+  contextCompressionEl.checked = false;
+  contextCompressionEl.dispatchEvent(new Event('change', { bubbles: true }));
 });
 
 loadSettings();
@@ -1811,6 +1905,8 @@ function startNewSession() {
   statTokensIn.textContent = sessionTokensIn;
   statTokensOut.textContent = sessionTokensOut;
   chatHistory = [];
+  chatSummary = '';
+  chatSummarizedCount = 0;
   updateContextMeter(chatCtxMeterEl, null, null);
   promptEl.focus();
 }
@@ -1981,12 +2077,26 @@ async function send() {
     const jsonSchema = parseJsonSchema() || null;
     const reasoning = reasoningEl.value === 'on' ? true : reasoningEl.value === 'off' ? false : null;
 
+    // Управление контекстом (см. setting-context-compression): если включено — вместо
+    // полной chatHistory в запрос уходит сводка более ранней части диалога (если она уже
+    // есть) плюс "хвост" сообщений, ещё не попавших в сводку. Та же схема, что и у
+    // именованных агентов (см. Agent::handle_request в core/src/agent.rs).
+    const historyToSend = contextCompressionEl.checked
+      ? (chatSummary
+          ? [{
+              role: 'system',
+              content: 'Сводка более ранней части этого диалога (сообщения до неё не включены в запрос '
+                + 'дословно, чтобы не раздувать контекст):\n\n' + chatSummary,
+            }].concat(chatHistory.slice(chatSummarizedCount))
+          : chatHistory.slice(chatSummarizedCount))
+      : chatHistory;
+
     const res = await fetch('/api/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         prompt,
-        history: chatHistory,
+        history: historyToSend,
         json_schema: jsonSchema,
         max_tokens: Number.isInteger(maxTokens) && maxTokens > 0 ? maxTokens : null,
         stop: stopList,
@@ -2040,6 +2150,10 @@ async function send() {
       statRequests.textContent = sessionRequests;
       statTokensIn.textContent = sessionTokensIn;
       statTokensOut.textContent = sessionTokensOut;
+
+      if (contextCompressionEl.checked) {
+        await maybeSummarizeChat();
+      }
     }
   } catch (e) {
     removeTyping();
@@ -2049,6 +2163,33 @@ async function send() {
     sendBtn.disabled = false;
     promptEl.focus();
   }
+}
+
+// Момент сжатия контекста обычного чата: как только пользователь отправил
+// CONTEXT_SUMMARY_CHUNK сообщений с прошлого пересчёта — сворачиваем весь
+// накопленный с того момента "хвост" в сводку через /api/summarize (та же
+// модель, тот же промпт, что и у именованных агентов) и показываем это
+// отдельной меткой в ленте чата. Ошибка суммаризации не должна ломать сам
+// чат — как и на бэкенде агентов, в этом случае просто пробуем снова на
+// следующем сообщении.
+async function maybeSummarizeChat() {
+  const total = chatHistory.length;
+  const pendingRaw = total - chatSummarizedCount;
+  if (pendingRaw < CONTEXT_SUMMARY_CHUNK * RAW_MESSAGES_PER_EXCHANGE) return;
+
+  const chunk = chatHistory.slice(chatSummarizedCount, total);
+  try {
+    const res = await fetch('/api/summarize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ previous_summary: chatSummary, messages: chunk }),
+    });
+    const data = await res.json();
+    if (data.error) return;
+    chatSummary = data.summary;
+    chatSummarizedCount = total;
+    addRow('compression', `🗜️ Контекст сжат в сводку — она теперь охватывает ${total / RAW_MESSAGES_PER_EXCHANGE} сообщений.`);
+  } catch (e) { /* сеть недоступна — сводка просто не обновилась в этот раз */ }
 }
 
 /* ---------- Переключение вкладок ---------- */
@@ -2737,6 +2878,7 @@ const agentTemperatureEl = document.getElementById('agent-temperature');
 const agentTopPEl = document.getElementById('agent-top-p');
 const agentReasoningEl = document.getElementById('agent-reasoning');
 const agentShowTokensEl = document.getElementById('agent-show-tokens');
+const agentContextCompressionEl = document.getElementById('agent-context-compression');
 const agentCreateBtn = document.getElementById('agent-create-btn');
 const agentCreateError = document.getElementById('agent-create-error');
 const agentModeButtons = document.querySelectorAll('.agent-mode-btn');
@@ -2753,6 +2895,52 @@ const agentChatMainEl = document.getElementById('agent-chat-main');
 const agentChatInputEl = document.getElementById('agent-chat-input');
 const agentChatSendBtn = document.getElementById('agent-chat-send');
 const agentCtxMeterEl = document.getElementById('agent-ctx-meter');
+const agentCtxPendingEl = document.getElementById('agent-ctx-pending');
+// Галочка "JSON запроса/ответа" в шапке чата с агентом — независимая от такой же
+// галочки в обычном чате (debugToggle): своя видимость, свой ключ в localStorage,
+// показывает/скрывает requestJson/responseJson (см. renderAgentMessage), которые
+// приходят от /api/agents/:name/ask только для сообщений ЭТОЙ сессии — история,
+// восстановленная из SQLite при открытии чата, их не содержит (сервер их не хранит).
+const agentChatDebugToggleEl = document.getElementById('agent-chat-debug-toggle');
+try {
+  agentChatDebugToggleEl.checked = localStorage.getItem('challenger-show-agent-debug') === '1';
+} catch (e) { /* localStorage недоступен — используем значение по умолчанию */ }
+
+function applyAgentDebugVisibility() {
+  const visible = agentChatDebugToggleEl.checked;
+  agentChatMainEl.querySelectorAll('.agent-debug').forEach((el) => { el.hidden = !visible; });
+}
+
+agentChatDebugToggleEl.addEventListener('change', () => {
+  applyAgentDebugVisibility();
+  try {
+    localStorage.setItem('challenger-show-agent-debug', agentChatDebugToggleEl.checked ? '1' : '0');
+  } catch (e) { /* игнорируем */ }
+});
+
+function addAgentDebugBlock(bubble, requestJson, responseJson) {
+  const debug = document.createElement('div');
+  debug.className = 'debug agent-debug';
+  debug.hidden = !agentChatDebugToggleEl.checked;
+
+  const reqSection = document.createElement('div');
+  reqSection.className = 'debug-section';
+  reqSection.innerHTML = '<h4>Запрос модели</h4>';
+  const reqPre = document.createElement('pre');
+  reqPre.textContent = requestJson || '(недоступно)';
+  reqSection.appendChild(reqPre);
+
+  const resSection = document.createElement('div');
+  resSection.className = 'debug-section';
+  resSection.innerHTML = '<h4>Ответ модели</h4>';
+  const resPre = document.createElement('pre');
+  resPre.textContent = responseJson || '(недоступно)';
+  resSection.appendChild(resPre);
+
+  debug.appendChild(reqSection);
+  debug.appendChild(resSection);
+  bubble.appendChild(debug);
+}
 
 // Локальная история переписки с каждым агентом (по имени), отображаемая в
 // полноэкранном чате. Настоящее хранилище истории — SQLite на сервере (см.
@@ -2775,7 +2963,9 @@ const agentChatStats = {};
 
 function ensureAgentChatStats(name) {
   if (!agentChatStats[name]) {
-    agentChatStats[name] = { usedTokens: null, contextWindow: null };
+    // compression — снимок CompressionInfo с бэкенда (см. core::agent::CompressionInfo):
+    // null, если у агента выключено сжатие контекста или статус ещё не приходил.
+    agentChatStats[name] = { usedTokens: null, contextWindow: null, compression: null };
   }
   return agentChatStats[name];
 }
@@ -2783,6 +2973,24 @@ function ensureAgentChatStats(name) {
 function updateAgentChatStats(name) {
   const stats = ensureAgentChatStats(name);
   updateContextMeter(agentCtxMeterEl, stats.usedTokens, stats.contextWindow);
+  updateAgentCompressionBadge(stats.compression);
+}
+
+// Наглядно показывает, сколько сообщений осталось до следующего пересчёта
+// сводки — рядом с индикатором заполнения контекста (см. .ctx-pending-badge).
+// Скрыт целиком, если у агента выключено сжатие контекста.
+function updateAgentCompressionBadge(compression) {
+  if (!compression) {
+    agentCtxPendingEl.hidden = true;
+    return;
+  }
+  agentCtxPendingEl.hidden = false;
+  agentCtxPendingEl.innerHTML =
+    '🗜️ ещё <b>' + compression.messages_until_summary + '</b> сообщ. до сжатия';
+  agentCtxPendingEl.title =
+    `Сводка уже охватывает ${compression.summarized_count} сообщений; ` +
+    `${compression.pending_messages} ещё не в сводке из ${CONTEXT_SUMMARY_CHUNK}, ` +
+    `после чего она будет пересчитана.`;
 }
 // Режим создания: 'quick' — только имя и системный промпт (остальное по
 // умолчанию), 'advanced' — полный набор параметров.
@@ -2808,6 +3016,7 @@ function agentMetaLine(config) {
   if (config.max_tokens !== null && config.max_tokens !== undefined) parts.push('макс. токенов: ' + config.max_tokens);
   if (config.reasoning === true) parts.push('reasoning: вкл');
   if (config.reasoning === false) parts.push('reasoning: выкл');
+  parts.push('сжатие контекста: ' + (config.context_compression ? 'вкл' : 'выкл'));
   return parts.join(' · ');
 }
 
@@ -2818,6 +3027,10 @@ function agentMetaLine(config) {
 function renderAgentMessage(msg) {
   const row = document.createElement('div');
   row.className = 'agent-message ' + msg.role;
+  if (msg.role === 'compression') {
+    row.textContent = '🗜️ ' + msg.text;
+    return row;
+  }
   const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
   const text = document.createElement('span');
   text.textContent = prefix + msg.text;
@@ -2826,6 +3039,11 @@ function renderAgentMessage(msg) {
   const tokens = msg.role === 'user' ? msg.requestTokens : msg.role === 'assistant' ? msg.responseTokens : null;
   if (typeof tokens === 'number') {
     setAgentMessageTokens(row, msg.role, tokens);
+  }
+  // JSON запроса/ответа — только для сообщений, полученных в этой сессии (см.
+  // agent-chat-debug-toggle): история, восстановленная из SQLite, их не несёт.
+  if (msg.role === 'assistant' && (msg.requestJson || msg.responseJson)) {
+    addAgentDebugBlock(row, msg.requestJson, msg.responseJson);
   }
   return row;
 }
@@ -2978,6 +3196,9 @@ function updateAgentChatHeader(name) {
   if (info && typeof info.context_window === 'number') {
     ensureAgentChatStats(name).contextWindow = info.context_window;
   }
+  if (info) {
+    ensureAgentChatStats(name).compression = info.compression || null;
+  }
   updateAgentChatStats(name);
 }
 
@@ -3016,6 +3237,7 @@ async function openAgentChat(name) {
       if (typeof data.context_window === 'number') {
         stats.contextWindow = data.context_window;
       }
+      stats.compression = data.compression || null;
       if (currentAgentChatName === name) updateAgentChatStats(name);
       if (currentAgentChatName === name) renderAgentChatMessages(name);
     } catch (e) {
@@ -3068,7 +3290,9 @@ async function sendAgentChatMessage() {
       body: JSON.stringify({ prompt }),
     });
     const data = await res.json();
-    const msg = data.error ? { role: 'error', text: data.error } : { role: 'assistant', text: data.answer };
+    const msg = data.error
+      ? { role: 'error', text: data.error }
+      : { role: 'assistant', text: data.answer, requestJson: data.requestJson, responseJson: data.responseJson };
     if (!data.error && data.usage) {
       userMsg.requestTokens = data.usage.prompt_tokens;
       msg.responseTokens = data.usage.completion_tokens;
@@ -3086,7 +3310,24 @@ async function sendAgentChatMessage() {
       if (typeof data.context_window === 'number') {
         stats.contextWindow = data.context_window;
       }
+      stats.compression = data.compression || null;
       if (currentAgentChatName === name) updateAgentChatStats(name);
+
+      // Момент сжатия контекста (см. AgentConfig::context_compression на бэкенде):
+      // модель только что пересчитала сводку устаревшей части истории — показываем
+      // это отдельной ненавязчивой меткой в ленте чата, а не молча.
+      if (data.summarized) {
+        const notice = {
+          role: 'compression',
+          text: `Контекст сжат в сводку — она теперь охватывает ${
+            typeof data.summary_covers === 'number' ? data.summary_covers : '…'
+          } более ранних сообщений.`,
+        };
+        agentChats[name].push(notice);
+        if (currentAgentChatName === name) {
+          agentChatMainEl.appendChild(renderAgentMessage(notice));
+        }
+      }
     }
   } catch (e) {
     const msg = { role: 'error', text: 'Ошибка сети: ' + e };
@@ -3131,6 +3372,7 @@ agentCreateBtn.addEventListener('click', async () => {
   const reasoning = advanced && agentReasoningEl.value === 'on' ? true : advanced && agentReasoningEl.value === 'off' ? false : null;
   const model = advanced ? agentModelEl.value.trim() || null : null;
   const showTokens = advanced ? agentShowTokensEl.checked : false;
+  const contextCompression = advanced ? agentContextCompressionEl.checked : false;
 
   agentCreateBtn.disabled = true;
   try {
@@ -3146,6 +3388,7 @@ agentCreateBtn.addEventListener('click', async () => {
         temperature: Number.isFinite(temperature) ? temperature : null,
         top_p: Number.isFinite(topP) ? topP : null,
         reasoning,
+        context_compression: contextCompression,
       }),
     });
     const data = await res.json();
@@ -3162,6 +3405,7 @@ agentCreateBtn.addEventListener('click', async () => {
     agentTopPEl.value = '';
     agentReasoningEl.value = '';
     agentShowTokensEl.checked = false;
+    agentContextCompressionEl.checked = false;
     document.getElementById('agent-mode-quick').click();
     await fetchAgents();
   } catch (e) {

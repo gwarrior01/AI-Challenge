@@ -77,11 +77,28 @@ struct CreateAgentRequest {
     top_p: Option<f32>,
     #[serde(default)]
     reasoning: Option<bool>,
+    /// Включить управление контекстом (см. AgentConfig::context_compression):
+    /// последние сообщения отправляются как есть, остальное периодически
+    /// сжимается той же моделью в сводку, которая подставляется в запрос
+    /// вместо полной истории.
+    #[serde(default)]
+    context_compression: bool,
 }
 
 #[derive(Deserialize)]
 struct AgentAskRequest {
     prompt: String,
+}
+
+/// Тело запроса на сжатие фрагмента истории обычного чата в сводку (см.
+/// `llm_core::context`) — обычный чат не хранит состояние на сервере, поэтому
+/// сама сводка и счётчик уже сжатых сообщений живут в браузере, а сервер лишь
+/// выполняет отдельное обращение к LLM по готовому фрагменту.
+#[derive(Deserialize)]
+struct SummarizeRequest {
+    #[serde(default)]
+    previous_summary: String,
+    messages: Vec<ChatMessage>,
 }
 
 const INDEX_TEMPLATE: &str = include_str!("index.html");
@@ -133,6 +150,23 @@ async fn ask(
     }
 }
 
+/// Сжимает присланный фрагмент диалога обычного чата в обновлённую сводку —
+/// та же логика управления контекстом, что у именованных агентов (см.
+/// `llm_core::context::summarize_chunk`), но состояние (сама сводка, счётчик
+/// уже сжатых сообщений) хранится в браузере, а не на сервере, поскольку
+/// обычный чат вообще не персистится на бэкенде.
+async fn summarize(
+    State(state): State<AppState>,
+    Json(req): Json<SummarizeRequest>,
+) -> Json<serde_json::Value> {
+    match llm_core::context::summarize_chunk(&state.client, state.client.model(), &req.previous_summary, &req.messages)
+        .await
+    {
+        Ok(summary) => Json(serde_json::json!({ "summary": summary })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
 /// Возвращает список всех агентов с их конфигурацией и статусом запуска.
 async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "agents": state.agents.list() }))
@@ -152,6 +186,7 @@ async fn create_agent(
         temperature: req.temperature,
         top_p: req.top_p,
         reasoning: req.reasoning,
+        context_compression: req.context_compression,
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -195,6 +230,14 @@ async fn ask_agent(
             "answer": reply.text,
             "usage": reply.usage,
             "context_window": agent.context_window(),
+            "summarized": reply.summarized,
+            "summary_covers": reply.summary_covers,
+            "requestJson": reply.request_json,
+            "responseJson": reply.response_json,
+            // Свежий статус сжатия ПОСЛЕ этого обмена (и возможного пересчёта сводки
+            // выше) — интерфейс показывает по нему, сколько сообщений осталось до
+            // следующего сжатия, рядом с индикатором заполнения контекста.
+            "compression": agent.info().compression,
         })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
@@ -212,9 +255,11 @@ async fn agent_history(State(state): State<AppState>, Path(name): Path<String>) 
         .into_iter()
         .map(|(m, usage)| serde_json::json!({ "role": m.role, "content": m.content, "usage": usage }))
         .collect();
+    let info = agent.info();
     Json(serde_json::json!({
         "messages": messages,
-        "context_window": agent.context_window(),
+        "context_window": info.context_window,
+        "compression": info.compression,
     }))
 }
 
@@ -225,7 +270,8 @@ async fn main() -> Result<()> {
         std::env::var("LLM_ANALYSIS_MODEL").unwrap_or_else(|_| client.model().to_string());
     let index_html = INDEX_TEMPLATE
         .replace("__MODEL_NAME__", client.model())
-        .replace("__ANALYSIS_MODEL_NAME__", &analysis_model);
+        .replace("__ANALYSIS_MODEL_NAME__", &analysis_model)
+        .replace("__CONTEXT_SUMMARY_CHUNK__", &llm_core::context::CONTEXT_SUMMARY_CHUNK.to_string());
     let agents = Arc::new(AgentManager::from_env(client.clone())?);
 
     let state = AppState {
@@ -238,6 +284,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/ask", post(ask))
+        .route("/api/summarize", post(summarize))
         .route("/api/agents", get(list_agents).post(create_agent))
         .route("/api/agents/:name", axum::routing::delete(delete_agent))
         .route("/api/agents/:name/start", post(start_agent))

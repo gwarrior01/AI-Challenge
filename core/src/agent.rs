@@ -10,7 +10,7 @@
 //! продолжает диалог, как будто его не выключали. Удаление агента удаляет и
 //! его историю (каскадно, через `ON DELETE CASCADE`).
 
-use crate::{ChatMessage, ChatOptions, LlmClient, Usage};
+use crate::{context, ChatMessage, ChatOptions, LlmClient, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,15 @@ pub struct AgentConfig {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub reasoning: Option<bool>,
+    /// Если true — включено управление контекстом (см. модуль-документацию
+    /// [`update_summary_if_needed`]): каждые [`crate::context::CONTEXT_SUMMARY_CHUNK`]
+    /// сообщений пользователя вся накопленная с прошлого раза история сжимается
+    /// той же моделью в текстовую сводку, которая подставляется в запрос вместо
+    /// полной истории; непросуммированный "хвост" между пересчётами отправляется
+    /// как есть. Если false (по умолчанию) — поведение как раньше: в каждый
+    /// запрос уходит вся история целиком.
+    #[serde(default)]
+    pub context_compression: bool,
 }
 
 impl AgentConfig {
@@ -53,6 +62,7 @@ impl AgentConfig {
             temperature: None,
             top_p: None,
             reasoning: None,
+            context_compression: false,
         }
     }
 }
@@ -68,6 +78,31 @@ pub struct AgentInfo {
     /// по всему диалогу: так это число всегда в точности то, что вернула модель,
     /// без вычислений с нашей стороны.
     pub context_window: u32,
+    /// Живой статус сжатия контекста (см. [`AgentConfig::context_compression`]) —
+    /// `None`, если оно выключено в конфигурации агента, иначе — сколько
+    /// сообщений пользователя сводка уже покрывает и сколько ещё осталось
+    /// написать до следующего пересчёта. Интерфейсы показывают это рядом с
+    /// индикатором заполнения контекстного окна, чтобы было наглядно видно,
+    /// сколько сообщений осталось отправить до следующего сжатия.
+    pub compression: Option<CompressionInfo>,
+}
+
+/// Единица счёта здесь — сообщение ПОЛЬЗОВАТЕЛЯ (один его запрос + один ответ
+/// ассистента = один "обмен"), а не отдельная запись в истории: интерфейсы
+/// уменьшают счётчик на 1 за каждое отправленное пользователем сообщение, а не
+/// на 2 (запрос + ответ) — см. [`crate::context::RAW_MESSAGES_PER_EXCHANGE`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CompressionInfo {
+    /// Сколько сообщений пользователя от начала диалога уже покрывает текущая сводка.
+    pub summarized_count: usize,
+    /// Сколько сообщений пользователя накопилось с прошлого пересчёта сводки и
+    /// ещё не попало в неё. Растёт на 1 с каждым отправленным сообщением и
+    /// сбрасывается в 0 сразу после очередного пересчёта.
+    pub pending_messages: usize,
+    /// Сколько ещё сообщений должно добавиться, прежде чем сводка будет
+    /// пересчитана снова — `CONTEXT_SUMMARY_CHUNK - pending_messages` (см.
+    /// [`crate::context::CONTEXT_SUMMARY_CHUNK`]).
+    pub messages_until_summary: usize,
 }
 
 /// Результат обработки запроса агентом: итоговый текст (уже с учётом
@@ -77,6 +112,30 @@ pub struct AgentInfo {
 pub struct AgentReply {
     pub text: String,
     pub usage: Option<Usage>,
+    /// true, если в рамках обработки именно этого запроса была пересчитана
+    /// сводка сжатого контекста (см. [`AgentConfig::context_compression`]) —
+    /// сигнал для интерфейсов показать пользователю момент сжатия.
+    pub summarized: bool,
+    /// Сколько сообщений от начала диалога сейчас покрывает сводка. Задано,
+    /// только если `summarized == true`.
+    pub summary_covers: Option<usize>,
+    /// Сырые JSON запроса к LLM и его ответа за этот обмен (как в
+    /// [`crate::ChatCompletion`]) — для отладочного просмотра в интерфейсах,
+    /// по галочке "показывать JSON запроса/ответа".
+    pub request_json: String,
+    pub response_json: String,
+}
+
+/// Состояние сжатия контекста конкретного агента: текст текущей сводки и
+/// сколько сообщений истории (считая от начала) она уже покрывает — эти
+/// сообщения больше не отправляются в LLM по отдельности, вместо них в
+/// запрос подставляется сводка (см. [`Agent::handle_request`]). Саму сводку
+/// строит [`crate::context::summarize_chunk`] — общая логика с обычным чатом
+/// веб-интерфейса.
+#[derive(Debug, Clone, Default)]
+struct CompressionState {
+    summary: String,
+    summarized_count: usize,
 }
 
 /// Агент — отдельная сущность, инкапсулирующая обращение к LLM через API.
@@ -96,11 +155,21 @@ pub struct Agent {
     /// отдаёт их одной суммой на весь обмен, поэтому у сообщения пользователя
     /// значение всегда `None`, а у ответа ассистента — метрики этого обмена.
     history: Mutex<Vec<(ChatMessage, Option<Usage>)>>,
+    /// Сводка устаревшей части истории (см. [`AgentConfig::context_compression`]),
+    /// восстановленная из SQLite при создании агента — так же, как и `history`,
+    /// переживает перезапуск приложения.
+    summary: Mutex<CompressionState>,
     db: Arc<Db>,
 }
 
 impl Agent {
-    fn new(config: AgentConfig, client: LlmClient, db: Arc<Db>, history: Vec<(ChatMessage, Option<Usage>)>) -> Self {
+    fn new(
+        config: AgentConfig,
+        client: LlmClient,
+        db: Arc<Db>,
+        history: Vec<(ChatMessage, Option<Usage>)>,
+        summary: CompressionState,
+    ) -> Self {
         let name = config.name.clone();
         Self {
             name,
@@ -108,6 +177,7 @@ impl Agent {
             config: RwLock::new(config),
             running: AtomicBool::new(false),
             history: Mutex::new(history),
+            summary: Mutex::new(summary),
             db,
         }
     }
@@ -154,7 +224,28 @@ impl Agent {
     }
 
     pub fn info(&self) -> AgentInfo {
-        AgentInfo { config: self.config(), running: self.is_running(), context_window: self.context_window() }
+        let config = self.config();
+        let compression = self.compression_status(&config);
+        AgentInfo { running: self.is_running(), context_window: self.context_window(), compression, config }
+    }
+
+    /// Считает [`CompressionInfo`] по текущей истории и сводке — `None`, если
+    /// сжатие выключено в конфигурации. Счёт ведётся в сообщениях пользователя
+    /// (обменах), а не в сырых записях истории — см.
+    /// [`crate::context::RAW_MESSAGES_PER_EXCHANGE`].
+    fn compression_status(&self, config: &AgentConfig) -> Option<CompressionInfo> {
+        if !config.context_compression {
+            return None;
+        }
+        let history_len = self.history.lock().expect("история агента отравлена паникой").len();
+        let summarized_count_raw =
+            self.summary.lock().expect("сводка агента отравлена паникой").summarized_count;
+        let pending = history_len.saturating_sub(summarized_count_raw) / context::RAW_MESSAGES_PER_EXCHANGE;
+        Some(CompressionInfo {
+            summarized_count: summarized_count_raw / context::RAW_MESSAGES_PER_EXCHANGE,
+            pending_messages: pending,
+            messages_until_summary: context::CONTEXT_SUMMARY_CHUNK.saturating_sub(pending),
+        })
     }
 
     /// Принимает запрос пользователя и обращается к LLM через API, добавляя его
@@ -174,7 +265,19 @@ impl Agent {
         }
         {
             let history = self.history.lock().expect("история агента отравлена паникой");
-            messages.extend(history.iter().map(|(m, _)| m.clone()));
+            if config.context_compression {
+                let summary = self.summary.lock().expect("сводка агента отравлена паникой");
+                if !summary.summary.is_empty() {
+                    messages.push(ChatMessage::system(format!(
+                        "Сводка более ранней части этого диалога (сообщения до неё не включены в \
+                         запрос дословно, чтобы не раздувать контекст):\n\n{}",
+                        summary.summary
+                    )));
+                }
+                messages.extend(history.iter().skip(summary.summarized_count).map(|(m, _)| m.clone()));
+            } else {
+                messages.extend(history.iter().map(|(m, _)| m.clone()));
+            }
         }
         messages.push(ChatMessage::user(prompt));
 
@@ -208,6 +311,8 @@ impl Agent {
             eprintln!("не удалось сохранить ответ агента в БД: {err:#}");
         }
 
+        let summary_covers = self.update_summary_if_needed(&config).await;
+
         let mut text = completion.content;
         if config.show_tokens {
             if let Some(usage) = completion.usage {
@@ -218,7 +323,65 @@ impl Agent {
             }
         }
 
-        Ok(AgentReply { text, usage: completion.usage })
+        Ok(AgentReply {
+            text,
+            usage: completion.usage,
+            summarized: summary_covers.is_some(),
+            summary_covers,
+            request_json: completion.request_json,
+            response_json: completion.response_json,
+        })
+    }
+
+    /// Пересчитывает сводку истории, если включено
+    /// [`AgentConfig::context_compression`] и с прошлого пересчёта пользователь
+    /// отправил не менее [`crate::context::CONTEXT_SUMMARY_CHUNK`] новых
+    /// сообщений — тогда сводка перестраивается заново, целиком охватывая весь
+    /// накопленный с прошлого раза "хвост" диалога. Сводку строит
+    /// [`crate::context::summarize_chunk`] (общая логика с обычным чатом
+    /// веб-интерфейса) — ошибка здесь не должна портить уже полученный
+    /// пользователем ответ, поэтому лишь логируется, как и ошибки записи в БД
+    /// выше.
+    ///
+    /// Возвращает `Some(N)`, если сводка была пересчитана и теперь покрывает
+    /// `N` сообщений пользователя от начала диалога — этот момент интерфейсы
+    /// показывают пользователю (см. [`AgentReply::summarized`]); `None`, если
+    /// пересчёт в этот раз не потребовался или завершился ошибкой.
+    async fn update_summary_if_needed(&self, config: &AgentConfig) -> Option<usize> {
+        if !config.context_compression {
+            return None;
+        }
+
+        let (chunk, prev_summary, new_summarized_count) = {
+            let history = self.history.lock().expect("история агента отравлена паникой");
+            let summary = self.summary.lock().expect("сводка агента отравлена паникой");
+            let total = history.len();
+            let pending_raw = total.saturating_sub(summary.summarized_count);
+            let chunk_threshold_raw = context::CONTEXT_SUMMARY_CHUNK * context::RAW_MESSAGES_PER_EXCHANGE;
+            if pending_raw < chunk_threshold_raw {
+                return None;
+            }
+            let chunk: Vec<ChatMessage> =
+                history[summary.summarized_count..total].iter().map(|(m, _)| m.clone()).collect();
+            (chunk, summary.summary.clone(), total)
+        };
+
+        let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
+        match context::summarize_chunk(&self.client, &model, &prev_summary, &chunk).await {
+            Ok(new_summary) => {
+                let mut summary = self.summary.lock().expect("сводка агента отравлена паникой");
+                summary.summary = new_summary;
+                summary.summarized_count = new_summarized_count;
+                if let Err(err) = self.db.save_summary(&self.name, &summary.summary, summary.summarized_count) {
+                    eprintln!("не удалось сохранить сводку контекста агента «{}» в БД: {err:#}", self.name);
+                }
+                Some(new_summarized_count / context::RAW_MESSAGES_PER_EXCHANGE)
+            }
+            Err(err) => {
+                eprintln!("не удалось построить сводку контекста для агента «{}»: {err:#}", self.name);
+                None
+            }
+        }
     }
 }
 
@@ -249,7 +412,12 @@ impl Db {
                  completion_tokens INTEGER,
                  total_tokens      INTEGER
              );
-             CREATE INDEX IF NOT EXISTS idx_messages_agent_name ON messages(agent_name);",
+             CREATE INDEX IF NOT EXISTS idx_messages_agent_name ON messages(agent_name);
+             CREATE TABLE IF NOT EXISTS context_summaries (
+                 agent_name       TEXT PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
+                 summary          TEXT NOT NULL,
+                 summarized_count INTEGER NOT NULL
+             );",
         )
         .context("не удалось создать таблицы БД агентов")?;
         Self::migrate_token_columns(&conn).context("не удалось обновить схему БД агентов")?;
@@ -323,6 +491,29 @@ impl Db {
         Ok(rows)
     }
 
+    /// Загружает сводку сжатого контекста агента (см.
+    /// [`AgentConfig::context_compression`]) — пустая сводка с нулевым счётчиком,
+    /// если её ещё нет (компрессия не включалась или ещё не набралось сообщений).
+    fn load_summary(&self, name: &str) -> Result<CompressionState> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT summary, summarized_count FROM context_summaries WHERE agent_name = ?1")?;
+        let mut rows = stmt.query_map([name], |row| {
+            let summarized_count: i64 = row.get(1)?;
+            Ok(CompressionState { summary: row.get(0)?, summarized_count: summarized_count as usize })
+        })?;
+        rows.next().transpose().map(|opt| opt.unwrap_or_default()).context("не удалось прочитать сводку контекста")
+    }
+
+    fn save_summary(&self, agent_name: &str, summary: &str, summarized_count: usize) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO context_summaries (agent_name, summary, summarized_count) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_name) DO UPDATE SET summary = excluded.summary, summarized_count = excluded.summarized_count",
+            rusqlite::params![agent_name, summary, summarized_count as i64],
+        )?;
+        Ok(())
+    }
+
     fn insert_agent(&self, config: &AgentConfig, running: bool) -> Result<()> {
         let config_json = serde_json::to_string(config)?;
         self.conn().execute(
@@ -392,7 +583,8 @@ impl AgentManager {
         let mut agents = self.agents.write().expect("реестр агентов отравлен паникой");
         for (config, running) in records {
             let history = self.db.load_messages(&config.name)?;
-            let agent = Agent::new(config, self.client.clone(), self.db.clone(), history);
+            let summary = self.db.load_summary(&config.name)?;
+            let agent = Agent::new(config, self.client.clone(), self.db.clone(), history, summary);
             if running {
                 agent.start();
             }
@@ -424,7 +616,8 @@ impl AgentManager {
             bail!("агент с именем «{name}» уже существует");
         }
         self.db.insert_agent(&config, false)?;
-        let agent = Agent::new(config, self.client.clone(), self.db.clone(), Vec::new());
+        let agent =
+            Agent::new(config, self.client.clone(), self.db.clone(), Vec::new(), CompressionState::default());
         let info = agent.info();
         agents.insert(name, Arc::new(agent));
 

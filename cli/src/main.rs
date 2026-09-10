@@ -23,6 +23,9 @@
 //!   --temperature N
 //!   --top-p N
 //!   --reasoning on|off
+//!   --compress                включить управление контекстом: последние сообщения
+//!                              отправляются как есть, остальное периодически сжимается
+//!                              той же моделью в сводку (см. AgentConfig::context_compression)
 //!
 //! Обязательные переменные окружения: LLM_API_URL, LLM_API_KEY (см. .env.example).
 //! Реестр агентов и история их диалогов хранятся в SQLite-файле AGENTS_STORE_PATH
@@ -110,8 +113,9 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                     let status = if info.running { "запущен" } else { "остановлен" };
                     let model = info.config.model.as_deref().unwrap_or("(модель по умолчанию)");
                     let tokens = if info.config.show_tokens { "показывать" } else { "скрывать" };
+                    let compression = if info.config.context_compression { "вкл" } else { "выкл" };
                     println!(
-                        "- {} [{status}] · модель: {model} · токены: {tokens}",
+                        "- {} [{status}] · модель: {model} · токены: {tokens} · сжатие контекста: {compression}",
                         info.config.name
                     );
                 }
@@ -173,6 +177,7 @@ fn print_agent_usage() {
          \x20 llm-cli agent list\n\
          \x20 llm-cli agent add <имя> [--system TEXT] [--model NAME] [--show-tokens]\n\
          \x20                        [--max-tokens N] [--temperature N] [--top-p N] [--reasoning on|off]\n\
+         \x20                        [--compress]\n\
          \x20 llm-cli agent remove <имя>\n\
          \x20 llm-cli agent start <имя>\n\
          \x20 llm-cli agent stop <имя>"
@@ -196,6 +201,9 @@ fn parse_agent_add_flags(name: String, flags: &[String]) -> Result<AgentConfig> 
             }
             "--show-tokens" => {
                 config.show_tokens = true;
+            }
+            "--compress" => {
+                config.context_compression = true;
             }
             "--max-tokens" => {
                 i += 1;
