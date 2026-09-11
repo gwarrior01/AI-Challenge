@@ -50,9 +50,9 @@ enum Role {
     Assistant,
     System,
     Error,
-    /// Момент пересчёта сводки сжатого контекста (см.
-    /// AgentConfig::context_compression) — отдельная от System роль, чтобы
-    /// этот момент визуально выделялся среди обычных информационных сообщений.
+    /// Момент пересчёта сводки сжатого контекста или обновления фактов (см.
+    /// AgentConfig::context_strategy) — отдельная от System роль, чтобы этот
+    /// момент визуально выделялся среди обычных информационных сообщений.
     Compression,
 }
 
@@ -66,6 +66,15 @@ struct HistoryItem {
     /// обмен (см. агент.rs), поэтому раскладываются по паре сообщений при построении
     /// истории (см. [`history_items_from_messages`]). `None`, если неизвестны.
     tokens: Option<u32>,
+    /// Денежная стоимость `tokens` этого сообщения (см. llm_core::pricing) — та же
+    /// раскладка запрос/ответ, что и у `tokens`. `None` для сообщений прямого чата
+    /// (там стоимость не считается — только у именованных агентов) и когда её
+    /// неоткуда взять (провайдер её не прислал и ставки цены не заданы).
+    cost: Option<f64>,
+    /// true, если `cost` — оценка по ставкам (см. llm_core::pricing::CostSource),
+    /// а не реальная стоимость, которую вернул провайдер. Не имеет значения,
+    /// если `cost` — `None`. Показывается как "≈" перед суммой.
+    cost_approx: bool,
 }
 
 /// Преобразует историю агента (роль + текст + метрики токенов, хранимые в SQLite)
@@ -74,7 +83,11 @@ struct HistoryItem {
 /// сообщением, как в веб-интерфейсе. Токены приходят от API одной суммой на весь
 /// обмен и хранятся на сообщении ассистента — раскладываем prompt_tokens на
 /// предыдущее сообщение пользователя, completion_tokens оставляем на ответе.
+/// Стоимость (см. llm_core::pricing) — реальная от провайдера, если она была
+/// сохранена вместе с сообщением, иначе оценка по текущим ставкам; `None`, если
+/// ни того ни другого нет.
 fn history_items_from_messages(messages: &[(ChatMessage, Option<Usage>)]) -> Vec<HistoryItem> {
+    let is_approx = |usage: &Usage| llm_core::pricing::source(usage) == Some(llm_core::pricing::CostSource::Estimated);
     let mut items: Vec<HistoryItem> = messages
         .iter()
         .map(|(message, usage)| {
@@ -84,7 +97,13 @@ fn history_items_from_messages(messages: &[(ChatMessage, Option<Usage>)]) -> Vec
                 _ => Role::System,
             };
             let tokens = if matches!(role, Role::Assistant) { usage.map(|u| u.completion_tokens) } else { None };
-            HistoryItem { role, text: message.content.clone(), debug: None, tokens }
+            let cost = if matches!(role, Role::Assistant) {
+                usage.and_then(|u| llm_core::pricing::resolve_output(&u))
+            } else {
+                None
+            };
+            let cost_approx = usage.map(|u| is_approx(&u)).unwrap_or(false);
+            HistoryItem { role, text: message.content.clone(), debug: None, tokens, cost, cost_approx }
         })
         .collect();
     for (i, (_, usage)) in messages.iter().enumerate() {
@@ -95,6 +114,10 @@ fn history_items_from_messages(messages: &[(ChatMessage, Option<Usage>)]) -> Vec
         if let Role::User = items[i - 1].role {
             if items[i - 1].tokens.is_none() {
                 items[i - 1].tokens = Some(usage.prompt_tokens);
+            }
+            if items[i - 1].cost.is_none() {
+                items[i - 1].cost = llm_core::pricing::resolve_input(usage);
+                items[i - 1].cost_approx = is_approx(usage);
             }
         }
     }
@@ -125,7 +148,7 @@ enum CreateStep {
     TopP,
     Reasoning,
     ShowTokens,
-    ContextCompression,
+    ContextStrategy,
 }
 
 const CREATE_STEPS_TOTAL_QUICK: usize = 2;
@@ -142,12 +165,13 @@ impl CreateStep {
             CreateStep::TopP => " Top P, число (Enter — по умолчанию) ".to_string(),
             CreateStep::Reasoning => " Reasoning: on / off (Enter — по умолчанию) ".to_string(),
             CreateStep::ShowTokens => " Показывать токены в ответах? y/n ".to_string(),
-            // Число сообщений в партии берётся из llm_core::context::context_summary_chunk()
-            // (LLM_CONTEXT_SUMMARY_CHUNK), поэтому подпись собирается динамически, а не
-            // хранится статической строкой, как остальные шаги мастера.
-            CreateStep::ContextCompression => format!(
-                " Сжимать контекст диалога в сводку? Каждые {} сообщений — y/n ",
-                llm_core::context::context_summary_chunk()
+            // Размер окна берётся из llm_core::context::sliding_window_size()
+            // (LLM_SLIDING_WINDOW_SIZE), поэтому подпись собирается динамически.
+            CreateStep::ContextStrategy => format!(
+                " Стратегия контекста: full / summary / sliding-window / facts / branching \
+                 (сводка — каждые {} сообщ.; окно/facts — последние {} сообщ.; Enter — full) ",
+                llm_core::context::context_summary_chunk(),
+                llm_core::context::sliding_window_size(),
             ),
         }
     }
@@ -162,7 +186,7 @@ impl CreateStep {
             CreateStep::TopP => 6,
             CreateStep::Reasoning => 7,
             CreateStep::ShowTokens => 8,
-            CreateStep::ContextCompression => 9,
+            CreateStep::ContextStrategy => 9,
         }
     }
 
@@ -180,8 +204,8 @@ impl CreateStep {
             Temperature => Some(TopP),
             TopP => Some(Reasoning),
             Reasoning => Some(ShowTokens),
-            ShowTokens => Some(ContextCompression),
-            ContextCompression => None,
+            ShowTokens => Some(ContextStrategy),
+            ContextStrategy => None,
         }
     }
 }
@@ -272,9 +296,21 @@ impl CreateWizard {
             CreateStep::ShowTokens => {
                 self.config.show_tokens = matches!(value.to_lowercase().as_str(), "y" | "yes" | "д" | "да");
             }
-            CreateStep::ContextCompression => {
-                self.config.context_compression =
-                    matches!(value.to_lowercase().as_str(), "y" | "yes" | "д" | "да");
+            CreateStep::ContextStrategy => {
+                if value.is_empty() {
+                    self.config.context_strategy = llm_core::ContextStrategy::default();
+                } else {
+                    match value.to_lowercase().parse() {
+                        Ok(strategy) => self.config.context_strategy = strategy,
+                        Err(_) => {
+                            self.error = Some(
+                                "Введите full, summary, sliding-window, facts, branching или оставьте пустым"
+                                    .to_string(),
+                            );
+                            return false;
+                        }
+                    }
+                }
             }
         }
 
@@ -312,10 +348,15 @@ struct DrawState<'a> {
     context_tokens: Option<u64>,
     /// Размер контекстного окна модели открытого агента (None — вне экрана чата с агентом).
     context_window: Option<u32>,
-    /// Живой статус сжатия контекста открытого агента (см.
-    /// llm_core::CompressionInfo) — None вне экрана чата с агентом, если у него
-    /// выключено сжатие, или если его пока не удалось определить.
-    agent_compression: Option<llm_core::CompressionInfo>,
+    /// Готовые фрагменты строки статуса активной стратегии управления
+    /// контекстом открытого агента (см. [`agent_strategy_spans`]) — `None` вне
+    /// экрана чата с агентом, при стратегии `full`, или если статус ещё не
+    /// удалось определить.
+    agent_strategy_badge: Option<Vec<Span<'static>>>,
+    /// Стоимость всего диалога с открытым агентом (сумма, признак "это оценка,
+    /// не реальная стоимость от провайдера" — см. llm_core::pricing) — `None`
+    /// вне экрана чата с агентом или если стоимость взять неоткуда.
+    agent_dialogue_cost: Option<(f64, bool)>,
     show_debug: bool,
     agents: &'a [AgentInfo],
     agents_selected: usize,
@@ -393,6 +434,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             .to_string(),
         debug: None,
         tokens: None,
+        cost: None,
+        cost_approx: false,
     }];
     let mut waiting = false;
     // Имя агента, чей ответ сейчас ожидается (None — если ждём прямой чат).
@@ -495,14 +538,38 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             Screen::Chat => Some(client.context_window()),
             _ => None,
         };
-        // Тот же снимок agents_snapshot, что и выше, — CompressionInfo в нём уже
+        // Тот же снимок agents_snapshot, что и выше, — статус стратегии в нём уже
         // посчитан на момент вызова agent_manager.list() (см. Agent::info()), без
         // отдельного похода к агенту.
-        let screen_agent_compression = match &screen {
+        let screen_agent_strategy_badge = match &screen {
             Screen::AgentChat => agent_chat_name
                 .as_ref()
                 .and_then(|n| agents_snapshot.iter().find(|a| &a.config.name == n))
-                .and_then(|a| a.compression),
+                .and_then(agent_strategy_spans),
+            _ => None,
+        };
+        // Стоимость всего диалога с открытым агентом (см. llm_core::pricing) —
+        // сумма HistoryItem::cost по всей известной истории (восстановленной из
+        // SQLite при открытии чата + отправленной в этой сессии TUI), а не
+        // только новых сообщений: пользователь видит, сколько уже стоил диалог
+        // целиком. `None`, если ни для одного сообщения стоимость не удалось
+        // определить (ни от провайдера, ни оценкой) — тогда бейдж скрыт; второй
+        // элемент пары — true, если хоть один вклад в сумму был оценкой, а не
+        // реальной стоимостью от провайдера (тогда сумма помечается "≈").
+        let screen_agent_dialogue_cost = match &screen {
+            Screen::AgentChat => agent_chat_name.as_ref().and_then(|n| agent_histories.get(n)).and_then(|items| {
+                let mut sum = 0.0;
+                let mut any = false;
+                let mut approx = false;
+                for item in items {
+                    if let Some(c) = item.cost {
+                        sum += c;
+                        any = true;
+                        approx |= item.cost_approx;
+                    }
+                }
+                any.then_some((sum, approx))
+            }),
             _ => None,
         };
 
@@ -519,7 +586,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             last_usage,
             context_tokens: screen_context_tokens,
             context_window: screen_context_window,
-            agent_compression: screen_agent_compression,
+            agent_strategy_badge: screen_agent_strategy_badge,
+            agent_dialogue_cost: screen_agent_dialogue_cost,
             show_debug,
             agents: &agents_snapshot,
             agents_selected,
@@ -569,6 +637,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         text: "Новая сессия — история сброшена.".to_string(),
                                         debug: None,
                                         tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
                                     });
                                     chat_history.clear();
                                     chat_context_tokens = None;
@@ -595,6 +665,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         text: prompt.clone(),
                                         debug: None,
                                         tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
                                     });
                                     waiting = true;
 
@@ -793,6 +865,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 text: prompt.clone(),
                                                 debug: None,
                                                 tokens: None,
+                                                cost: None,
+                                                cost_approx: false,
                                             });
                                             waiting = true;
                                             waiting_agent = Some(name.clone());
@@ -850,6 +924,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             text: completion.content,
                             debug: Some((completion.request_json, completion.response_json)),
                             tokens: response_tokens,
+                            cost: None,
+                            cost_approx: false,
                         });
                     }
                     AppEvent::DirectResponse { result: Err(err), .. } => {
@@ -858,6 +934,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             text: format!("{err:#}"),
                             debug: None,
                             tokens: None,
+                            cost: None,
+                            cost_approx: false,
                         });
                     }
                     AppEvent::AgentResponse { name, result } => {
@@ -865,10 +943,21 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         match result {
                             Ok(reply) => {
                                 let response_tokens = reply.usage.map(|u| u.completion_tokens);
+                                let response_cost = reply.cost.map(|c| c.output);
+                                let cost_approx =
+                                    reply.cost.map(|c| c.source == llm_core::pricing::CostSource::Estimated);
                                 if let Some(usage) = reply.usage {
                                     if let Some(last) = entry.last_mut() {
                                         if matches!(last.role, Role::User) && last.tokens.is_none() {
                                             last.tokens = Some(usage.prompt_tokens);
+                                        }
+                                    }
+                                }
+                                if let Some(cost) = reply.cost {
+                                    if let Some(last) = entry.last_mut() {
+                                        if matches!(last.role, Role::User) && last.cost.is_none() {
+                                            last.cost = Some(cost.input);
+                                            last.cost_approx = cost.source == llm_core::pricing::CostSource::Estimated;
                                         }
                                     }
                                 }
@@ -877,6 +966,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 }
                                 let summarized = reply.summarized;
                                 let summary_covers = reply.summary_covers;
+                                let facts_updated = reply.facts_updated;
                                 entry.push(HistoryItem {
                                     role: Role::Assistant,
                                     text: reply.text,
@@ -885,10 +975,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     // всегда был пуст, потому что AgentReply не нёс JSON.
                                     debug: Some((reply.request_json, reply.response_json)),
                                     tokens: response_tokens,
+                                    cost: response_cost,
+                                    cost_approx: cost_approx.unwrap_or(false),
                                 });
-                                // Момент пересчёта сводки сжатого контекста — показываем его
-                                // отдельной строкой сразу после ответа, в рамках которого он
-                                // произошёл (см. AgentConfig::context_compression).
+                                // Момент пересчёта сводки сжатого контекста (стратегия
+                                // summary) — показываем его отдельной строкой сразу после
+                                // ответа, в рамках которого он произошёл.
                                 if summarized {
                                     entry.push(HistoryItem {
                                         role: Role::Compression,
@@ -898,6 +990,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         ),
                                         debug: None,
                                         tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
+                                    });
+                                }
+                                // Момент обновления фактов (стратегия facts) — аналогичная метка.
+                                if facts_updated {
+                                    entry.push(HistoryItem {
+                                        role: Role::Compression,
+                                        text: "📌 Факты обновлены.".to_string(),
+                                        debug: None,
+                                        tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
                                     });
                                 }
                             }
@@ -907,6 +1012,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     text: format!("{err:#}"),
                                     debug: None,
                                     tokens: None,
+                                    cost: None,
+                                    cost_approx: false,
                                 });
                             }
                         }
@@ -1049,10 +1156,7 @@ fn agent_meta_line(config: &AgentConfig) -> String {
     if let Some(r) = config.reasoning {
         parts.push(format!("reasoning: {}", if r { "on" } else { "off" }));
     }
-    parts.push(format!(
-        "сжатие контекста: {}",
-        if config.context_compression { "вкл" } else { "выкл" }
-    ));
+    parts.push(format!("стратегия контекста: {}", config.context_strategy));
     parts.join(" · ")
 }
 
@@ -1261,10 +1365,7 @@ fn draw_agent_create(frame: &mut Frame, state: &DrawState) {
             },
         ));
         lines.push(summary_line("Показывать токены", if wizard.config.show_tokens { "да" } else { "нет" }));
-        lines.push(summary_line(
-            "Сжатие контекста",
-            if wizard.config.context_compression { "да" } else { "нет" },
-        ));
+        lines.push(summary_line("Стратегия контекста", &wizard.config.context_strategy.to_string()));
     }
     if let Some(err) = &wizard.error {
         lines.push(Line::from(""));
@@ -1376,6 +1477,41 @@ fn context_bar_color(percent: u32) -> Color {
     }
 }
 
+/// Строит фрагменты строки статуса активной стратегии управления контекстом
+/// агента — рядом с индикатором заполнения контекста в шапке чата (см.
+/// `DrawState::agent_strategy_badge`). `None`, если активна стратегия `full`
+/// (управлять нечем).
+fn agent_strategy_spans(info: &AgentInfo) -> Option<Vec<Span<'static>>> {
+    if let Some(c) = info.compression {
+        return Some(vec![
+            Span::raw("  ·  🗜 ещё "),
+            Span::styled(c.messages_until_summary.to_string(), Style::default().fg(Color::Yellow)),
+            Span::raw(" сообщ. до сжатия"),
+        ]);
+    }
+    if let Some(f) = &info.facts {
+        return Some(vec![
+            Span::raw("  ·  📌 facts: "),
+            Span::styled(f.facts.len().to_string(), Style::default().fg(Color::Yellow)),
+            Span::raw(format!(" (окно {})", f.window_size)),
+        ]);
+    }
+    if let Some(w) = info.sliding_window {
+        return Some(vec![
+            Span::raw("  ·  🪟 окно: "),
+            Span::styled(format!("{}/{}", w.kept_messages, w.total_messages), Style::default().fg(Color::Yellow)),
+            Span::raw(" сообщ."),
+        ]);
+    }
+    if let Some(b) = &info.branching {
+        return Some(vec![
+            Span::raw("  ·  🌿 ветка: "),
+            Span::styled(b.current_branch.clone(), Style::default().fg(Color::Yellow)),
+        ]);
+    }
+    None
+}
+
 fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let area = frame.area();
     let chunks = layout_chunks_with_input_height(area, INPUT_HEIGHT_AGENT_CHAT);
@@ -1433,15 +1569,21 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
                 Span::styled(context_bar(used, window, 24), Style::default().fg(context_bar_color(percent))),
                 Span::raw(format!(" {percent}% ({}/{})", format_tokens(used), format_tokens(window as u64))),
             ];
-            // Наглядно показывает, сколько сообщений осталось до следующего пересчёта
-            // сводки — прямо рядом с заполнением контекста (см. CompressionInfo).
-            if let Some(compression) = state.agent_compression {
-                spans.push(Span::raw("  ·  🗜 ещё "));
+            // Наглядно показывает статус активной стратегии управления контекстом
+            // (сколько сообщений осталось до сжатия, окно, факты или ветка) — прямо
+            // рядом с заполнением контекста (см. agent_strategy_spans).
+            if let Some(badge) = &state.agent_strategy_badge {
+                spans.extend(badge.iter().cloned());
+            }
+            // Стоимость всего диалога (см. llm_core::pricing) — скрыта, если стоимость
+            // взять неоткуда (ни от провайдера, ни оценкой по LLM_PRICE_*_PER_1M).
+            if let Some((cost, approx)) = state.agent_dialogue_cost {
+                let mark = if approx { "≈" } else { "" };
+                spans.push(Span::raw("  ·  💰 "));
                 spans.push(Span::styled(
-                    compression.messages_until_summary.to_string(),
+                    format!("{mark}{}{cost:.8}", llm_core::pricing::currency()),
                     Style::default().fg(Color::Yellow),
                 ));
-                spans.push(Span::raw(" сообщ. до сжатия"));
             }
             Line::from(spans)
         }
@@ -1502,16 +1644,22 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
     }
     // Токены этого конкретного сообщения — как в веб-интерфейсе, прямо под
     // текстом: "токены запроса" у сообщения пользователя, "токены ответа" у
-    // ответа ассистента (см. HistoryItem::tokens).
+    // ответа ассистента (см. HistoryItem::tokens); стоимость (см.
+    // HistoryItem::cost) дописывается на ту же строку, если заданы ставки цены.
     if let Some(tokens) = item.tokens {
         let token_label = match item.role {
             Role::User => "токены запроса",
             Role::Assistant => "токены ответа",
             _ => "токены",
         };
+        let mut text = format!("{token_label}: {tokens}");
+        if let Some(cost) = item.cost {
+            let mark = if item.cost_approx { "≈" } else { "" };
+            text.push_str(&format!(" · {mark}{}{:.8}", llm_core::pricing::currency(), cost));
+        }
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(prefix_width)),
-            Span::styled(format!("{token_label}: {tokens}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(text, Style::default().fg(Color::DarkGray)),
         ]));
     }
 

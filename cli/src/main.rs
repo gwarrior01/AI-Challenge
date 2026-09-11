@@ -3,8 +3,9 @@
 //! Два режима работы:
 //!   1) Прямой разовый/интерактивный запрос к LLM (без именованного агента) — как раньше.
 //!   2) Управление именованными агентами: у каждого своя конфигурация (системный промпт,
-//!      модель, лимиты генерации, показывать ли токены) и жизненный цикл — агента можно
-//!      добавить, запустить и остановить. Запрос, пока агент остановлен, отклоняется.
+//!      модель, лимиты генерации, показывать ли токены, стратегия управления контекстом)
+//!      и жизненный цикл — агента можно добавить, запустить и остановить. Запрос, пока
+//!      агент остановлен, отклоняется.
 //!
 //! Использование:
 //!   llm-cli "запрос"                  -- разовый запрос напрямую к LLM
@@ -14,25 +15,38 @@
 //!   llm-cli agent remove <имя>        -- удалить агента
 //!   llm-cli agent start <имя>         -- запустить агента и открыть чат с ним
 //!   llm-cli agent stop <имя>          -- остановить агента
+//!   llm-cli agent strategy <имя> <стратегия>       -- сменить стратегию контекста на лету
+//!   llm-cli agent checkpoint <имя> <метка>         -- отметить точку ветвления (strategy branching)
+//!   llm-cli agent branch <имя> <новая-ветка> [--from <метка>]  -- ответвить новую ветку
+//!   llm-cli agent switch <имя> <ветка>             -- переключиться на другую ветку
+//!   llm-cli agent branches <имя>                   -- список веток и checkpoint'ов
+//!
+//! ## Стратегии управления контекстом (`--context-strategy`)
+//!   full             -- без управления: вся история в каждом запросе (по умолчанию)
+//!   summary          -- сжатие устаревшей части истории в сводку той же моделью
+//!   sliding-window   -- только последние N сообщений пользователя, остальное отбрасывается
+//!   facts            -- sticky facts (ключ-значение) + последние N сообщений
+//!   branching        -- ветки диалога с checkpoint'ами (см. agent checkpoint/branch/switch)
+//! N берётся из LLM_SLIDING_WINDOW_SIZE (по умолчанию 6) или флага --window-size у агента.
 //!
 //! Флаги `agent add`:
-//!   --system TEXT            системный промпт
-//!   --model NAME              модель (иначе используется LLM_MODEL)
-//!   --show-tokens             выводить расход токенов в ответах
+//!   --system TEXT              системный промпт
+//!   --model NAME                модель (иначе используется LLM_MODEL)
+//!   --show-tokens               выводить расход токенов в ответах
 //!   --max-tokens N
 //!   --temperature N
 //!   --top-p N
 //!   --reasoning on|off
-//!   --compress                включить управление контекстом: последние сообщения
-//!                              отправляются как есть, остальное периодически сжимается
-//!                              той же моделью в сводку (см. AgentConfig::context_compression)
+//!   --context-strategy STRAT    full|summary|sliding-window|facts|branching (см. выше)
+//!   --window-size N              переопределить размер окна для sliding-window/facts
+//!   --compress                   устаревший алиас --context-strategy summary
 //!
 //! Обязательные переменные окружения: LLM_API_URL, LLM_API_KEY (см. .env.example).
 //! Реестр агентов и история их диалогов хранятся в SQLite-файле AGENTS_STORE_PATH
 //! (по умолчанию agents.db) — после перезапуска агент помнит прошлые сообщения.
 
 use anyhow::{anyhow, bail, Result};
-use llm_core::{Agent, AgentConfig, AgentManager, LlmClient};
+use llm_core::{Agent, AgentConfig, AgentManager, ContextStrategy, LlmClient};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -113,11 +127,18 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                     let status = if info.running { "запущен" } else { "остановлен" };
                     let model = info.config.model.as_deref().unwrap_or("(модель по умолчанию)");
                     let tokens = if info.config.show_tokens { "показывать" } else { "скрывать" };
-                    let compression = if info.config.context_compression { "вкл" } else { "выкл" };
                     println!(
-                        "- {} [{status}] · модель: {model} · токены: {tokens} · сжатие контекста: {compression}",
-                        info.config.name
+                        "- {} [{status}] · модель: {model} · токены: {tokens} · стратегия контекста: {}",
+                        info.config.name, info.config.context_strategy
                     );
+                    if let Some(branching) = &info.branching {
+                        println!(
+                            "    ветка: {} · веток всего: {} · checkpoint'ов: {}",
+                            branching.current_branch,
+                            branching.branches.len(),
+                            branching.checkpoints.len()
+                        );
+                    }
                 }
             }
             Ok(())
@@ -164,6 +185,97 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             println!("Агент «{name}» остановлен.");
             Ok(())
         }
+        Some("strategy") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent strategy <имя> <стратегия>"))?;
+            let raw = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите стратегию: full|summary|sliding-window|facts|branching"))?;
+            let strategy: ContextStrategy = raw.parse()?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            let mut config = agent.config();
+            config.context_strategy = strategy;
+            agent.set_config(config)?;
+            println!("Стратегия контекста агента «{name}» переключена на «{strategy}».");
+            Ok(())
+        }
+        Some("checkpoint") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent checkpoint <имя> <метка>"))?;
+            let label =
+                args.get(2).cloned().ok_or_else(|| anyhow!("укажите метку checkpoint'а"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            agent.checkpoint(&label)?;
+            println!("Checkpoint «{label}» сохранён (ветка «{}»).", agent.current_branch());
+            Ok(())
+        }
+        Some("branch") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent branch <имя> <новая-ветка> [--from <метка>]"))?;
+            let new_branch = args.get(2).cloned().ok_or_else(|| anyhow!("укажите имя новой ветки"))?;
+            let mut from_checkpoint: Option<String> = None;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--from" {
+                    i += 1;
+                    from_checkpoint =
+                        Some(args.get(i).cloned().ok_or_else(|| anyhow!("--from требует значение"))?);
+                } else {
+                    bail!("неизвестный флаг: {}", args[i]);
+                }
+                i += 1;
+            }
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            agent.branch_from(from_checkpoint.as_deref(), &new_branch)?;
+            match &from_checkpoint {
+                Some(cp) => println!("Ветка «{new_branch}» создана от checkpoint'а «{cp}»."),
+                None => println!("Ветка «{new_branch}» создана от текущего конца ветки «{}».", agent.current_branch()),
+            }
+            println!("Переключиться на неё: llm-cli agent switch {name} {new_branch}");
+            Ok(())
+        }
+        Some("switch") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent switch <имя> <ветка>"))?;
+            let branch = args.get(2).cloned().ok_or_else(|| anyhow!("укажите имя ветки"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            agent.switch_branch(&branch)?;
+            println!("Агент «{name}» переключён на ветку «{branch}».");
+            Ok(())
+        }
+        Some("branches") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent branches <имя>"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            let current = agent.current_branch();
+            println!("Текущая ветка: {current}");
+            println!("Ветки:");
+            for branch in agent.list_branches() {
+                let marker = if branch == current { "*" } else { " " };
+                println!("  {marker} {branch}");
+            }
+            let checkpoints = agent.list_checkpoints();
+            if checkpoints.is_empty() {
+                println!("Checkpoint'ов пока нет.");
+            } else {
+                println!("Checkpoint'ы:");
+                for cp in checkpoints {
+                    println!("  - {cp}");
+                }
+            }
+            Ok(())
+        }
         _ => {
             print_agent_usage();
             Ok(())
@@ -177,10 +289,16 @@ fn print_agent_usage() {
          \x20 llm-cli agent list\n\
          \x20 llm-cli agent add <имя> [--system TEXT] [--model NAME] [--show-tokens]\n\
          \x20                        [--max-tokens N] [--temperature N] [--top-p N] [--reasoning on|off]\n\
-         \x20                        [--compress]\n\
+         \x20                        [--context-strategy full|summary|sliding-window|facts|branching]\n\
+         \x20                        [--window-size N] [--compress]\n\
          \x20 llm-cli agent remove <имя>\n\
          \x20 llm-cli agent start <имя>\n\
-         \x20 llm-cli agent stop <имя>"
+         \x20 llm-cli agent stop <имя>\n\
+         \x20 llm-cli agent strategy <имя> <стратегия>\n\
+         \x20 llm-cli agent checkpoint <имя> <метка>                    (стратегия branching)\n\
+         \x20 llm-cli agent branch <имя> <новая-ветка> [--from <метка>] (стратегия branching)\n\
+         \x20 llm-cli agent switch <имя> <ветка>                        (стратегия branching)\n\
+         \x20 llm-cli agent branches <имя>                              (стратегия branching)"
     );
 }
 
@@ -203,7 +321,18 @@ fn parse_agent_add_flags(name: String, flags: &[String]) -> Result<AgentConfig> 
                 config.show_tokens = true;
             }
             "--compress" => {
-                config.context_compression = true;
+                config.context_strategy = ContextStrategy::Summary;
+            }
+            "--context-strategy" => {
+                i += 1;
+                let raw = flags.get(i).ok_or_else(|| anyhow!("--context-strategy требует значение"))?;
+                config.context_strategy = raw.parse()?;
+            }
+            "--window-size" => {
+                i += 1;
+                let raw = flags.get(i).ok_or_else(|| anyhow!("--window-size требует значение"))?;
+                config.window_size =
+                    Some(raw.parse().map_err(|_| anyhow!("--window-size должно быть целым числом"))?);
             }
             "--max-tokens" => {
                 i += 1;
@@ -265,6 +394,30 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
     let mut session_tokens: u64 = 0;
     let show_tokens = agent.config().show_tokens;
 
+    // Стоимость диалога (см. llm_core::pricing) — в отличие от session_tokens
+    // выше (который считает только запросы этого запуска CLI), она сразу
+    // включает и восстановленную из SQLite историю, поэтому число с первого же
+    // сообщения отражает, сколько уже стоил весь диалог с этим агентом, а не
+    // только эта сессия. Печатается, только если для ХОТЯ БЫ ОДНОГО сообщения
+    // стоимость удалось определить (реальная от провайдера или оценка по
+    // ставкам LLM_PRICE_INPUT_PER_1M/LLM_PRICE_OUTPUT_PER_1M) — иначе печатать
+    // нечего. dialogue_cost_approx — true, если хоть один вклад в сумму был
+    // оценкой, а не реальной стоимостью от провайдера: тогда итог помечается "≈".
+    let currency = llm_core::pricing::currency();
+    let mut dialogue_cost: f64 = 0.0;
+    let mut dialogue_cost_known = false;
+    let mut dialogue_cost_approx = false;
+    for (_, usage) in agent.history_with_usage() {
+        let Some(usage) = usage else { continue };
+        if let Some(total) = llm_core::pricing::resolve_total(&usage) {
+            dialogue_cost += total;
+            dialogue_cost_known = true;
+            if llm_core::pricing::source(&usage) == Some(llm_core::pricing::CostSource::Estimated) {
+                dialogue_cost_approx = true;
+            }
+        }
+    }
+
     loop {
         print!("[{}] > ", agent.name());
         io::stdout().flush()?;
@@ -290,6 +443,42 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
                     session_tokens += usage.total_tokens as u64;
                     if show_tokens {
                         println!("[всего за сессию: {session_tokens} ток.]");
+                    }
+                }
+                if let Some(cost) = reply.cost {
+                    dialogue_cost += cost.total;
+                    dialogue_cost_known = true;
+                    let request_approx = cost.source == llm_core::pricing::CostSource::Estimated;
+                    if request_approx {
+                        dialogue_cost_approx = true;
+                    }
+                    if show_tokens {
+                        let request_mark = if request_approx { "≈" } else { "" };
+                        let dialogue_mark = if dialogue_cost_approx { "≈" } else { "" };
+                        println!(
+                            "[💰 запрос: {request_mark}{currency}{:.8} · весь диалог: {dialogue_mark}{currency}{dialogue_cost:.8}]",
+                            cost.total
+                        );
+                    }
+                } else if dialogue_cost_known && show_tokens {
+                    // Стоимость этого конкретного обмена определить не удалось (см.
+                    // AgentReply::cost), но по диалогу в целом что-то уже накоплено —
+                    // печатаем хотя бы итог, чтобы счётчик не пропадал молча.
+                    let dialogue_mark = if dialogue_cost_approx { "≈" } else { "" };
+                    println!("[💰 весь диалог: {dialogue_mark}{currency}{dialogue_cost:.8}]");
+                }
+                if let (true, Some(n)) = (reply.summarized, reply.summary_covers) {
+                    println!("[🗜️ сводка контекста пересчитана — покрывает {n} сообщений]");
+                }
+                if reply.facts_updated {
+                    if let Some(facts) = agent.info().facts {
+                        if facts.facts.is_empty() {
+                            println!("[📌 facts: (пусто)]");
+                        } else {
+                            let rendered: Vec<String> =
+                                facts.facts.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                            println!("[📌 facts обновлены: {}]", rendered.join(", "));
+                        }
                     }
                 }
                 println!();
