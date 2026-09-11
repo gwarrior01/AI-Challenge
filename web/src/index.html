@@ -1265,6 +1265,14 @@
     display: none;
   }
 
+  /* Тот же баг specificity у полей settings-field (например, "Размер окна N",
+     скрываемого/показываемого через agentWindowSizeField.hidden при смене
+     стратегии контекста) — .settings-field{display:flex} иначе перебивал бы
+     скрытие через hidden. */
+  .settings-field[hidden] {
+    display: none;
+  }
+
   .agents-list {
     display: flex;
     flex-direction: column;
@@ -1414,6 +1422,62 @@
     line-height: 1.5;
     padding: 12px 16px;
     border-radius: 14px;
+  }
+
+  .branch-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 20px;
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+    font-size: 12px;
+  }
+
+  /* Тот же баг specificity, что и у .agent-advanced-fields[hidden] выше —
+     .branch-bar{display:flex} иначе перебивал бы скрытие через hidden,
+     когда агент не на стратегии branching (см. updateBranchBar). */
+  .branch-bar[hidden] {
+    display: none;
+  }
+
+  .branch-bar-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .branch-bar-label {
+    color: var(--muted);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .branch-bar select,
+  .branch-bar input[type="text"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+  }
+
+  .branch-bar select {
+    cursor: pointer;
+  }
+
+  .branch-bar .settings-btn {
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+
+  .branch-bar .field-error {
+    color: var(--error);
+    font-size: 11px;
+    flex-basis: 100%;
   }
 
   .agent-chat-footer {
@@ -1656,13 +1720,21 @@
         <input type="checkbox" id="agent-show-tokens">
         Показывать количество использованных токенов в ответах агента
       </label>
-      <label class="debug-check">
-        <input type="checkbox" id="agent-context-compression">
-        Сжимать контекст диалога: каждые __CONTEXT_SUMMARY_CHUNK__ сообщений вся накопленная с прошлого раза переписка
-        сжимается той же моделью в сводку — она подставляется в запрос вместо полной истории, а
-        между пересчётами непросуммированный "хвост" отправляется как есть. Без галочки в каждый
-        запрос уходит вся история целиком.
-      </label>
+      <div class="settings-field">
+        <label for="agent-context-strategy">Стратегия управления контекстом</label>
+        <select id="agent-context-strategy">
+          <option value="full">Без управления — вся история в каждом запросе</option>
+          <option value="summary">Summary — сжатие устаревшей части в сводку (каждые __CONTEXT_SUMMARY_CHUNK__ сообщ.)</option>
+          <option value="sliding-window">Sliding Window — только последние N сообщений</option>
+          <option value="facts">Sticky Facts — факты (ключ-значение) + последние N сообщений</option>
+          <option value="branching">Branching — ветки диалога (checkpoint + переключение веток)</option>
+        </select>
+        <span class="field-hint" id="agent-context-strategy-hint"></span>
+      </div>
+      <div class="settings-field" id="agent-window-size-field" hidden>
+        <label for="agent-window-size">Размер окна N (сообщений пользователя)</label>
+        <input type="number" id="agent-window-size" min="1" step="1" placeholder="по умолчанию __SLIDING_WINDOW_SIZE__">
+      </div>
     </div>
     <button type="button" id="agent-create-btn">Добавить агента</button>
     <span class="field-error" id="agent-create-error" hidden></span>
@@ -1695,6 +1767,23 @@
       <span class="ctx-tooltip"></span>
     </div>
     <span class="ctx-pending-badge" id="agent-ctx-pending" hidden></span>
+    <span class="ctx-pending-badge" id="agent-cost-badge" hidden></span>
+  </div>
+  <div class="branch-bar" id="agent-branch-bar" hidden>
+    <div class="branch-bar-group">
+      <span class="branch-bar-label">🌿 Ветка</span>
+      <select id="agent-branch-select"></select>
+    </div>
+    <div class="branch-bar-group">
+      <input type="text" id="agent-checkpoint-input" placeholder="имя checkpoint'а" size="16">
+      <button type="button" class="settings-btn" id="agent-checkpoint-btn">📍 Отметить</button>
+    </div>
+    <div class="branch-bar-group">
+      <input type="text" id="agent-new-branch-input" placeholder="имя новой ветки" size="16">
+      <select id="agent-branch-from-select"></select>
+      <button type="button" class="settings-btn" id="agent-new-branch-btn">+ Ветка</button>
+    </div>
+    <span class="field-error" id="agent-branch-error" hidden></span>
   </div>
   <main class="agent-chat-main" id="agent-chat-main"></main>
   <footer class="agent-chat-footer">
@@ -1741,6 +1830,53 @@ const CONTEXT_SUMMARY_CHUNK = __CONTEXT_SUMMARY_CHUNK__;
 // В chatHistory (и в agentChats) каждый обмен хранится как два отдельных сообщения
 // (запрос + ответ) — должно совпадать с llm_core::context::RAW_MESSAGES_PER_EXCHANGE.
 const RAW_MESSAGES_PER_EXCHANGE = 2;
+
+// Ставки оценки (см. llm_core::pricing) — inputPerMillion/outputPerMillion
+// равны null, если LLM_PRICE_INPUT_PER_1M / LLM_PRICE_OUTPUT_PER_1M не заданы
+// на бэкенде (тогда доступна только реальная стоимость от провайдера, если он
+// её прислал — см. helpers ниже); currency задана всегда. Используется только
+// в чате с именованным агентом — в обычном чате ("Чат") стоимость не считается.
+const PRICING = __PRICING_JSON__;
+
+// Стоимость входной части usage: usage.cost_input, если провайдер дал разбивку
+// (см. llm_core::Usage); 0, если провайдер дал только usage.cost целиком без
+// разбивки (тогда вся сумма приписывается outputCostOf — обмен не теряется);
+// иначе — оценка по ставкам. null, если стоимость взять неоткуда.
+function inputCostOf(usage) {
+  if (!usage) return null;
+  if (typeof usage.cost_input === 'number') return usage.cost_input;
+  if (typeof usage.cost === 'number') return 0;
+  if (PRICING.inputPerMillion == null || typeof usage.prompt_tokens !== 'number') return null;
+  return (usage.prompt_tokens / 1e6) * PRICING.inputPerMillion;
+}
+
+// Симметрично inputCostOf — см. её комментарий.
+function outputCostOf(usage) {
+  if (!usage) return null;
+  if (typeof usage.cost_output === 'number') return usage.cost_output;
+  if (typeof usage.cost === 'number') return usage.cost;
+  if (PRICING.outputPerMillion == null || typeof usage.completion_tokens !== 'number') return null;
+  return (usage.completion_tokens / 1e6) * PRICING.outputPerMillion;
+}
+
+// true, если стоимость usage — оценка по ставкам, а не реальная сумма от
+// провайдера (usage.cost). Показывается интерфейсом как "≈" перед суммой.
+function isCostApprox(usage) {
+  return !!usage && typeof usage.cost !== 'number';
+}
+
+function exchangeCostOf(usage) {
+  if (!usage) return null;
+  const input = inputCostOf(usage);
+  const output = outputCostOf(usage);
+  if (input == null || output == null) return null;
+  return input + output;
+}
+
+function formatCost(value, approx) {
+  if (value == null) return '';
+  return (approx ? '≈' : '') + PRICING.currency + value.toFixed(8);
+}
 
 let sessionRequests = 0;
 let sessionTokensIn = 0;
@@ -2878,7 +3014,32 @@ const agentTemperatureEl = document.getElementById('agent-temperature');
 const agentTopPEl = document.getElementById('agent-top-p');
 const agentReasoningEl = document.getElementById('agent-reasoning');
 const agentShowTokensEl = document.getElementById('agent-show-tokens');
-const agentContextCompressionEl = document.getElementById('agent-context-compression');
+const agentContextStrategyEl = document.getElementById('agent-context-strategy');
+const agentWindowSizeField = document.getElementById('agent-window-size-field');
+const agentWindowSizeEl = document.getElementById('agent-window-size');
+const agentContextStrategyHintEl = document.getElementById('agent-context-strategy-hint');
+
+// Полное описание поведения каждой стратегии — показывается под селектом сразу
+// при выборе, а не только в усечённом тексте option'а (см. llm_core::ContextStrategy
+// и core/src/context.rs на бэкенде — здесь тот же смысл, но по-русски и подробнее).
+const CONTEXT_STRATEGY_HINTS = {
+  'full': 'Управления нет: в каждый запрос уходит вся история диалога целиком. Ничего не теряется, но с ростом переписки растут и токены — без ограничения.',
+  'summary': `Каждые __CONTEXT_SUMMARY_CHUNK__ сообщений вся накопленная с прошлого раза переписка сжимается той же моделью в текстовую сводку — она подставляется в запрос вместо полной истории. Между пересчётами непросуммированный "хвост" отправляется как есть.`,
+  'sliding-window': 'В запрос попадают только последние N сообщений пользователя (обменов) — всё, что старше, просто отбрасывается без остатка. Самая дешёвая стратегия, но агент может забыть важную деталь, если она "выпала" из окна.',
+  'facts': 'Отдельно от истории ведётся набор фактов "ключ: значение" (цель, ограничения, договорённости и т.п.) — он обновляется отдельным запросом к модели после каждого сообщения пользователя. В запрос уходит блок фактов + последние N сообщений (то же окно, что и у Sliding Window).',
+  'branching': 'История хранится как набор именованных веток. После создания агента откройте его чат и в панели "🌿 Ветка" под шапкой отмечайте checkpoint, отращивайте от него новые ветки (там же указывается имя новой ветки) и переключайтесь между ними — каждая ветка несёт свою полную историю независимо от остальных.',
+};
+
+function updateAgentContextStrategyHint() {
+  const text = CONTEXT_STRATEGY_HINTS[agentContextStrategyEl.value] || '';
+  agentContextStrategyHintEl.textContent = text.replace('__CONTEXT_SUMMARY_CHUNK__', CONTEXT_SUMMARY_CHUNK);
+}
+
+agentContextStrategyEl.addEventListener('change', () => {
+  agentWindowSizeField.hidden = !(agentContextStrategyEl.value === 'sliding-window' || agentContextStrategyEl.value === 'facts');
+  updateAgentContextStrategyHint();
+});
+updateAgentContextStrategyHint();
 const agentCreateBtn = document.getElementById('agent-create-btn');
 const agentCreateError = document.getElementById('agent-create-error');
 const agentModeButtons = document.querySelectorAll('.agent-mode-btn');
@@ -2896,6 +3057,15 @@ const agentChatInputEl = document.getElementById('agent-chat-input');
 const agentChatSendBtn = document.getElementById('agent-chat-send');
 const agentCtxMeterEl = document.getElementById('agent-ctx-meter');
 const agentCtxPendingEl = document.getElementById('agent-ctx-pending');
+const agentCostBadgeEl = document.getElementById('agent-cost-badge');
+const agentBranchBarEl = document.getElementById('agent-branch-bar');
+const agentBranchSelectEl = document.getElementById('agent-branch-select');
+const agentCheckpointInputEl = document.getElementById('agent-checkpoint-input');
+const agentCheckpointBtnEl = document.getElementById('agent-checkpoint-btn');
+const agentNewBranchInputEl = document.getElementById('agent-new-branch-input');
+const agentBranchFromSelectEl = document.getElementById('agent-branch-from-select');
+const agentNewBranchBtnEl = document.getElementById('agent-new-branch-btn');
+const agentBranchErrorEl = document.getElementById('agent-branch-error');
 // Галочка "JSON запроса/ответа" в шапке чата с агентом — независимая от такой же
 // галочки в обычном чате (debugToggle): своя видимость, свой ключ в localStorage,
 // показывает/скрывает requestJson/responseJson (см. renderAgentMessage), которые
@@ -2963,34 +3133,253 @@ const agentChatStats = {};
 
 function ensureAgentChatStats(name) {
   if (!agentChatStats[name]) {
-    // compression — снимок CompressionInfo с бэкенда (см. core::agent::CompressionInfo):
-    // null, если у агента выключено сжатие контекста или статус ещё не приходил.
-    agentChatStats[name] = { usedTokens: null, contextWindow: null, compression: null };
+    // Снимки статуса активной стратегии с бэкенда (см. core::agent::AgentInfo) —
+    // не более одного из четырёх не-null одновременно, остальные null.
+    // dialogueCost — сумма стоимости (см. PRICING/usage.cost) по ВСЕЙ известной
+    // истории этого агента (восстановленной + отправленной в этой вкладке), а
+    // не только новых сообщений — см. addDialogueCost/openAgentChat/sumDialogueCost.
+    // dialogueCostApprox — true, если хоть один вклад в сумму был оценкой по
+    // ставкам, а не реальной стоимостью от провайдера (см. isCostApprox).
+    agentChatStats[name] = {
+      usedTokens: null,
+      contextWindow: null,
+      compression: null,
+      slidingWindow: null,
+      facts: null,
+      branching: null,
+      dialogueCost: null,
+      dialogueCostApprox: false,
+    };
   }
   return agentChatStats[name];
+}
+
+// Прибавляет стоимость одного обмена к накопленной стоимости диалога агента
+// `name` (см. ensureAgentChatStats) — no-op, если стоимость не удалось
+// определить (ни от провайдера, ни оценкой) или у обмена нет usage.
+function addDialogueCost(name, usage) {
+  const cost = exchangeCostOf(usage);
+  if (cost == null) return;
+  const stats = ensureAgentChatStats(name);
+  stats.dialogueCost = (stats.dialogueCost || 0) + cost;
+  stats.dialogueCostApprox = stats.dialogueCostApprox || isCostApprox(usage);
+}
+
+// Суммирует стоимость по списку сообщений чата ({usage, ...}) — используется
+// при открытии чата и после переключения ветки, когда нужно посчитать всю
+// известную историю разом, а не по одному обмену через addDialogueCost.
+function sumDialogueCost(messages) {
+  let sum = null;
+  let approx = false;
+  for (const m of messages) {
+    const cost = exchangeCostOf(m.usage);
+    if (cost == null) continue;
+    sum = (sum || 0) + cost;
+    approx = approx || isCostApprox(m.usage);
+  }
+  return { sum, approx };
 }
 
 function updateAgentChatStats(name) {
   const stats = ensureAgentChatStats(name);
   updateContextMeter(agentCtxMeterEl, stats.usedTokens, stats.contextWindow);
-  updateAgentCompressionBadge(stats.compression);
+  updateAgentStrategyBadge(stats);
+  updateBranchBar(name, stats.branching);
+  if (stats.dialogueCost == null) {
+    agentCostBadgeEl.hidden = true;
+  } else {
+    agentCostBadgeEl.hidden = false;
+    agentCostBadgeEl.innerHTML = '💰 <b>' + formatCost(stats.dialogueCost, stats.dialogueCostApprox) + '</b>';
+    agentCostBadgeEl.title = stats.dialogueCostApprox
+      ? 'Суммарная стоимость этого диалога — частично оценка по ставкам (LLM_PRICE_INPUT_PER_1M / LLM_PRICE_OUTPUT_PER_1M), частично реальная сумма от провайдера.'
+      : 'Суммарная стоимость этого диалога — реальная сумма, которую вернул провайдер.';
+  }
 }
 
-// Наглядно показывает, сколько сообщений осталось до следующего пересчёта
-// сводки — рядом с индикатором заполнения контекста (см. .ctx-pending-badge).
-// Скрыт целиком, если у агента выключено сжатие контекста.
-function updateAgentCompressionBadge(compression) {
-  if (!compression) {
-    agentCtxPendingEl.hidden = true;
+// Панель управления ветками (стратегия branching, см. AgentConfig::context_strategy
+// на бэкенде) — переключатель текущей ветки, создание checkpoint'а и ответвление
+// новой ветки от него (или от текущего момента). Скрыта целиком при любой другой
+// стратегии. Селекты перерисовываются только когда список веток/checkpoint'ов
+// реально изменился — иначе открытый в этот момент <select> дёргался бы при
+// каждом обновлении статистики.
+let agentBranchBarRenderedKey = null;
+function updateBranchBar(name, branching) {
+  if (!branching) {
+    agentBranchBarEl.hidden = true;
+    agentBranchBarRenderedKey = null;
     return;
   }
-  agentCtxPendingEl.hidden = false;
-  agentCtxPendingEl.innerHTML =
-    '🗜️ ещё <b>' + compression.messages_until_summary + '</b> сообщ. до сжатия';
-  agentCtxPendingEl.title =
-    `Сводка уже охватывает ${compression.summarized_count} сообщений; ` +
-    `${compression.pending_messages} ещё не в сводке из ${CONTEXT_SUMMARY_CHUNK}, ` +
-    `после чего она будет пересчитана.`;
+  agentBranchBarEl.hidden = false;
+  agentBranchBarEl.dataset.agent = name;
+
+  const key = name + '|' + branching.current_branch + '|' + branching.branches.join(',') + '|' + branching.checkpoints.join(',');
+  if (key === agentBranchBarRenderedKey) return;
+  agentBranchBarRenderedKey = key;
+
+  agentBranchSelectEl.innerHTML = branching.branches
+    .map((b) => `<option value="${escapeHtml(b)}"${b === branching.current_branch ? ' selected' : ''}>${escapeHtml(b)}</option>`)
+    .join('');
+
+  const fromOptions = ['<option value="">от текущего момента</option>'].concat(
+    branching.checkpoints.map((c) => `<option value="${escapeHtml(c)}">от checkpoint «${escapeHtml(c)}»</option>`)
+  );
+  agentBranchFromSelectEl.innerHTML = fromOptions.join('');
+}
+
+function showBranchError(message) {
+  agentBranchErrorEl.textContent = message;
+  agentBranchErrorEl.hidden = false;
+}
+
+agentBranchSelectEl.addEventListener('change', async () => {
+  const name = agentBranchBarEl.dataset.agent;
+  const branch = agentBranchSelectEl.value;
+  if (!name || !branch) return;
+  agentBranchErrorEl.hidden = true;
+  agentBranchSelectEl.disabled = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showBranchError(data.error);
+      return;
+    }
+    const stats = ensureAgentChatStats(name);
+    stats.branching = data.agent.branching || null;
+    stats.compression = data.agent.compression || null;
+    stats.slidingWindow = data.agent.sliding_window || null;
+    stats.facts = data.agent.facts || null;
+    // Переключение ветки меняет саму историю диалога — перерисовываем ленту
+    // чата из истории, которую вернула ветка назначения, а не просто статус.
+    agentChats[name] = applyAgentTokenMeta(
+      (data.history || [])
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role, text: m.content, usage: m.usage || null }))
+    );
+    // Контекстное окно у каждой ветки своё — переносим индикатор заполнения на
+    // last usage ветки назначения, иначе он ещё пару секунд показывал бы цифры
+    // от ветки, из которой ушли.
+    const lastWithUsage = [...agentChats[name]].reverse().find((m) => m.usage);
+    stats.usedTokens = lastWithUsage ? lastWithUsage.usage.total_tokens : null;
+    // Стоимость диалога тоже своя у каждой ветки — пересчитываем с нуля по
+    // истории ветки назначения (см. openAgentChat, та же логика).
+    const branchCost = sumDialogueCost(agentChats[name]);
+    stats.dialogueCost = branchCost.sum;
+    stats.dialogueCostApprox = branchCost.approx;
+    if (currentAgentChatName === name) {
+      updateAgentChatStats(name);
+      renderAgentChatMessages(name);
+    }
+  } catch (e) {
+    showBranchError('Ошибка сети: ' + e);
+  } finally {
+    agentBranchSelectEl.disabled = false;
+  }
+});
+
+agentCheckpointBtnEl.addEventListener('click', async () => {
+  const name = agentBranchBarEl.dataset.agent;
+  const label = agentCheckpointInputEl.value.trim();
+  if (!name) return;
+  agentBranchErrorEl.hidden = true;
+  if (!label) {
+    showBranchError('Укажите имя checkpoint\'а.');
+    return;
+  }
+  agentCheckpointBtnEl.disabled = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/checkpoint`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showBranchError(data.error);
+      return;
+    }
+    agentCheckpointInputEl.value = '';
+    const stats = ensureAgentChatStats(name);
+    stats.branching = data.agent.branching || null;
+    if (currentAgentChatName === name) updateBranchBar(name, stats.branching);
+  } catch (e) {
+    showBranchError('Ошибка сети: ' + e);
+  } finally {
+    agentCheckpointBtnEl.disabled = false;
+  }
+});
+
+agentNewBranchBtnEl.addEventListener('click', async () => {
+  const name = agentBranchBarEl.dataset.agent;
+  const newBranch = agentNewBranchInputEl.value.trim();
+  const fromCheckpoint = agentBranchFromSelectEl.value || null;
+  if (!name) return;
+  agentBranchErrorEl.hidden = true;
+  if (!newBranch) {
+    showBranchError('Укажите имя новой ветки.');
+    return;
+  }
+  agentNewBranchBtnEl.disabled = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_branch: newBranch, from_checkpoint: fromCheckpoint }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showBranchError(data.error);
+      return;
+    }
+    agentNewBranchInputEl.value = '';
+    const stats = ensureAgentChatStats(name);
+    stats.branching = data.agent.branching || null;
+    if (currentAgentChatName === name) updateBranchBar(name, stats.branching);
+  } catch (e) {
+    showBranchError('Ошибка сети: ' + e);
+  } finally {
+    agentNewBranchBtnEl.disabled = false;
+  }
+});
+
+// Наглядно показывает статус активной стратегии управления контекстом рядом с
+// индикатором заполнения контекста (см. .ctx-pending-badge): сколько сообщений
+// осталось до пересчёта сводки (summary), сколько сообщений реально попадёт в
+// следующий запрос (sliding-window), текущие факты (facts) или текущую ветку
+// (branching). Скрыт целиком при стратегии full.
+function updateAgentStrategyBadge({ compression, slidingWindow, facts, branching }) {
+  if (compression) {
+    agentCtxPendingEl.hidden = false;
+    agentCtxPendingEl.innerHTML = '🗜️ ещё <b>' + compression.messages_until_summary + '</b> сообщ. до сжатия';
+    agentCtxPendingEl.title =
+      `Сводка уже охватывает ${compression.summarized_count} сообщений; ` +
+      `${compression.pending_messages} ещё не в сводке из ${CONTEXT_SUMMARY_CHUNK}, ` +
+      `после чего она будет пересчитана.`;
+  } else if (facts) {
+    const entries = Object.entries(facts.facts || {});
+    agentCtxPendingEl.hidden = false;
+    agentCtxPendingEl.innerHTML = '📌 facts: <b>' + entries.length + '</b> · окно ' + facts.window_size;
+    agentCtxPendingEl.title = entries.length
+      ? entries.map(([k, v]) => `${k}: ${v}`).join('\n')
+      : 'Фактов пока нет — появятся после первого сообщения.';
+  } else if (slidingWindow) {
+    agentCtxPendingEl.hidden = false;
+    agentCtxPendingEl.innerHTML =
+      '🪟 окно: <b>' + slidingWindow.kept_messages + '/' + slidingWindow.total_messages + '</b> сообщ.';
+    agentCtxPendingEl.title = `Отброшено сообщений: ${slidingWindow.dropped_messages} из ${slidingWindow.total_messages} (окно N=${slidingWindow.window_size}).`;
+  } else if (branching) {
+    agentCtxPendingEl.hidden = false;
+    agentCtxPendingEl.innerHTML = '🌿 ветка: <b>' + branching.current_branch + '</b>';
+    agentCtxPendingEl.title =
+      `Веток всего: ${branching.branches.join(', ')}. ` +
+      `Checkpoint'ы: ${branching.checkpoints.length ? branching.checkpoints.join(', ') : '—'}.`;
+  } else {
+    agentCtxPendingEl.hidden = true;
+  }
 }
 // Режим создания: 'quick' — только имя и системный промпт (остальное по
 // умолчанию), 'advanced' — полный набор параметров.
@@ -3016,7 +3405,7 @@ function agentMetaLine(config) {
   if (config.max_tokens !== null && config.max_tokens !== undefined) parts.push('макс. токенов: ' + config.max_tokens);
   if (config.reasoning === true) parts.push('reasoning: вкл');
   if (config.reasoning === false) parts.push('reasoning: выкл');
-  parts.push('сжатие контекста: ' + (config.context_compression ? 'вкл' : 'выкл'));
+  parts.push('стратегия контекста: ' + (config.context_strategy || 'full'));
   return parts.join(' · ');
 }
 
@@ -3037,8 +3426,9 @@ function renderAgentMessage(msg) {
   row.appendChild(text);
 
   const tokens = msg.role === 'user' ? msg.requestTokens : msg.role === 'assistant' ? msg.responseTokens : null;
+  const usage = msg.role === 'user' ? msg.requestUsage : msg.role === 'assistant' ? msg.usage : null;
   if (typeof tokens === 'number') {
-    setAgentMessageTokens(row, msg.role, tokens);
+    setAgentMessageTokens(row, msg.role, tokens, usage);
   }
   // JSON запроса/ответа — только для сообщений, полученных в этой сессии (см.
   // agent-chat-debug-toggle): история, восстановленная из SQLite, их не несёт.
@@ -3048,20 +3438,26 @@ function renderAgentMessage(msg) {
   return row;
 }
 
-function setAgentMessageTokens(row, role, tokens) {
+function setAgentMessageTokens(row, role, tokens, usage) {
   let meta = row.querySelector('.agent-message-meta');
   if (!meta) {
     meta = document.createElement('span');
     meta.className = 'agent-message-meta';
     row.appendChild(meta);
   }
-  meta.textContent = (role === 'user' ? 'токены запроса: ' : 'токены ответа: ') + tokens;
+  const cost = role === 'user' ? inputCostOf(usage) : outputCostOf(usage);
+  let text = (role === 'user' ? 'токены запроса: ' : 'токены ответа: ') + tokens;
+  if (cost != null) text += ' · ' + formatCost(cost, isCostApprox(usage));
+  meta.textContent = text;
 }
 
 // Токены пары "запрос-ответ" от API приходят одной суммой на сообщении
-// ассистента (prompt_tokens относится к предыдущему сообщению пользователя,
-// completion_tokens — к самому ответу). Раскладываем их по сообщениям, чтобы
-// renderAgentMessage мог показать нужное число под каждым из них.
+// ассистента (prompt_tokens/cost_input относятся к предыдущему сообщению
+// пользователя, completion_tokens/cost_output — к самому ответу). Раскладываем
+// их по сообщениям, чтобы renderAgentMessage мог показать нужное число под
+// каждым из них — requestUsage/usage хранят полный объект usage (а не только
+// токены), потому что стоимость (см. inputCostOf/outputCostOf) читает из него
+// больше одного поля.
 function applyAgentTokenMeta(messages) {
   for (let i = 0; i < messages.length; i += 1) {
     const msg = messages[i];
@@ -3070,6 +3466,7 @@ function applyAgentTokenMeta(messages) {
     const prev = messages[i - 1];
     if (prev && prev.role === 'user' && prev.requestTokens == null) {
       prev.requestTokens = msg.usage.prompt_tokens;
+      prev.requestUsage = msg.usage;
     }
   }
   return messages;
@@ -3197,7 +3594,11 @@ function updateAgentChatHeader(name) {
     ensureAgentChatStats(name).contextWindow = info.context_window;
   }
   if (info) {
-    ensureAgentChatStats(name).compression = info.compression || null;
+    const stats = ensureAgentChatStats(name);
+    stats.compression = info.compression || null;
+    stats.slidingWindow = info.sliding_window || null;
+    stats.facts = info.facts || null;
+    stats.branching = info.branching || null;
   }
   updateAgentChatStats(name);
 }
@@ -3234,10 +3635,20 @@ async function openAgentChat(name) {
       if (lastWithUsage) {
         stats.usedTokens = lastWithUsage.usage.total_tokens;
       }
+      // Стоимость диалога (см. sumDialogueCost) — сумма по ВСЕЙ известной истории
+      // (та же конкатенация restored+session, что и agentChats[name] выше), а не
+      // только по восстановленным сообщениям: usage хранится только на сообщении
+      // ассистента, поэтому каждый обмен считается ровно раз.
+      const historyCost = sumDialogueCost(agentChats[name]);
+      stats.dialogueCost = historyCost.sum;
+      stats.dialogueCostApprox = historyCost.approx;
       if (typeof data.context_window === 'number') {
         stats.contextWindow = data.context_window;
       }
       stats.compression = data.compression || null;
+      stats.slidingWindow = data.sliding_window || null;
+      stats.facts = data.facts || null;
+      stats.branching = data.branching || null;
       if (currentAgentChatName === name) updateAgentChatStats(name);
       if (currentAgentChatName === name) renderAgentChatMessages(name);
     } catch (e) {
@@ -3295,8 +3706,10 @@ async function sendAgentChatMessage() {
       : { role: 'assistant', text: data.answer, requestJson: data.requestJson, responseJson: data.responseJson };
     if (!data.error && data.usage) {
       userMsg.requestTokens = data.usage.prompt_tokens;
+      userMsg.requestUsage = data.usage;
       msg.responseTokens = data.usage.completion_tokens;
-      if (currentAgentChatName === name) setAgentMessageTokens(userRow, 'user', userMsg.requestTokens);
+      msg.usage = data.usage;
+      if (currentAgentChatName === name) setAgentMessageTokens(userRow, 'user', userMsg.requestTokens, data.usage);
     }
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
@@ -3311,17 +3724,35 @@ async function sendAgentChatMessage() {
         stats.contextWindow = data.context_window;
       }
       stats.compression = data.compression || null;
+      stats.slidingWindow = data.sliding_window || null;
+      stats.facts = data.facts || null;
+      stats.branching = data.branching || null;
+      addDialogueCost(name, data.usage);
       if (currentAgentChatName === name) updateAgentChatStats(name);
 
-      // Момент сжатия контекста (см. AgentConfig::context_compression на бэкенде):
-      // модель только что пересчитала сводку устаревшей части истории — показываем
-      // это отдельной ненавязчивой меткой в ленте чата, а не молча.
+      // Момент сжатия контекста (стратегия summary): модель только что
+      // пересчитала сводку устаревшей части истории — показываем это отдельной
+      // ненавязчивой меткой в ленте чата, а не молча.
       if (data.summarized) {
         const notice = {
           role: 'compression',
           text: `Контекст сжат в сводку — она теперь охватывает ${
             typeof data.summary_covers === 'number' ? data.summary_covers : '…'
           } более ранних сообщений.`,
+        };
+        agentChats[name].push(notice);
+        if (currentAgentChatName === name) {
+          agentChatMainEl.appendChild(renderAgentMessage(notice));
+        }
+      }
+      // Момент обновления фактов (стратегия facts) — аналогичная метка.
+      if (data.facts_updated && data.facts) {
+        const entries = Object.entries(data.facts.facts || {});
+        const notice = {
+          role: 'compression',
+          text: entries.length
+            ? `📌 Факты обновлены: ${entries.map(([k, v]) => `${k}=${v}`).join(', ')}`
+            : '📌 Факты обновлены (пусто).',
         };
         agentChats[name].push(notice);
         if (currentAgentChatName === name) {
@@ -3372,7 +3803,9 @@ agentCreateBtn.addEventListener('click', async () => {
   const reasoning = advanced && agentReasoningEl.value === 'on' ? true : advanced && agentReasoningEl.value === 'off' ? false : null;
   const model = advanced ? agentModelEl.value.trim() || null : null;
   const showTokens = advanced ? agentShowTokensEl.checked : false;
-  const contextCompression = advanced ? agentContextCompressionEl.checked : false;
+  const contextStrategy = advanced ? agentContextStrategyEl.value : 'full';
+  const windowSizeRaw = advanced ? agentWindowSizeEl.value.trim() : '';
+  const windowSize = windowSizeRaw ? parseInt(windowSizeRaw, 10) : null;
 
   agentCreateBtn.disabled = true;
   try {
@@ -3388,7 +3821,8 @@ agentCreateBtn.addEventListener('click', async () => {
         temperature: Number.isFinite(temperature) ? temperature : null,
         top_p: Number.isFinite(topP) ? topP : null,
         reasoning,
-        context_compression: contextCompression,
+        context_strategy: contextStrategy,
+        window_size: Number.isInteger(windowSize) && windowSize > 0 ? windowSize : null,
       }),
     });
     const data = await res.json();
@@ -3405,7 +3839,10 @@ agentCreateBtn.addEventListener('click', async () => {
     agentTopPEl.value = '';
     agentReasoningEl.value = '';
     agentShowTokensEl.checked = false;
-    agentContextCompressionEl.checked = false;
+    agentContextStrategyEl.value = 'full';
+    agentWindowSizeEl.value = '';
+    agentWindowSizeField.hidden = true;
+    updateAgentContextStrategyHint();
     document.getElementById('agent-mode-quick').click();
     await fetchAgents();
   } catch (e) {

@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use llm_core::{AgentConfig, AgentManager, ChatMessage, ChatOptions, LlmClient};
+use llm_core::{AgentConfig, AgentManager, ChatMessage, ChatOptions, ContextStrategy, LlmClient};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -77,17 +77,44 @@ struct CreateAgentRequest {
     top_p: Option<f32>,
     #[serde(default)]
     reasoning: Option<bool>,
-    /// Включить управление контекстом (см. AgentConfig::context_compression):
-    /// последние сообщения отправляются как есть, остальное периодически
-    /// сжимается той же моделью в сводку, которая подставляется в запрос
-    /// вместо полной истории.
+    /// Стратегия управления контекстом — "full" (по умолчанию, без управления),
+    /// "summary", "sliding-window", "facts" или "branching" (см. llm_core::ContextStrategy).
+    #[serde(default = "default_strategy_str")]
+    context_strategy: String,
+    /// Переопределение размера окна для sliding-window/facts (см. AgentConfig::window_size).
     #[serde(default)]
-    context_compression: bool,
+    window_size: Option<usize>,
+}
+
+fn default_strategy_str() -> String {
+    ContextStrategy::default().to_string()
 }
 
 #[derive(Deserialize)]
 struct AgentAskRequest {
     prompt: String,
+}
+
+#[derive(Deserialize)]
+struct SetStrategyRequest {
+    context_strategy: String,
+}
+
+#[derive(Deserialize)]
+struct CheckpointRequest {
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct BranchRequest {
+    new_branch: String,
+    #[serde(default)]
+    from_checkpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SwitchBranchRequest {
+    branch: String,
 }
 
 /// Тело запроса на сжатие фрагмента истории обычного чата в сводку (см.
@@ -177,6 +204,10 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Json<serde_json::Value> {
+    let context_strategy: ContextStrategy = match req.context_strategy.parse() {
+        Ok(strategy) => strategy,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
     let config = AgentConfig {
         name: req.name,
         system_prompt: req.system_prompt.filter(|s| !s.trim().is_empty()),
@@ -186,10 +217,80 @@ async fn create_agent(
         temperature: req.temperature,
         top_p: req.top_p,
         reasoning: req.reasoning,
-        context_compression: req.context_compression,
+        context_strategy,
+        window_size: req.window_size.filter(|&n| n > 0),
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Меняет стратегию управления контекстом уже существующего агента на лету.
+async fn set_agent_strategy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetStrategyRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let strategy: ContextStrategy = match req.context_strategy.parse() {
+        Ok(strategy) => strategy,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
+    let mut config = agent.config();
+    config.context_strategy = strategy;
+    match agent.set_config(config) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Отмечает checkpoint в текущей ветке агента (стратегия branching).
+async fn create_checkpoint(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<CheckpointRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.checkpoint(&req.label) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Ответвляет новую ветку от checkpoint'а (или от текущего конца текущей ветки).
+async fn create_branch(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<BranchRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.branch_from(req.from_checkpoint.as_deref(), &req.new_branch) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Переключает активную ветку агента.
+async fn switch_branch(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SwitchBranchRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.switch_branch(&req.branch) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info(), "history": agent.history_with_usage()
+            .into_iter()
+            .map(|(m, usage)| serde_json::json!({ "role": m.role, "content": m.content, "usage": usage }))
+            .collect::<Vec<_>>() })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -226,19 +327,26 @@ async fn ask_agent(
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     match agent.handle_request(&req.prompt).await {
-        Ok(reply) => Json(serde_json::json!({
-            "answer": reply.text,
-            "usage": reply.usage,
-            "context_window": agent.context_window(),
-            "summarized": reply.summarized,
-            "summary_covers": reply.summary_covers,
-            "requestJson": reply.request_json,
-            "responseJson": reply.response_json,
-            // Свежий статус сжатия ПОСЛЕ этого обмена (и возможного пересчёта сводки
-            // выше) — интерфейс показывает по нему, сколько сообщений осталось до
-            // следующего сжатия, рядом с индикатором заполнения контекста.
-            "compression": agent.info().compression,
-        })),
+        Ok(reply) => {
+            // Свежий статус стратегии ПОСЛЕ этого обмена (и возможного пересчёта
+            // сводки/фактов выше) — интерфейс показывает по нему прогресс до
+            // следующего сжатия/окно/факты, рядом с индикатором заполнения контекста.
+            let info = agent.info();
+            Json(serde_json::json!({
+                "answer": reply.text,
+                "usage": reply.usage,
+                "context_window": agent.context_window(),
+                "summarized": reply.summarized,
+                "summary_covers": reply.summary_covers,
+                "facts_updated": reply.facts_updated,
+                "requestJson": reply.request_json,
+                "responseJson": reply.response_json,
+                "compression": info.compression,
+                "sliding_window": info.sliding_window,
+                "facts": info.facts,
+                "branching": info.branching,
+            }))
+        }
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -260,6 +368,9 @@ async fn agent_history(State(state): State<AppState>, Path(name): Path<String>) 
         "messages": messages,
         "context_window": info.context_window,
         "compression": info.compression,
+        "sliding_window": info.sliding_window,
+        "facts": info.facts,
+        "branching": info.branching,
     }))
 }
 
@@ -268,10 +379,27 @@ async fn main() -> Result<()> {
     let client = LlmClient::from_env()?;
     let analysis_model =
         std::env::var("LLM_ANALYSIS_MODEL").unwrap_or_else(|_| client.model().to_string());
+    // Ставки цены (см. llm_core::pricing) передаются на фронтенд одним JSON-блобом,
+    // чтобы стоимость и новых, и восстановленных из SQLite сообщений в чате агента
+    // считалась одним и тем же способом на клиенте, а не дублировалась ещё и в
+    // Rust. Объект всегда есть (не `null`) — currency нужна независимо от того,
+    // заданы ли ставки оценки: реальная стоимость от провайдера (usage.cost,
+    // если он её прислал) показывается даже без LLM_PRICE_INPUT_PER_1M/OUTPUT_PER_1M.
+    // inputPerMillion/outputPerMillion — `null`, если ставки не заданы (тогда
+    // оценка недоступна, но реальная стоимость от провайдера всё ещё может быть).
+    let pricing = llm_core::pricing::from_env();
+    let pricing_json = serde_json::json!({
+        "inputPerMillion": pricing.map(|p| p.input_per_million),
+        "outputPerMillion": pricing.map(|p| p.output_per_million),
+        "currency": llm_core::pricing::currency(),
+    })
+    .to_string();
     let index_html = INDEX_TEMPLATE
         .replace("__MODEL_NAME__", client.model())
         .replace("__ANALYSIS_MODEL_NAME__", &analysis_model)
-        .replace("__CONTEXT_SUMMARY_CHUNK__", &llm_core::context::context_summary_chunk().to_string());
+        .replace("__CONTEXT_SUMMARY_CHUNK__", &llm_core::context::context_summary_chunk().to_string())
+        .replace("__SLIDING_WINDOW_SIZE__", &llm_core::context::sliding_window_size().to_string())
+        .replace("__PRICING_JSON__", &pricing_json);
     let agents = Arc::new(AgentManager::from_env(client.clone())?);
 
     let state = AppState {
@@ -291,6 +419,10 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/stop", post(stop_agent))
         .route("/api/agents/:name/ask", post(ask_agent))
         .route("/api/agents/:name/history", get(agent_history))
+        .route("/api/agents/:name/strategy", post(set_agent_strategy))
+        .route("/api/agents/:name/checkpoint", post(create_checkpoint))
+        .route("/api/agents/:name/branch", post(create_branch))
+        .route("/api/agents/:name/switch", post(switch_branch))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";

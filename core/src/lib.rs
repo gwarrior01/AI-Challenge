@@ -5,9 +5,16 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
-pub use agent::{Agent, AgentConfig, AgentInfo, AgentManager, AgentReply, CompressionInfo};
+pub use agent::{
+    Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
+    FactsInfo, SlidingWindowInfo,
+};
 
 pub mod context;
+pub use context::ContextStrategy;
+
+pub mod pricing;
+pub use pricing::Pricing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -74,7 +81,7 @@ pub struct ChatOptions {
 struct ChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<RawUsage>,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +94,57 @@ struct ChoiceMessage {
     content: String,
 }
 
-/// Количество токенов, потраченных на запрос (приходит от LLM API).
+/// Зеркало `usage` ровно в том виде, в котором его присылает API — отдельно от
+/// публичного [`Usage`], потому что стоимость там (там, где она вообще есть)
+/// приходит вложенной в `cost_details`, а наружу мы хотим плоскую структуру.
+/// Расширение некоторых OpenAI-совместимых провайдеров (например, OpenRouter):
+/// `usage.cost` — реальная выставленная сумма в USD за этот запрос, точнее
+/// любой нашей оценки по ставкам (см. [`crate::pricing`]), потому что учитывает
+/// фактический тариф провайдера, reasoning-токены и т.п. Большинство
+/// провайдеров (OpenAI, Ollama, LM Studio...) это поле не присылают.
+#[derive(Deserialize)]
+struct RawUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    cost_details: Option<RawCostDetails>,
+}
+
+#[derive(Deserialize)]
+struct RawCostDetails {
+    #[serde(default)]
+    upstream_inference_prompt_cost: Option<f64>,
+    #[serde(default)]
+    upstream_inference_completions_cost: Option<f64>,
+}
+
+impl From<RawUsage> for Usage {
+    fn from(raw: RawUsage) -> Self {
+        let (cost_input, cost_output) = match raw.cost_details {
+            Some(d) => (d.upstream_inference_prompt_cost, d.upstream_inference_completions_cost),
+            None => (None, None),
+        };
+        Usage {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            total_tokens: raw.total_tokens,
+            cost: raw.cost,
+            cost_input,
+            cost_output,
+        }
+    }
+}
+
+/// Количество токенов, потраченных на запрос (приходит от LLM API), и, если
+/// провайдер её сообщает, реальная стоимость этого запроса — см. [`RawUsage`]
+/// и модуль [`crate::pricing`] (там же — оценка стоимости по своим ставкам,
+/// когда провайдер `cost` не присылает).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
@@ -96,6 +153,19 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// Реальная стоимость этого запроса в USD, если провайдер её сообщает
+    /// (`usage.cost` у OpenRouter и совместимых) — `None` у большинства
+    /// провайдеров, тогда стоимость (если нужна) — только оценка.
+    #[serde(default)]
+    pub cost: Option<f64>,
+    /// Часть `cost`, приходящаяся на входные токены, если провайдер даёт
+    /// разбивку (`usage.cost_details.upstream_inference_prompt_cost` у
+    /// OpenRouter) — `None`, если `cost` есть, а разбивки нет.
+    #[serde(default)]
+    pub cost_input: Option<f64>,
+    /// То же для выходных токенов (`upstream_inference_completions_cost`).
+    #[serde(default)]
+    pub cost_output: Option<f64>,
 }
 
 /// Результат обращения к LLM: текст ответа, метрики токенов и сырые JSON запроса/ответа
@@ -220,7 +290,7 @@ impl LlmClient {
         let parsed: ChatResponse = serde_json::from_str(&raw)
             .with_context(|| format!("не удалось разобрать ответ LLM: {raw}"))?;
 
-        let usage = parsed.usage;
+        let usage = parsed.usage.map(Usage::from);
         let content = parsed
             .choices
             .into_iter()
