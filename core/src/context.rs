@@ -3,11 +3,11 @@
 //! `/api/summarize`), чтобы оба места вели себя одинаково и не дублировали промпт.
 //!
 //! Идея управления контекстом одна для обоих случаев: каждые
-//! [`CONTEXT_SUMMARY_CHUNK`] сообщений пользователя вся накопленная с прошлого
+//! [`context_summary_chunk`] сообщений пользователя вся накопленная с прошлого
 //! пересчёта история сжимается той же моделью отдельным запросом в текстовую
 //! сводку — она хранится отдельно и подставляется в следующий запрос вместо
 //! полной истории. Между пересчётами непросуммированный "хвост" диалога
-//! (от 0 до `CONTEXT_SUMMARY_CHUNK - 1` сообщений) всегда отправляется модели
+//! (от 0 до `context_summary_chunk() - 1` сообщений) всегда отправляется модели
 //! как есть.
 //!
 //! Единица счёта здесь и в [`CompressionInfo`](crate::agent::CompressionInfo) —
@@ -18,17 +18,40 @@
 
 use crate::{ChatMessage, ChatOptions, LlmClient};
 use anyhow::Result;
+use std::sync::OnceLock;
+
+/// Имя переменной окружения, которой можно переопределить [`context_summary_chunk`].
+const CONTEXT_SUMMARY_CHUNK_ENV: &str = "LLM_CONTEXT_SUMMARY_CHUNK";
+
+/// Значение [`context_summary_chunk`] по умолчанию, если переменная окружения
+/// не задана, пуста или не парсится в положительное целое.
+const DEFAULT_CONTEXT_SUMMARY_CHUNK: usize = 10;
 
 /// Сколько сообщений пользователя (обменов "запрос — ответ") нужно накопить с
 /// последнего пересчёта сводки, прежде чем она будет пересчитана снова —
 /// заново, целиком, охватывая весь накопленный с прошлого раза "хвост".
 /// Сводка обновляется не после каждого сообщения, а пачками — иначе каждый
 /// запрос удваивался бы лишним обращением к LLM.
-pub const CONTEXT_SUMMARY_CHUNK: usize = 10;
+///
+/// Берётся из переменной окружения `LLM_CONTEXT_SUMMARY_CHUNK` (читается один
+/// раз за время жизни процесса и кэшируется — как и остальные `LLM_*`
+/// переменные, менять её на лету без перезапуска нельзя); если она не задана
+/// или содержит не положительное целое число — используется
+/// [`DEFAULT_CONTEXT_SUMMARY_CHUNK`].
+pub fn context_summary_chunk() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(CONTEXT_SUMMARY_CHUNK_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CONTEXT_SUMMARY_CHUNK)
+    })
+}
 
 /// В истории диалога каждый обмен хранится как два отдельных сообщения
 /// (запрос пользователя + ответ ассистента, см. `Agent::history`), но и
-/// [`CONTEXT_SUMMARY_CHUNK`], и счётчики в [`CompressionInfo`](crate::agent::CompressionInfo)
+/// [`context_summary_chunk`], и счётчики в [`CompressionInfo`](crate::agent::CompressionInfo)
 /// считаются в обменах, а не в сырых записях истории — переводит одно в
 /// другое.
 pub const RAW_MESSAGES_PER_EXCHANGE: usize = 2;

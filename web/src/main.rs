@@ -271,7 +271,7 @@ async fn main() -> Result<()> {
     let index_html = INDEX_TEMPLATE
         .replace("__MODEL_NAME__", client.model())
         .replace("__ANALYSIS_MODEL_NAME__", &analysis_model)
-        .replace("__CONTEXT_SUMMARY_CHUNK__", &llm_core::context::CONTEXT_SUMMARY_CHUNK.to_string());
+        .replace("__CONTEXT_SUMMARY_CHUNK__", &llm_core::context::context_summary_chunk().to_string());
     let agents = Arc::new(AgentManager::from_env(client.clone())?);
 
     let state = AppState {

@@ -132,17 +132,23 @@ const CREATE_STEPS_TOTAL_QUICK: usize = 2;
 const CREATE_STEPS_TOTAL_ADVANCED: usize = 9;
 
 impl CreateStep {
-    fn label(&self) -> &'static str {
+    fn label(&self) -> String {
         match self {
-            CreateStep::Name => " Имя агента ",
-            CreateStep::System => " Системный промпт (Enter — пропустить) ",
-            CreateStep::Model => " Модель (Enter — по умолчанию) ",
-            CreateStep::MaxTokens => " Макс. токенов ответа, число (Enter — без ограничения) ",
-            CreateStep::Temperature => " Temperature, число (Enter — по умолчанию) ",
-            CreateStep::TopP => " Top P, число (Enter — по умолчанию) ",
-            CreateStep::Reasoning => " Reasoning: on / off (Enter — по умолчанию) ",
-            CreateStep::ShowTokens => " Показывать токены в ответах? y/n ",
-            CreateStep::ContextCompression => " Сжимать контекст диалога в сводку? y/n ",
+            CreateStep::Name => " Имя агента ".to_string(),
+            CreateStep::System => " Системный промпт (Enter — пропустить) ".to_string(),
+            CreateStep::Model => " Модель (Enter — по умолчанию) ".to_string(),
+            CreateStep::MaxTokens => " Макс. токенов ответа, число (Enter — без ограничения) ".to_string(),
+            CreateStep::Temperature => " Temperature, число (Enter — по умолчанию) ".to_string(),
+            CreateStep::TopP => " Top P, число (Enter — по умолчанию) ".to_string(),
+            CreateStep::Reasoning => " Reasoning: on / off (Enter — по умолчанию) ".to_string(),
+            CreateStep::ShowTokens => " Показывать токены в ответах? y/n ".to_string(),
+            // Число сообщений в партии берётся из llm_core::context::context_summary_chunk()
+            // (LLM_CONTEXT_SUMMARY_CHUNK), поэтому подпись собирается динамически, а не
+            // хранится статической строкой, как остальные шаги мастера.
+            CreateStep::ContextCompression => format!(
+                " Сжимать контекст диалога в сводку? Каждые {} сообщений — y/n ",
+                llm_core::context::context_summary_chunk()
+            ),
         }
     }
 
@@ -1278,7 +1284,7 @@ fn draw_agent_create(frame: &mut Frame, state: &DrawState) {
         chunks[2],
     );
 
-    render_input_box(frame, chunks[3], state.input, wizard.step.label().to_string(), Color::Cyan);
+    render_input_box(frame, chunks[3], state.input, wizard.step.label(), Color::Cyan);
 }
 
 /// Первый шаг создания агента: выбор между быстрым режимом (только имя и

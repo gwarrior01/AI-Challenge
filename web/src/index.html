@@ -1658,7 +1658,7 @@
       </label>
       <label class="debug-check">
         <input type="checkbox" id="agent-context-compression">
-        Сжимать контекст диалога: каждые 10 сообщений вся накопленная с прошлого раза переписка
+        Сжимать контекст диалога: каждые __CONTEXT_SUMMARY_CHUNK__ сообщений вся накопленная с прошлого раза переписка
         сжимается той же моделью в сводку — она подставляется в запрос вместо полной истории, а
         между пересчётами непросуммированный "хвост" отправляется как есть. Без галочки в каждый
         запрос уходит вся история целиком.
@@ -1732,9 +1732,9 @@ const contextCompressionEl = document.getElementById('setting-context-compressio
 const settingsResetBtn = document.getElementById('settings-reset');
 const newSessionBtn = document.getElementById('new-session-btn');
 
-// Должен совпадать с llm_core::context::CONTEXT_SUMMARY_CHUNK — подставляется сервером
-// при рендере страницы (см. web/src/main.rs), чтобы порог, по которому клиент решает
-// вызвать /api/summarize, не расходился с бэкендом. Единица счёта — сообщение
+// Должен совпадать с llm_core::context::context_summary_chunk() (LLM_CONTEXT_SUMMARY_CHUNK) —
+// подставляется сервером при рендере страницы (см. web/src/main.rs), чтобы порог, по которому
+// клиент решает вызвать /api/summarize, не расходился с бэкендом. Единица счёта — сообщение
 // ПОЛЬЗОВАТЕЛЯ (один его запрос + один ответ ассистента = один "обмен"), а не отдельная
 // запись в chatHistory — см. RAW_MESSAGES_PER_EXCHANGE.
 const CONTEXT_SUMMARY_CHUNK = __CONTEXT_SUMMARY_CHUNK__;

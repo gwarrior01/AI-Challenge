@@ -41,7 +41,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub reasoning: Option<bool>,
     /// Если true — включено управление контекстом (см. модуль-документацию
-    /// [`update_summary_if_needed`]): каждые [`crate::context::CONTEXT_SUMMARY_CHUNK`]
+    /// [`update_summary_if_needed`]): каждые [`crate::context::context_summary_chunk`]
     /// сообщений пользователя вся накопленная с прошлого раза история сжимается
     /// той же моделью в текстовую сводку, которая подставляется в запрос вместо
     /// полной истории; непросуммированный "хвост" между пересчётами отправляется
@@ -100,8 +100,8 @@ pub struct CompressionInfo {
     /// сбрасывается в 0 сразу после очередного пересчёта.
     pub pending_messages: usize,
     /// Сколько ещё сообщений должно добавиться, прежде чем сводка будет
-    /// пересчитана снова — `CONTEXT_SUMMARY_CHUNK - pending_messages` (см.
-    /// [`crate::context::CONTEXT_SUMMARY_CHUNK`]).
+    /// пересчитана снова — `context_summary_chunk() - pending_messages` (см.
+    /// [`crate::context::context_summary_chunk`]).
     pub messages_until_summary: usize,
 }
 
@@ -244,7 +244,7 @@ impl Agent {
         Some(CompressionInfo {
             summarized_count: summarized_count_raw / context::RAW_MESSAGES_PER_EXCHANGE,
             pending_messages: pending,
-            messages_until_summary: context::CONTEXT_SUMMARY_CHUNK.saturating_sub(pending),
+            messages_until_summary: context::context_summary_chunk().saturating_sub(pending),
         })
     }
 
@@ -335,7 +335,7 @@ impl Agent {
 
     /// Пересчитывает сводку истории, если включено
     /// [`AgentConfig::context_compression`] и с прошлого пересчёта пользователь
-    /// отправил не менее [`crate::context::CONTEXT_SUMMARY_CHUNK`] новых
+    /// отправил не менее [`crate::context::context_summary_chunk`] новых
     /// сообщений — тогда сводка перестраивается заново, целиком охватывая весь
     /// накопленный с прошлого раза "хвост" диалога. Сводку строит
     /// [`crate::context::summarize_chunk`] (общая логика с обычным чатом
@@ -357,7 +357,7 @@ impl Agent {
             let summary = self.summary.lock().expect("сводка агента отравлена паникой");
             let total = history.len();
             let pending_raw = total.saturating_sub(summary.summarized_count);
-            let chunk_threshold_raw = context::CONTEXT_SUMMARY_CHUNK * context::RAW_MESSAGES_PER_EXCHANGE;
+            let chunk_threshold_raw = context::context_summary_chunk() * context::RAW_MESSAGES_PER_EXCHANGE;
             if pending_raw < chunk_threshold_raw {
                 return None;
             }
