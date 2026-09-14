@@ -117,6 +117,42 @@ struct SwitchBranchRequest {
     branch: String,
 }
 
+/// Тело запроса на сохранение записи долговременной памяти (см. llm_core::memory) —
+/// `category` пустая/не задана означает "knowledge" (см. `Agent::remember`).
+#[derive(Deserialize)]
+struct RememberRequest {
+    key: String,
+    value: String,
+    #[serde(default)]
+    category: String,
+}
+
+#[derive(Deserialize)]
+struct ForgetRequest {
+    key: String,
+}
+
+/// Тело запроса на создание новой ОБЩЕЙ задачи (рабочая память, см.
+/// llm_core::memory) — вызывающий агент сразу к ней присоединяется.
+#[derive(Deserialize)]
+struct TaskStartRequest {
+    name: String,
+    #[serde(default)]
+    goal: Option<String>,
+}
+
+/// Тело запроса на присоединение к уже существующей общей задаче.
+#[derive(Deserialize)]
+struct TaskJoinRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct TaskSetRequest {
+    key: String,
+    value: String,
+}
+
 /// Тело запроса на сжатие фрагмента истории обычного чата в сводку (см.
 /// `llm_core::context`) — обычный чат не хранит состояние на сервере, поэтому
 /// сама сводка и счётчик уже сжатых сообщений живут в браузере, а сервер лишь
@@ -295,6 +331,111 @@ async fn switch_branch(
     }
 }
 
+/// Явно сохраняет (или обновляет) одну запись долговременной памяти агента
+/// (см. llm_core::memory) — единственный способ туда что-то положить, ничего
+/// не пишется сюда автоматически по ответу модели.
+async fn remember_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RememberRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.remember(&req.key, &req.value, &req.category) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Удаляет запись долговременной памяти агента.
+async fn forget_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<ForgetRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.forget(&req.key) {
+        Ok(existed) => Json(serde_json::json!({ "agent": agent.info(), "existed": existed })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Создаёт новую ОБЩУЮ задачу (рабочая память, см. llm_core::memory) и сразу
+/// присоединяет к ней вызывающего агента — ошибка, если у него уже есть
+/// активная задача, или если задача с таким именем уже существует (тогда
+/// нужен `.../task/join`, а не `.../task/start`).
+async fn task_start_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskStartRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_start(&req.name, req.goal.as_deref()) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Присоединяет агента к уже существующей общей задаче (созданной им самим
+/// или другим агентом) — с этого момента он делит её рабочую память со всеми
+/// остальными участниками. Ошибка, если задачи с таким именем нет, или если у
+/// агента уже есть другая активная задача.
+async fn task_join_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskJoinRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_join(&req.name) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Сохраняет пару ключ/значение в рабочую память задачи, к которой сейчас
+/// присоединён агент — видна сразу всем остальным её участникам. Ошибка, если
+/// агент ни к какой задаче не присоединён.
+async fn task_set_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskSetRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_set(&req.key, &req.value) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Завершает задачу, к которой присоединён агент, — ДЛЯ ВСЕХ её участников
+/// разом: рабочая память удаляется целиком, а членство остальных агентов
+/// снимается автоматически (см. `Agent::task_finish`).
+async fn task_finish_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_finish() {
+        Ok(finished) => Json(serde_json::json!({ "agent": agent.info(), "finished": finished })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Список всех существующих общих задач с их участниками — не привязан к
+/// конкретному агенту, используется фронтендом, чтобы предложить задачи,
+/// доступные для `.../task/join`.
+async fn list_tasks(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "tasks": state.agents.list_tasks() }))
+}
+
 async fn start_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
     match state.agents.start(&name) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -423,6 +564,13 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/checkpoint", post(create_checkpoint))
         .route("/api/agents/:name/branch", post(create_branch))
         .route("/api/agents/:name/switch", post(switch_branch))
+        .route("/api/agents/:name/remember", post(remember_agent))
+        .route("/api/agents/:name/forget", post(forget_agent))
+        .route("/api/agents/:name/task/start", post(task_start_agent))
+        .route("/api/agents/:name/task/join", post(task_join_agent))
+        .route("/api/agents/:name/task/set", post(task_set_agent))
+        .route("/api/agents/:name/task/finish", post(task_finish_agent))
+        .route("/api/tasks", get(list_tasks))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";

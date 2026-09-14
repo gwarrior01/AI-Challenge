@@ -21,6 +21,26 @@
 //! того, какой экран открыт. История диалога каждого агента хранится в SQLite
 //! (AGENTS_STORE_PATH) и переживает и остановку/запуск, и перезапуск всего
 //! приложения — при повторном открытии чата агент помнит прошлые сообщения.
+//!
+//! ## Модель памяти агента (F3 из чата с агентом)
+//!
+//! Из чата с конкретным агентом F3 открывает экран его памяти (Esc/F3 —
+//! обратно к диалогу), показывающий три уровня раздельно (см. llm_core::memory):
+//! краткосрочную (текущий диалог — обзорной строкой, сам диалог виден в чате),
+//! рабочую (данные ОБЩЕЙ ЗАДАЧИ, видны только присоединившимся к ней агентам)
+//! и долговременную (профиль/решения/знания — ОБЩАЯ для ВСЕХ агентов сразу,
+//! правка через одного агента видна через любого другого). Рабочая и
+//! долговременная память заполняются только явно, командами в поле ввода
+//! этого экрана — никакого автоматического попадания данных не по адресу:
+//! `remember <ключ> <значение>
+//! [--category CAT]`, `forget <ключ>`, `task start <название> [--goal ТЕКСТ]`
+//! (создаёт общую задачу и сразу присоединяет к ней агента), `task join
+//! <название>` (присоединяет к УЖЕ существующей задаче — созданной этим же
+//! или другим агентом; экран списком показывает задачи, доступные для join),
+//! `task set <ключ> <значение>` (видно сразу всем присоединённым агентам),
+//! `task finish` (завершает задачу и удаляет её данные ДЛЯ ВСЕХ участников
+//! разом — синтаксис совпадает с одноимёнными подкомандами `llm-cli agent`,
+//! см. cli/src/main.rs, — поведение не расходится между интерфейсами).
 
 use anyhow::Result;
 use crossterm::{
@@ -136,6 +156,13 @@ enum Screen {
     AgentsList,
     AgentCreate,
     AgentChat,
+    /// Модель памяти агента (см. llm_core::memory) — рабочая память текущей
+    /// задачи и долговременная память, показанные и редактируемые отдельно от
+    /// диалога (F3 из [`Screen::AgentChat`], Esc/F3 обратно). Команды в поле
+    /// ввода этого экрана — `remember`/`forget`/`task ...` — синтаксически
+    /// совпадают с подкомандами `llm-cli agent remember/forget/task`, чтобы
+    /// поведение не расходилось между интерфейсами (см. [`run_memory_command`]).
+    AgentMemory,
 }
 
 /// Шаги мастера создания агента — по одному вопросу за раз в нижнем поле ввода.
@@ -364,6 +391,18 @@ struct DrawState<'a> {
     wizard: Option<&'a CreateWizard>,
     agent_chat_name: Option<&'a str>,
     agent_chat_running: bool,
+    /// Число записей в истории диалога открытого агента (см. [`Agent::history`])
+    /// — показывается в кратком виде на экране памяти ([`Screen::AgentMemory`])
+    /// как обзор краткосрочной памяти; `None` вне экранов чата/памяти агента.
+    agent_history_len: Option<usize>,
+    /// Результат последней выполненной команды на экране памяти (текст, признак
+    /// ошибки) — `None`, пока ни одна команда ещё не выполнялась в этой сессии
+    /// экрана (тогда вместо него показывается подсказка по синтаксису команд).
+    memory_status: Option<(&'a str, bool)>,
+    /// Все существующие общие задачи (см. llm_core::memory) с их участниками —
+    /// только на экране памяти агента, чтобы показать, к каким задачам можно
+    /// присоединиться командой `task join`; `&[]` на остальных экранах.
+    shared_tasks: &'a [llm_core::SharedTaskSummary],
 }
 
 /// Высота поля ввода по умолчанию (1 строка текста + рамка сверху/снизу).
@@ -397,7 +436,7 @@ fn layout_chunks_with_input_height(area: Rect, input_height: u16) -> [Rect; 4] {
 /// согласованно резервировали одинаковое место под ввод.
 fn input_height_for(screen: Screen) -> u16 {
     match screen {
-        Screen::AgentChat => INPUT_HEIGHT_AGENT_CHAT,
+        Screen::AgentChat | Screen::AgentMemory => INPUT_HEIGHT_AGENT_CHAT,
         _ => INPUT_HEIGHT_DEFAULT,
     }
 }
@@ -477,6 +516,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // модель, без нашего суммирования (см. context_bar в draw_agent_chat).
     // При первом открытии чата восстанавливается из истории в SQLite.
     let mut agent_context_tokens: HashMap<String, u64> = HashMap::new();
+    // Результат последней команды на экране памяти агента (Screen::AgentMemory,
+    // см. run_memory_command) — сбрасывается при входе на экран и при смене
+    // открытого агента, чтобы не показывать результат команды для другого агента.
+    let mut memory_status: Option<(String, bool)> = None;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut events = EventStream::new();
@@ -572,6 +615,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             }),
             _ => None,
         };
+        let screen_agent_history_len = match &screen {
+            Screen::AgentChat | Screen::AgentMemory => {
+                agent_chat_name.as_ref().and_then(|n| agent_histories.get(n)).map(|v| v.len())
+            }
+            _ => None,
+        };
+        // Список общих задач (см. llm_core::memory) только на экране памяти —
+        // нужен, чтобы показать, к каким задачам можно присоединиться (`task
+        // join`); в остальных экранах не запрашивается, чтобы не дёргать БД
+        // на каждой перерисовке зря.
+        let screen_shared_tasks =
+            if matches!(screen, Screen::AgentMemory) { agent_manager.list_tasks() } else { Vec::new() };
 
         let draw_state = DrawState {
             screen,
@@ -595,6 +650,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             wizard: wizard.as_ref(),
             agent_chat_name: agent_chat_name.as_deref(),
             agent_chat_running,
+            agent_history_len: screen_agent_history_len,
+            memory_status: memory_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
+            shared_tasks: &screen_shared_tasks,
         };
         terminal.draw(|frame| draw(frame, &draw_state))?;
 
@@ -614,10 +672,24 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 Screen::Chat => Screen::AgentsList,
                                 Screen::AgentsList => Screen::Chat,
                                 Screen::AgentCreate => { wizard = None; Screen::AgentsList }
-                                Screen::AgentChat => { agent_chat_name = None; Screen::AgentsList }
+                                Screen::AgentChat | Screen::AgentMemory => { agent_chat_name = None; Screen::AgentsList }
                             };
                             input.clear();
                             confirm_delete = None;
+                            continue;
+                        }
+
+                        // F3 переключается между диалогом агента и его рабочей/долговременной
+                        // памятью (см. Screen::AgentMemory) — доступно только пока чат с
+                        // конкретным агентом открыт; в остальных экранах ничего не делает.
+                        if key.code == KeyCode::F(3) {
+                            screen = match screen {
+                                Screen::AgentChat => Screen::AgentMemory,
+                                Screen::AgentMemory => Screen::AgentChat,
+                                other => other,
+                            };
+                            input.clear();
+                            memory_status = None;
                             continue;
                         }
 
@@ -756,6 +828,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 screen = Screen::AgentChat;
                                                 follow_bottom = true;
                                                 input.clear();
+                                                memory_status = None;
                                             }
                                         }
                                     }
@@ -884,6 +957,37 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 }
                                 _ => {}
                             },
+                            // Экран памяти агента (см. Screen::AgentMemory) — команды
+                            // remember/forget/task выполняются сразу, синхронно (никакого
+                            // обращения к LLM здесь нет), поэтому `waiting` не проверяется:
+                            // это не мешает и не мешается запросу к самой LLM, если он
+                            // сейчас выполняется в фоне для этого же или другого агента.
+                            Screen::AgentMemory => match key.code {
+                                KeyCode::Esc => {
+                                    screen = Screen::AgentChat;
+                                    input.clear();
+                                }
+                                KeyCode::Enter => {
+                                    let raw = input.trim().to_string();
+                                    input.clear();
+                                    if raw.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(name) = agent_chat_name.clone() {
+                                        if let Some(agent) = agent_manager.get(&name) {
+                                            memory_status = Some(match run_memory_command(&agent, &raw) {
+                                                Ok(text) => (text, false),
+                                                Err(text) => (text, true),
+                                            });
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            },
                         }
                     }
                     // Вставленный текст приходит одним куском — просто дописываем его в
@@ -891,6 +995,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                     // Отправка по-прежнему происходит только по явному нажатию Enter.
                     Some(Ok(Event::Paste(text))) => match screen {
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
+                        Screen::AgentMemory => input.push_str(&text),
                         Screen::AgentCreate if wizard.as_ref().is_some_and(|w| w.quick.is_some()) => {
                             input.push_str(&text);
                         }
@@ -1037,6 +1142,7 @@ fn draw(frame: &mut Frame, state: &DrawState) {
         Screen::AgentsList => draw_agents_list(frame, state),
         Screen::AgentCreate => draw_agent_create(frame, state),
         Screen::AgentChat => draw_agent_chat(frame, state),
+        Screen::AgentMemory => draw_agent_memory(frame, state),
     }
 }
 
@@ -1525,7 +1631,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::raw("  ·  агент: "),
         Span::styled(name, Style::default().fg(Color::Cyan)),
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
-        Span::raw("  ·  Ctrl+S старт/стоп"),
+        Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память"),
     ]))
     .block(
         Block::default()
@@ -1604,6 +1710,215 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         (" Запрос — Enter отправить, Esc назад к списку агентов ".to_string(), Color::Reset)
     };
     render_input_box(frame, chunks[3], state.input, input_title, border_color);
+}
+
+/// Экран модели памяти агента (см. llm_core::memory) — F3 из [`Screen::AgentChat`],
+/// Esc/F3 обратно. Показывает все три уровня разом (краткосрочная — только
+/// обзорная строка, т.к. сам диалог виден в чате; рабочая и долговременная —
+/// целиком, поскольку это единственное место, где их вообще видно) и исполняет
+/// команды `remember`/`forget`/`task ...` из поля ввода (см. [`run_memory_command`]) —
+/// синтаксис намеренно совпадает с одноимёнными подкомандами `llm-cli agent`.
+fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
+    let area = frame.area();
+    let chunks = layout_chunks_with_input_height(area, INPUT_HEIGHT_AGENT_CHAT);
+    let name = state.agent_chat_name.unwrap_or("?");
+    let info = state.agents.iter().find(|a| a.config.name == name);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✦ Challenger", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  память агента: "),
+        Span::styled(name, Style::default().fg(Color::Cyan)),
+        Span::raw("  ·  F3/Esc — назад к диалогу"),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(header, chunks[0]);
+
+    let section_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled("Краткосрочная — текущий диалог", section_style)));
+    lines.push(Line::from(format!(
+        "  записей в истории: {} · стратегия контекста: {}",
+        state.agent_history_len.unwrap_or(0),
+        info.map(|i| i.config.context_strategy.to_string()).unwrap_or_else(|| "?".to_string()),
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled("Рабочая — данные ОБЩЕЙ задачи", section_style)));
+    match info.and_then(|i| i.task.as_ref()) {
+        Some(task) => {
+            let goal_suffix = task.goal.as_deref().map(|g| format!(" (цель: {g})")).unwrap_or_default();
+            lines.push(Line::from(format!("  задача «{}»{goal_suffix}", task.name)));
+            let members = state
+                .shared_tasks
+                .iter()
+                .find(|t| t.name == task.name)
+                .map(|t| t.members.join(", "))
+                .unwrap_or_default();
+            if !members.is_empty() {
+                lines.push(Line::from(Span::styled(format!("  участники: {members}"), hint_style)));
+            }
+            if task.data.is_empty() {
+                lines.push(Line::from(Span::styled("  (данных пока нет)", hint_style)));
+            } else {
+                for (key, value) in &task.data {
+                    lines.push(Line::from(format!("  - {key} = {value}")));
+                }
+            }
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  активной задачи нет — команда: task start <название> [--goal ТЕКСТ] или task join <название>",
+                hint_style,
+            )));
+            if !state.shared_tasks.is_empty() {
+                lines.push(Line::from(Span::styled("  доступные задачи для join:", hint_style)));
+                for task in state.shared_tasks {
+                    let goal = task.goal.as_deref().map(|g| format!(" (цель: {g})")).unwrap_or_default();
+                    let members =
+                        if task.members.is_empty() { "без участников".to_string() } else { task.members.join(", ") };
+                    lines.push(Line::from(Span::styled(
+                        format!("    - {}{goal} · участники: {members}", task.name),
+                        hint_style,
+                    )));
+                }
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Долговременная — профиль, решения, знания (общая для всех агентов)",
+        section_style,
+    )));
+    match info.map(|i| &i.long_term) {
+        Some(map) if !map.is_empty() => {
+            for (key, item) in map {
+                lines.push(Line::from(format!("  - [{}] {key} = {}", item.category, item.value)));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(
+            "  пусто — команда: remember <ключ> <значение> [--category CAT]",
+            hint_style,
+        ))),
+    }
+
+    let body = Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Память агента "),
+    );
+    frame.render_widget(body, chunks[1]);
+
+    let (status_text, status_color) = match state.memory_status {
+        Some((text, is_error)) => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
+        None => (
+            " Команды: remember <ключ> <значение> [--category CAT] · forget <ключ> · \
+             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · task finish"
+                .to_string(),
+            Color::DarkGray,
+        ),
+    };
+    frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(status_color)), chunks[2]);
+
+    render_input_box(
+        frame,
+        chunks[3],
+        state.input,
+        " Команда памяти — Enter выполнить, Esc/F3 назад к диалогу ".to_string(),
+        Color::Reset,
+    );
+}
+
+/// Разбирает и выполняет одну команду экрана памяти агента ([`Screen::AgentMemory`]) —
+/// `remember`/`forget`/`task start|join|set|show|finish`, синтаксически
+/// совпадающие с одноимёнными подкомандами `llm-cli agent` (см.
+/// cli/src/main.rs), чтобы поведение этой модели памяти не расходилось между
+/// интерфейсами. `task` работает с ОБЩЕЙ задачей (см. `crate::memory` в
+/// llm-core) — `start` создаёт её и сразу присоединяет агента, `join`
+/// присоединяет к уже существующей (созданной другим агентом), `finish`
+/// завершает её для ВСЕХ присоединённых агентов разом. Все операции — быстрые
+/// синхронные вызовы над [`llm_core::Agent`] (никакого обращения к LLM),
+/// поэтому выполняются прямо в цикле событий. Возвращает текст сообщения для
+/// строки статуса — `Ok` при успехе, `Err` при ошибке (некорректная команда
+/// или отказ метода `Agent`, например повторный `task start`/`join` без
+/// предварительного `finish`).
+fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, String> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    match tokens.first().copied() {
+        Some("remember") => {
+            let key = tokens.get(1).copied().ok_or("укажите ключ: remember <ключ> <значение> [--category CAT]")?;
+            let mut category = "knowledge".to_string();
+            let mut value_tokens: Vec<&str> = Vec::new();
+            let mut i = 2;
+            while i < tokens.len() {
+                if tokens[i] == "--category" {
+                    i += 1;
+                    category = tokens.get(i).copied().ok_or("--category требует значение")?.to_string();
+                } else {
+                    value_tokens.push(tokens[i]);
+                }
+                i += 1;
+            }
+            if value_tokens.is_empty() {
+                return Err("укажите значение: remember <ключ> <значение> [--category CAT]".to_string());
+            }
+            let value = value_tokens.join(" ");
+            agent.remember(key, &value, &category).map_err(|err| err.to_string())?;
+            Ok(format!("Сохранено в долговременную память: [{category}] {key} = {value}"))
+        }
+        Some("forget") => {
+            let key = tokens.get(1).copied().ok_or("укажите ключ: forget <ключ>")?;
+            match agent.forget(key) {
+                Ok(true) => Ok(format!("Запись «{key}» удалена из долговременной памяти.")),
+                Ok(false) => Ok(format!("В долговременной памяти не было записи «{key}».")),
+                Err(err) => Err(err.to_string()),
+            }
+        }
+        Some("task") => match tokens.get(1).copied() {
+            Some("start") => {
+                let task_name =
+                    tokens.get(2).copied().ok_or("укажите название: task start <название> [--goal ТЕКСТ]")?;
+                let rest = &tokens[3.min(tokens.len())..];
+                let goal = if rest.first().copied() == Some("--goal") {
+                    Some(rest[1..].join(" "))
+                } else {
+                    None
+                };
+                agent.task_start(task_name, goal.as_deref()).map_err(|err| err.to_string())?;
+                Ok(format!("Задача «{task_name}» создана, агент присоединён к ней."))
+            }
+            Some("join") => {
+                let task_name = tokens.get(2).copied().ok_or("укажите название: task join <название>")?;
+                agent.task_join(task_name).map_err(|err| err.to_string())?;
+                Ok(format!(
+                    "Агент присоединён к задаче «{task_name}» — видит и меняет её рабочую память \
+                     наравне с остальными участниками."
+                ))
+            }
+            Some("set") => {
+                let key = tokens.get(2).copied().ok_or("укажите ключ: task set <ключ> <значение>")?;
+                let value_tokens = &tokens[3.min(tokens.len())..];
+                if value_tokens.is_empty() {
+                    return Err("укажите значение: task set <ключ> <значение>".to_string());
+                }
+                let value = value_tokens.join(" ");
+                agent.task_set(key, &value).map_err(|err| err.to_string())?;
+                Ok(format!("Рабочая память обновлена (видно всем участникам): {key} = {value}"))
+            }
+            Some("finish") => match agent.task_finish() {
+                Ok(Some(task)) => {
+                    Ok(format!("Задача «{}» завершена и удалена ДЛЯ ВСЕХ участников.", task.name))
+                }
+                Ok(None) => Ok("Активной задачи не было.".to_string()),
+                Err(err) => Err(err.to_string()),
+            },
+            Some("show") => Ok("Текущее состояние показано выше.".to_string()),
+            Some(other) => Err(format!("неизвестное действие «{other}» — task start/join/set/show/finish")),
+            None => Err("укажите действие: task start/join/set/show/finish".to_string()),
+        },
+        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task")),
+        None => Ok(String::new()),
+    }
 }
 
 fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> Vec<Line<'static>> {

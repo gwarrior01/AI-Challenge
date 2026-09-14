@@ -20,6 +20,26 @@
 //!   llm-cli agent branch <имя> <новая-ветка> [--from <метка>]  -- ответвить новую ветку
 //!   llm-cli agent switch <имя> <ветка>             -- переключиться на другую ветку
 //!   llm-cli agent branches <имя>                   -- список веток и checkpoint'ов
+//!   llm-cli agent memory <имя>                     -- показать все три уровня памяти
+//!   llm-cli agent remember <имя> <ключ> <значение> [--category CAT]  -- долговременная память (общая для всех)
+//!   llm-cli agent forget <имя> <ключ>                                -- удалить запись (общей) долговременной памяти
+//!   llm-cli agent task <имя> start <название> [--goal TEXT]  -- создать общую задачу и присоединиться
+//!   llm-cli agent task <имя> join <название>                 -- присоединиться к чужой общей задаче
+//!   llm-cli agent task <имя> set <ключ> <значение>            -- записать данные (видно всем участникам)
+//!   llm-cli agent task <имя> show                             -- показать текущую задачу
+//!   llm-cli agent task <имя> finish                           -- завершить задачу ДЛЯ ВСЕХ участников
+//!   llm-cli agent tasks                                       -- список всех общих задач и их участников
+//!
+//! ## Модель памяти агента (см. llm_core::memory)
+//!   краткосрочная -- текущий диалог (history/branches выше, управляется --context-strategy)
+//!   рабочая        -- данные ОБЩЕЙ ЗАДАЧИ: один агент создаёт её (task start), другие
+//!                      присоединяются по имени (task join) и делят её данные (task set) —
+//!                      завершение (task finish) удаляет задачу и её данные для ВСЕХ участников разом
+//!   долговременная -- профиль/решения/знания, ОДНА НА ВСЁ ПРИЛОЖЕНИЕ (agent remember/forget):
+//!                      правка через одного агента сразу видна через любого другого,
+//!                      независимо от задачи, живёт, пока не удалят явно
+//! Все три хранятся раздельно (разные таблицы SQLite) и заполняются только явно —
+//! никакого автоматического попадания данных не по адресу.
 //!
 //! ## Стратегии управления контекстом (`--context-strategy`)
 //!   full             -- без управления: вся история в каждом запросе (по умолчанию)
@@ -276,9 +296,197 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        Some("memory") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent memory <имя>"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            print_memory_overview(&agent);
+            Ok(())
+        }
+        Some("remember") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent remember <имя> <ключ> <значение> [--category CAT]"))?;
+            let key = args.get(2).cloned().ok_or_else(|| anyhow!("укажите ключ"))?;
+            let value = args.get(3).cloned().ok_or_else(|| anyhow!("укажите значение"))?;
+            let mut category = "knowledge".to_string();
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--category" {
+                    i += 1;
+                    category = args.get(i).cloned().ok_or_else(|| anyhow!("--category требует значение"))?;
+                } else {
+                    bail!("неизвестный флаг: {}", args[i]);
+                }
+                i += 1;
+            }
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            agent.remember(&key, &value, &category)?;
+            println!("Долговременная память (общая для всех агентов) обновлена: [{category}] {key} = {value}");
+            Ok(())
+        }
+        Some("forget") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent forget <имя> <ключ>"))?;
+            let key = args.get(2).cloned().ok_or_else(|| anyhow!("укажите ключ"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            if agent.forget(&key)? {
+                println!("Запись «{key}» удалена из долговременной памяти (общей для всех агентов).");
+            } else {
+                println!("В долговременной памяти нет записи «{key}».");
+            }
+            Ok(())
+        }
+        Some("task") => {
+            let name = args.get(1).cloned().ok_or_else(|| {
+                anyhow!("укажите имя агента: llm-cli agent task <имя> <start|join|set|show|finish> ...")
+            })?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            match args.get(2).map(String::as_str) {
+                Some("start") => {
+                    let task_name = args
+                        .get(3)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("укажите название задачи: llm-cli agent task {name} start <название> [--goal TEXT]"))?;
+                    let mut goal: Option<String> = None;
+                    let mut i = 4;
+                    while i < args.len() {
+                        if args[i] == "--goal" {
+                            i += 1;
+                            goal = Some(args.get(i).cloned().ok_or_else(|| anyhow!("--goal требует значение"))?);
+                        } else {
+                            bail!("неизвестный флаг: {}", args[i]);
+                        }
+                        i += 1;
+                    }
+                    agent.task_start(&task_name, goal.as_deref())?;
+                    println!("Задача «{task_name}» создана и агент «{name}» присоединён к ней.");
+                    Ok(())
+                }
+                Some("join") => {
+                    let task_name = args
+                        .get(3)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("укажите название задачи: llm-cli agent task {name} join <название>"))?;
+                    agent.task_join(&task_name)?;
+                    println!(
+                        "Агент «{name}» присоединён к задаче «{task_name}» — видит и меняет её рабочую память \
+                         наравне с остальными участниками."
+                    );
+                    Ok(())
+                }
+                Some("set") => {
+                    let key = args
+                        .get(3)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("укажите ключ: llm-cli agent task {name} set <ключ> <значение>"))?;
+                    let value = args.get(4).cloned().ok_or_else(|| anyhow!("укажите значение"))?;
+                    agent.task_set(&key, &value)?;
+                    println!("Рабочая память задачи обновлена (видно всем участникам): {key} = {value}");
+                    Ok(())
+                }
+                Some("show") => {
+                    match agent.task_state() {
+                        Some(task) => print_task(&task),
+                        None => println!("У агента «{name}» сейчас нет активной задачи."),
+                    }
+                    Ok(())
+                }
+                Some("finish") => match agent.task_finish()? {
+                    Some(task) => {
+                        println!(
+                            "Задача «{}» завершена и удалена ДЛЯ ВСЕХ агентов, которые были к ней присоединены.",
+                            task.name
+                        );
+                        Ok(())
+                    }
+                    None => {
+                        println!("У агента «{name}» не было активной задачи.");
+                        Ok(())
+                    }
+                },
+                _ => {
+                    bail!("укажите действие: llm-cli agent task {name} <start|join|set|show|finish> ...");
+                }
+            }
+        }
+        Some("tasks") => {
+            let tasks = manager.list_tasks();
+            if tasks.is_empty() {
+                println!("Общих задач пока нет — создайте: llm-cli agent task <имя-агента> start <название>");
+            } else {
+                for task in tasks {
+                    let goal = task.goal.as_deref().map(|g| format!(" (цель: {g})")).unwrap_or_default();
+                    let members = if task.members.is_empty() {
+                        "без участников".to_string()
+                    } else {
+                        format!("участники: {}", task.members.join(", "))
+                    };
+                    println!("- {}{goal} · {members}", task.name);
+                }
+            }
+            Ok(())
+        }
         _ => {
             print_agent_usage();
             Ok(())
+        }
+    }
+}
+
+/// Печатает все три уровня памяти агента: краткосрочную (сводка по диалогу),
+/// рабочую (текущая задача) и долговременную (профиль/решения/знания) — по
+/// отдельности, чтобы граница между ними была видна и в интерфейсе, а не
+/// только в хранилище.
+fn print_memory_overview(agent: &Agent) {
+    let config = agent.config();
+    println!("=== Память агента «{}» ===\n", agent.name());
+
+    println!("-- Краткосрочная (текущий диалог) --");
+    println!(
+        "Сообщений в активной ветке «{}»: {} · стратегия контекста: {}",
+        agent.current_branch(),
+        agent.history().len(),
+        config.context_strategy
+    );
+    println!();
+
+    println!("-- Рабочая (данные общей задачи, к которой присоединён этот агент) --");
+    match agent.task_state() {
+        Some(task) => print_task(&task),
+        None => println!(
+            "(активной задачи нет — llm-cli agent task {} start <название> или ... join <название>)",
+            agent.name()
+        ),
+    }
+    println!();
+
+    println!("-- Долговременная (профиль, решения, знания — общая для ВСЕХ агентов) --");
+    let long_term = agent.long_term_memory();
+    if long_term.is_empty() {
+        println!("(пусто — llm-cli agent remember {} <ключ> <значение>)", agent.name());
+    } else {
+        for (key, item) in long_term {
+            println!("- [{}] {key} = {}", item.category, item.value);
+        }
+    }
+}
+
+fn print_task(task: &llm_core::TaskState) {
+    match &task.goal {
+        Some(goal) => println!("Задача «{}» (цель: {goal})", task.name),
+        None => println!("Задача «{}»", task.name),
+    }
+    if task.data.is_empty() {
+        println!("(данных пока нет)");
+    } else {
+        for (key, value) in &task.data {
+            println!("- {key} = {value}");
         }
     }
 }
@@ -298,7 +506,16 @@ fn print_agent_usage() {
          \x20 llm-cli agent checkpoint <имя> <метка>                    (стратегия branching)\n\
          \x20 llm-cli agent branch <имя> <новая-ветка> [--from <метка>] (стратегия branching)\n\
          \x20 llm-cli agent switch <имя> <ветка>                        (стратегия branching)\n\
-         \x20 llm-cli agent branches <имя>                              (стратегия branching)"
+         \x20 llm-cli agent branches <имя>                              (стратегия branching)\n\
+         \x20 llm-cli agent memory <имя>                                (все 3 уровня памяти)\n\
+         \x20 llm-cli agent remember <имя> <ключ> <значение> [--category CAT]  (долговременная память, общая)\n\
+         \x20 llm-cli agent forget <имя> <ключ>                              (долговременная память, общая)\n\
+         \x20 llm-cli agent task <имя> start <название> [--goal TEXT]  (создать общую задачу и присоединиться)\n\
+         \x20 llm-cli agent task <имя> join <название>                (присоединиться к чужой общей задаче)\n\
+         \x20 llm-cli agent task <имя> set <ключ> <значение>           (видно всем участникам задачи)\n\
+         \x20 llm-cli agent task <имя> show                            (рабочая память задачи)\n\
+         \x20 llm-cli agent task <имя> finish                          (завершает задачу ДЛЯ ВСЕХ участников)\n\
+         \x20 llm-cli agent tasks                                      (список всех общих задач и их участников)"
     );
 }
 

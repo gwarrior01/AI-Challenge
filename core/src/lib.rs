@@ -13,6 +13,9 @@ pub use agent::{
 pub mod context;
 pub use context::ContextStrategy;
 
+pub mod memory;
+pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
+
 pub mod pricing;
 pub use pricing::Pricing;
 
