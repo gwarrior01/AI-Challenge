@@ -20,7 +20,24 @@
 //! запущенный до перезапуска, при следующем старте снова видит все прежние
 //! сообщения и продолжает диалог, как будто его не выключали. Удаление агента
 //! удаляет и всё это (каскадно, через `ON DELETE CASCADE`).
+//!
+//! ## Модель памяти
+//!
+//! Помимо истории диалога, у агента есть ещё два независимых, явно
+//! заполняемых уровня памяти — см. модуль [`crate::memory`] за полным
+//! описанием модели из трёх уровней (краткосрочная/рабочая/долговременная).
+//! Оба этих уровня — ОБЩИЕ, не приватные для отдельного агента:
+//! [`Agent::remember`]/[`Agent::forget`] (долговременная) читают и пишут
+//! ЕДИНЫЙ набор данных на всё приложение — правка через одного агента сразу
+//! видна через любого другого, независимо от того, какую задачу он выполняет;
+//! [`Agent::task_start`]/[`Agent::task_join`]/[`Agent::task_set`]/
+//! [`Agent::task_finish`] (рабочая) устроены детальнее — она принадлежит не
+//! агенту, а ОБЩЕЙ ЗАДАЧЕ (см. [`crate::memory::TaskState`]), и видна только
+//! агентам, явно присоединившимся к этой конкретной задаче по имени — см.
+//! [`AgentManager::list_tasks`] для списка всех существующих задач и их
+//! участников.
 
+use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
 use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClient, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
@@ -109,6 +126,20 @@ pub struct AgentInfo {
     /// Живой статус стратегии [`ContextStrategy::Branching`] — `Some` только
     /// пока она активна.
     pub branching: Option<BranchingInfo>,
+    /// Долговременная память — ОБЩАЯ для ВСЕХ агентов (профиль/решения/знания,
+    /// см. [`crate::memory`]), одинакова независимо от того, через какого
+    /// агента её читают или какую задачу он выполняет; всегда присутствует
+    /// (может быть пустой), не зависит от `context_strategy`: заполняется
+    /// только явно, через [`Agent::remember`]. Прочитано заново из БД на
+    /// момент вызова, а не из кеша — эти данные могли только что измениться
+    /// через любого другого агента (см. [`Agent::long_term_memory`]).
+    pub long_term: LongTermMemory,
+    /// Рабочая память ОБЩЕЙ задачи, к которой сейчас присоединён этот агент
+    /// (см. [`crate::memory::TaskState`]) — `None`, если агент ни к какой
+    /// задаче не присоединён. Прочитано заново из БД на момент вызова, а не
+    /// из кеша — эти данные могли только что измениться другим агентом,
+    /// участвующим в той же задаче (см. [`Agent::task_state`]).
+    pub task: Option<TaskState>,
 }
 
 /// Единица счёта здесь — сообщение ПОЛЬЗОВАТЕЛЯ (один его запрос + один ответ
@@ -276,11 +307,15 @@ pub struct Agent {
     summary: Mutex<CompressionState>,
     /// Набор фактов (стратегия `facts`), восстановленный из SQLite при создании агента.
     facts: Mutex<FactsState>,
+    // Ни долговременная, ни рабочая память НЕ кешируются здесь — обе общие
+    // (долговременная — сразу для всех агентов, рабочая — для всех участников
+    // задачи), поэтому любой другой агент мог изменить их только что; см.
+    // crate::memory (module doc), Agent::long_term_memory и Agent::task_state,
+    // которые читают их из БД заново при каждом обращении.
     db: Arc<Db>,
 }
 
 impl Agent {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         config: AgentConfig,
         client: LlmClient,
@@ -449,6 +484,156 @@ impl Agent {
         Ok(())
     }
 
+    // --- Долговременная память — ОБЩАЯ для всех агентов (см. модуль crate::memory) ---
+    //
+    // В отличие от рабочей памяти задачи (которую видят только присоединённые
+    // к ней агенты), долговременная память не имеет вообще никакой изоляции —
+    // это один-единственный набор ключ/значение на всё приложение. Метод всё
+    // ещё вызывается через конкретного агента (`agent.remember(...)`), но имя
+    // этого агента не участвует в хранении: это просто точка входа в общий
+    // API, а не владелец данных. Ничего не кешируется в памяти процесса — как
+    // и рабочая память задачи, читается из БД заново при каждом обращении,
+    // потому что её мог только что изменить любой другой агент.
+
+    /// Явно сохраняет (или обновляет) одну запись долговременной памяти —
+    /// единственный способ туда что-то положить: ничего не пишется сюда
+    /// автоматически по ответу модели, только по прямому вызову этого метода
+    /// (за ним стоит команда `agent remember` в CLI и аналоги в других
+    /// интерфейсах). Изменение сразу видно всем агентам, не только этому.
+    pub fn remember(&self, key: &str, value: &str, category: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("ключ долговременной памяти не может быть пустым");
+        }
+        let category = if category.trim().is_empty() { "knowledge" } else { category.trim() };
+        let item = LongTermItem { category: category.to_string(), value: value.to_string() };
+        self.db.save_long_term(key, &item)?;
+        Ok(())
+    }
+
+    /// Явно удаляет запись долговременной памяти (для всех агентов разом).
+    /// Возвращает `true`, если она существовала.
+    pub fn forget(&self, key: &str) -> Result<bool> {
+        self.db.delete_long_term(key)
+    }
+
+    /// Снимок всей долговременной памяти — общей для всех агентов приложения.
+    pub fn long_term_memory(&self) -> LongTermMemory {
+        self.db.load_long_term().unwrap_or_default()
+    }
+
+    // --- Рабочая память ОБЩЕЙ задачи (см. модуль crate::memory) ----------------
+    //
+    // Задача — общая сущность, адресуемая по имени, а не приватная для этого
+    // агента: task_start создаёт её и сразу присоединяет к ней вызывающего
+    // агента, task_join присоединяет к уже существующей (созданной другим
+    // агентом) задаче. Ничего не кешируется в памяти процесса — каждое чтение
+    // идёт в БД заново (см. Db::agent_task_name/load_shared_task), потому что
+    // данные могут в любой момент измениться другим участником той же задачи.
+
+    /// Создаёт НОВУЮ общую задачу с этим именем и сразу присоединяет к ней
+    /// вызывающего агента. Ошибка, если у агента уже есть активная задача
+    /// (сначала завершите её — [`Agent::task_finish`]) или если задача с таким
+    /// именем уже существует (тогда нужно [`Agent::task_join`], а не `task_start`).
+    pub fn task_start(&self, name: &str, goal: Option<&str>) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("имя задачи не может быть пустым");
+        }
+        if let Some(current) = self.db.agent_task_name(&self.name)? {
+            bail!(
+                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её \
+                 (agent task {} finish), прежде чем начинать новую",
+                self.name,
+                self.name
+            );
+        }
+        if self.db.shared_task_exists(name)? {
+            bail!(
+                "задача «{name}» уже существует — чтобы присоединиться к ней, используйте \
+                 «agent task {} join {name}» вместо start",
+                self.name
+            );
+        }
+        self.db.create_shared_task(name, goal)?;
+        self.db.set_agent_task(&self.name, name)?;
+        Ok(())
+    }
+
+    /// Присоединяет вызывающего агента к УЖЕ СУЩЕСТВУЮЩЕЙ общей задаче (созданной
+    /// им самим или другим агентом через [`Agent::task_start`]) — с этого момента
+    /// он видит и меняет её рабочую память наравне со всеми остальными
+    /// участниками. Ошибка, если у агента уже есть активная задача, или если
+    /// задачи с таким именем не существует (тогда нужен [`Agent::task_start`]).
+    pub fn task_join(&self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("имя задачи не может быть пустым");
+        }
+        if let Some(current) = self.db.agent_task_name(&self.name)? {
+            bail!(
+                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её \
+                 (agent task {} finish), прежде чем присоединяться к другой",
+                self.name,
+                self.name
+            );
+        }
+        if !self.db.shared_task_exists(name)? {
+            bail!(
+                "задача «{name}» не найдена — чтобы создать её, используйте «agent task {} start {name}»",
+                self.name
+            );
+        }
+        self.db.set_agent_task(&self.name, name)?;
+        Ok(())
+    }
+
+    /// Явно сохраняет пару ключ/значение в рабочую память задачи, к которой
+    /// сейчас присоединён агент — видна сразу всем остальным её участникам.
+    /// Ошибка, если агент ни к какой задаче не присоединён.
+    pub fn task_set(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("ключ рабочей памяти не может быть пустым");
+        }
+        let task_name = self.db.agent_task_name(&self.name)?.ok_or_else(|| {
+            anyhow!(
+                "у агента «{}» нет активной задачи — сначала «agent task {} start <название>» \
+                 или «agent task {} join <название>»",
+                self.name,
+                self.name,
+                self.name
+            )
+        })?;
+        self.db.save_shared_task_data(&task_name, key, value)?;
+        Ok(())
+    }
+
+    /// Снимок задачи, к которой сейчас присоединён агент, — читается из БД
+    /// заново при каждом вызове (см. документацию поля [`Agent`] выше), `None`,
+    /// если агент ни к какой задаче не присоединён.
+    pub fn task_state(&self) -> Option<TaskState> {
+        let task_name = self.db.agent_task_name(&self.name).ok().flatten()?;
+        self.db.load_shared_task(&task_name).ok().flatten()
+    }
+
+    /// Завершает задачу, к которой присоединён агент, — целиком, **для всех**
+    /// её участников разом (не только для вызывающего агента): её рабочая
+    /// память безвозвратно удаляется, а membership всех агентов, что были к
+    /// ней присоединены, снимается автоматически (`ON DELETE CASCADE`, см.
+    /// схему `Db`). Возвращает снимок задачи, каким он был перед завершением —
+    /// если что-то из него должно пережить задачу, это нужно явно перенести
+    /// через [`Agent::remember`] *до* вызова этого метода. `Ok(None)`, если
+    /// агент ни к какой задаче не был присоединён.
+    pub fn task_finish(&self) -> Result<Option<TaskState>> {
+        let Some(task_name) = self.db.agent_task_name(&self.name)? else {
+            return Ok(None);
+        };
+        let snapshot = self.db.load_shared_task(&task_name)?;
+        self.db.delete_shared_task(&task_name)?;
+        Ok(snapshot)
+    }
+
     fn require_branching_strategy(&self) -> Result<()> {
         if self.config().context_strategy != ContextStrategy::Branching {
             bail!(
@@ -482,6 +667,8 @@ impl Agent {
         let sliding_window = self.sliding_window_status(&config);
         let facts = self.facts_status(&config);
         let branching = self.branching_status(&config);
+        let long_term = self.long_term_memory();
+        let task = self.task_state();
         AgentInfo {
             running: self.is_running(),
             context_window: self.context_window(),
@@ -489,6 +676,8 @@ impl Agent {
             sliding_window,
             facts,
             branching,
+            long_term,
+            task,
             config,
         }
     }
@@ -569,6 +758,20 @@ impl Agent {
             if !system_prompt.trim().is_empty() {
                 messages.push(ChatMessage::system(system_prompt.clone()));
             }
+        }
+
+        // Долговременная и рабочая память (см. crate::memory) подмешиваются в
+        // запрос независимо от `context_strategy` — та управляет только тем,
+        // как в запрос попадает КРАТКОСРОЧНАЯ память (история диалога ниже);
+        // это ортогональная ось и её выключить нельзя, зато обе заполняются
+        // только явно (Agent::remember/task_set), поэтому попадание сюда
+        // лишнего исключено самой моделью данных, а не проверкой здесь.
+        let long_term = self.long_term_memory();
+        if !long_term.is_empty() {
+            messages.push(ChatMessage::system(crate::memory::format_long_term_block(&long_term)));
+        }
+        if let Some(task) = self.task_state() {
+            messages.push(ChatMessage::system(crate::memory::format_task_block(&task)));
         }
 
         let window = config.window_size.unwrap_or_else(context::sliding_window_size);
@@ -827,6 +1030,26 @@ impl Db {
                  branch     TEXT NOT NULL,
                  msg_count  INTEGER NOT NULL,
                  PRIMARY KEY (agent_name, name)
+             );
+             CREATE TABLE IF NOT EXISTS long_term_memory (
+                 key        TEXT PRIMARY KEY,
+                 category   TEXT NOT NULL,
+                 value      TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             CREATE TABLE IF NOT EXISTS shared_tasks (
+                 name TEXT PRIMARY KEY,
+                 goal TEXT
+             );
+             CREATE TABLE IF NOT EXISTS shared_task_data (
+                 task_name TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
+                 key       TEXT NOT NULL,
+                 value     TEXT NOT NULL,
+                 PRIMARY KEY (task_name, key)
+             );
+             CREATE TABLE IF NOT EXISTS agent_current_task (
+                 agent_name TEXT PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
+                 task_name  TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE
              );",
         )
         .context("не удалось создать таблицы БД агентов")?;
@@ -1026,6 +1249,143 @@ impl Db {
         Ok(())
     }
 
+    /// Загружает всю долговременную память — общую для всех агентов приложения
+    /// (см. [`crate::memory`]) — пустая, если в ней ещё ничего нет.
+    fn load_long_term(&self) -> Result<LongTermMemory> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT key, category, value FROM long_term_memory")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, LongTermItem { category: row.get(1)?, value: row.get(2)? }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    fn save_long_term(&self, key: &str, item: &LongTermItem) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO long_term_memory (key, category, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET category = excluded.category, value = excluded.value, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            rusqlite::params![key, item.category, item.value],
+        )?;
+        Ok(())
+    }
+
+    /// Удаляет запись долговременной памяти. Возвращает `true`, если она существовала.
+    fn delete_long_term(&self, key: &str) -> Result<bool> {
+        let affected = self.conn().execute("DELETE FROM long_term_memory WHERE key = ?1", [key])?;
+        Ok(affected > 0)
+    }
+
+    /// Имя общей задачи, к которой сейчас присоединён агент (см.
+    /// [`crate::memory`]) — `None`, если он ни к какой задаче не присоединён.
+    fn agent_task_name(&self, agent_name: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT task_name FROM agent_current_task WHERE agent_name = ?1",
+            [agent_name],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(name) => Ok(Some(name)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// `true`, если общая задача с этим именем уже существует (независимо от
+    /// того, есть ли у неё сейчас хоть один участник).
+    fn shared_task_exists(&self, task_name: &str) -> Result<bool> {
+        self.conn()
+            .query_row("SELECT EXISTS(SELECT 1 FROM shared_tasks WHERE name = ?1)", [task_name], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    /// Загружает общую задачу по имени (метаданные + все её данные) — видна
+    /// одинаково всем агентам, которые к ней присоединены. `None`, если задачи
+    /// с таким именем не существует.
+    fn load_shared_task(&self, task_name: &str) -> Result<Option<TaskState>> {
+        let conn = self.conn();
+        let goal: Option<String> = match conn.query_row(
+            "SELECT goal FROM shared_tasks WHERE name = ?1",
+            [task_name],
+            |row| row.get(0),
+        ) {
+            Ok(goal) => goal,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut stmt = conn.prepare("SELECT key, value FROM shared_task_data WHERE task_name = ?1")?;
+        let data: BTreeMap<String, String> = stmt
+            .query_map([task_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(Some(TaskState { name: task_name.to_string(), goal, data }))
+    }
+
+    /// Создаёт новую общую задачу — вызывающая сторона уже проверила, что
+    /// задачи с таким именем ещё нет ([`Db::shared_task_exists`]).
+    fn create_shared_task(&self, task_name: &str, goal: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO shared_tasks (name, goal) VALUES (?1, ?2)",
+            rusqlite::params![task_name, goal],
+        )?;
+        Ok(())
+    }
+
+    /// Присоединяет агента `agent_name` к задаче `task_name` (или переносит его
+    /// членство, если оно уже было где-то ещё — вызывающая сторона в
+    /// [`Agent::task_start`]/[`Agent::task_join`] такое не допускает, но сам
+    /// метод остаётся простым upsert'ом).
+    fn set_agent_task(&self, agent_name: &str, task_name: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO agent_current_task (agent_name, task_name) VALUES (?1, ?2)
+             ON CONFLICT(agent_name) DO UPDATE SET task_name = excluded.task_name",
+            rusqlite::params![agent_name, task_name],
+        )?;
+        Ok(())
+    }
+
+    fn save_shared_task_data(&self, task_name: &str, key: &str, value: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO shared_task_data (task_name, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_name, key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![task_name, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Удаляет общую задачу целиком — каскадно удаляет и её данные
+    /// (`shared_task_data`), и членство ВСЕХ агентов, которые были к ней
+    /// присоединены (`agent_current_task`, `ON DELETE CASCADE`), поэтому
+    /// завершение задачи одним участником завершает её для всех разом (см.
+    /// [`Agent::task_finish`]).
+    fn delete_shared_task(&self, task_name: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM shared_tasks WHERE name = ?1", [task_name])?;
+        Ok(())
+    }
+
+    /// Список всех существующих общих задач с их участниками — используется
+    /// интерфейсами, чтобы показать, к каким задачам вообще можно
+    /// присоединиться (см. [`AgentManager::list_tasks`]).
+    fn list_shared_tasks(&self) -> Result<Vec<SharedTaskSummary>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT name, goal FROM shared_tasks ORDER BY name")?;
+        let tasks: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+
+        let mut members_stmt = conn.prepare("SELECT agent_name FROM agent_current_task WHERE task_name = ?1")?;
+        let mut summaries = Vec::with_capacity(tasks.len());
+        for (name, goal) in tasks {
+            let members: Vec<String> = members_stmt
+                .query_map([&name], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            summaries.push(SharedTaskSummary { name, goal, members });
+        }
+        Ok(summaries)
+    }
+
     fn save_current_branch(&self, agent_name: &str, branch: &str) -> Result<()> {
         self.conn().execute(
             "INSERT INTO agent_branch_state (agent_name, current_branch) VALUES (?1, ?2)
@@ -1197,6 +1557,14 @@ impl AgentManager {
         agents.insert(name, Arc::new(agent));
 
         Ok(info)
+    }
+
+    /// Список всех существующих общих задач (рабочая память, см.
+    /// [`crate::memory`]) с их участниками — не привязан к конкретному агенту,
+    /// т.к. задача — общая сущность; используется интерфейсами, чтобы показать,
+    /// к каким задачам можно присоединиться командой `agent task <имя> join`.
+    pub fn list_tasks(&self) -> Vec<SharedTaskSummary> {
+        self.db.list_shared_tasks().unwrap_or_default()
     }
 
     /// Удаляет агента вместе со всей его историей диалога в БД.

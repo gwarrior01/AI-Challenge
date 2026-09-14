@@ -1480,6 +1480,113 @@
     flex-basis: 100%;
   }
 
+  .memory-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+    font-size: 12px;
+  }
+
+  /* Тот же баг specificity, что и у .branch-bar[hidden] выше. */
+  .memory-panel[hidden] {
+    display: none;
+  }
+
+  .memory-section h4 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+
+  .memory-kv-list {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  /* Тот же баг specificity, что и у .memory-kv-form[hidden] выше — без этого
+     agent-joinable-tasks-list (класс memory-kv-list) не скрывался бы, пока
+     активна задача (см. renderMemoryPanel). */
+  .memory-kv-list[hidden] {
+    display: none;
+  }
+
+  .memory-kv-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 10px;
+  }
+
+  .memory-kv-list .memory-kv-cat {
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .memory-kv-list .memory-kv-text {
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+
+  .memory-kv-list .memory-forget-btn {
+    background: none;
+    border: none;
+    color: var(--error);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 0 4px;
+    line-height: 1;
+  }
+
+  .memory-kv-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+
+  /* Тот же баг specificity, что и у .branch-bar[hidden] выше — без этого
+     agent-task-start-form (класс memory-kv-form) не скрывался бы, пока
+     активна задача (см. renderMemoryPanel). */
+  .memory-kv-form[hidden] {
+    display: none;
+  }
+
+  .memory-kv-form input[type="text"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+  }
+
+  .memory-kv-form .settings-btn {
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+
+  .memory-task-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
   .agent-chat-footer {
     border-top: 1px solid var(--border);
     padding: 16px 24px 20px;
@@ -1751,6 +1858,7 @@
       <span class="card-hint" id="agent-chat-meta"></span>
     </div>
     <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
+    <button type="button" class="settings-btn" id="agent-memory-toggle">🧠 Память</button>
     <label class="debug-check">
       <input type="checkbox" id="agent-chat-debug-toggle">
       JSON запроса/ответа
@@ -1784,6 +1892,53 @@
       <button type="button" class="settings-btn" id="agent-new-branch-btn">+ Ветка</button>
     </div>
     <span class="field-error" id="agent-branch-error" hidden></span>
+  </div>
+  <!-- Модель памяти агента (см. llm_core::memory): рабочая память ТЕКУЩЕЙ ЗАДАЧИ
+       и долговременная память (профиль/решения/знания) — обе заполняются только
+       явно, кнопками ниже, независимо от того, какая стратегия (context_strategy)
+       управляет краткосрочной историей диалога выше. См. renderMemoryPanel. -->
+  <div class="memory-panel" id="agent-memory-panel" hidden>
+    <div class="memory-section">
+      <h4>🧩 Рабочая память — данные ОБЩЕЙ задачи</h4>
+      <div class="memory-kv-form" id="agent-task-start-form">
+        <input type="text" id="agent-task-start-name" placeholder="название задачи" list="agent-joinable-tasks-options">
+        <datalist id="agent-joinable-tasks-options"></datalist>
+        <input type="text" id="agent-task-start-goal" placeholder="цель (только для новой)">
+        <button type="button" class="settings-btn" id="agent-task-start-btn">▶ Создать</button>
+        <button type="button" class="settings-btn" id="agent-task-join-btn">🔗 Присоединиться</button>
+      </div>
+      <ul class="memory-kv-list" id="agent-joinable-tasks-list"></ul>
+      <div id="agent-task-active" hidden>
+        <div class="memory-task-head">
+          <strong id="agent-task-name"></strong>
+          <span class="card-hint" id="agent-task-goal"></span>
+          <button type="button" class="settings-btn" id="agent-task-finish-btn">✔ Завершить для всех</button>
+        </div>
+        <div class="card-hint" id="agent-task-members"></div>
+        <ul class="memory-kv-list" id="agent-task-data-list"></ul>
+        <div class="memory-kv-form">
+          <input type="text" id="agent-task-set-key" placeholder="ключ">
+          <input type="text" id="agent-task-set-value" placeholder="значение">
+          <button type="button" class="settings-btn" id="agent-task-set-btn">+ Сохранить</button>
+        </div>
+      </div>
+    </div>
+    <div class="memory-section">
+      <h4>🗄 Долговременная память — профиль, решения, знания (общая для всех агентов)</h4>
+      <ul class="memory-kv-list" id="agent-longterm-list"></ul>
+      <div class="memory-kv-form">
+        <input type="text" id="agent-remember-key" placeholder="ключ">
+        <input type="text" id="agent-remember-value" placeholder="значение">
+        <input type="text" id="agent-remember-category" placeholder="категория (по умолчанию knowledge)" list="agent-remember-category-options">
+        <datalist id="agent-remember-category-options">
+          <option value="profile"></option>
+          <option value="decision"></option>
+          <option value="knowledge"></option>
+        </datalist>
+        <button type="button" class="settings-btn" id="agent-remember-btn">+ Запомнить</button>
+      </div>
+    </div>
+    <span class="field-error" id="agent-memory-error" hidden></span>
   </div>
   <main class="agent-chat-main" id="agent-chat-main"></main>
   <footer class="agent-chat-footer">
@@ -3066,6 +3221,245 @@ const agentNewBranchInputEl = document.getElementById('agent-new-branch-input');
 const agentBranchFromSelectEl = document.getElementById('agent-branch-from-select');
 const agentNewBranchBtnEl = document.getElementById('agent-new-branch-btn');
 const agentBranchErrorEl = document.getElementById('agent-branch-error');
+
+// Панель модели памяти агента (см. llm_core::memory) — независимая от branch-bar
+// выше: рабочая память (текущая задача) и долговременная память (профиль/решения/
+// знания) заполняются только явно, кнопками ниже, и не зависят от context_strategy.
+const agentMemoryToggleBtn = document.getElementById('agent-memory-toggle');
+const agentMemoryPanelEl = document.getElementById('agent-memory-panel');
+const agentLongtermListEl = document.getElementById('agent-longterm-list');
+const agentRememberKeyEl = document.getElementById('agent-remember-key');
+const agentRememberValueEl = document.getElementById('agent-remember-value');
+const agentRememberCategoryEl = document.getElementById('agent-remember-category');
+const agentRememberBtnEl = document.getElementById('agent-remember-btn');
+const agentTaskStartFormEl = document.getElementById('agent-task-start-form');
+const agentTaskStartNameEl = document.getElementById('agent-task-start-name');
+const agentTaskStartGoalEl = document.getElementById('agent-task-start-goal');
+const agentTaskStartBtnEl = document.getElementById('agent-task-start-btn');
+const agentTaskJoinBtnEl = document.getElementById('agent-task-join-btn');
+const agentJoinableTasksListEl = document.getElementById('agent-joinable-tasks-list');
+const agentJoinableTasksOptionsEl = document.getElementById('agent-joinable-tasks-options');
+const agentTaskActiveEl = document.getElementById('agent-task-active');
+const agentTaskNameEl = document.getElementById('agent-task-name');
+const agentTaskGoalEl = document.getElementById('agent-task-goal');
+const agentTaskMembersEl = document.getElementById('agent-task-members');
+const agentTaskDataListEl = document.getElementById('agent-task-data-list');
+const agentTaskSetKeyEl = document.getElementById('agent-task-set-key');
+const agentTaskSetValueEl = document.getElementById('agent-task-set-value');
+const agentTaskSetBtnEl = document.getElementById('agent-task-set-btn');
+const agentTaskFinishBtnEl = document.getElementById('agent-task-finish-btn');
+const agentMemoryErrorEl = document.getElementById('agent-memory-error');
+
+// Снимок всех ОБЩИХ задач (см. llm_core::memory::SharedTaskSummary) — не
+// привязан к конкретному агенту, обновляется через fetchSharedTasks() и
+// используется renderMemoryPanel, чтобы показать список участников активной
+// задачи и список задач, доступных для task/join.
+let lastSharedTasks = [];
+
+async function fetchSharedTasks() {
+  try {
+    const res = await fetch('/api/tasks');
+    const data = await res.json();
+    lastSharedTasks = data.tasks || [];
+  } catch (e) {
+    // сеть недоступна — оставляем предыдущий снимок, не ломаем остальную панель
+  }
+}
+
+agentMemoryToggleBtn.addEventListener('click', async () => {
+  agentMemoryPanelEl.hidden = !agentMemoryPanelEl.hidden;
+  if (!agentMemoryPanelEl.hidden) {
+    await fetchSharedTasks();
+    if (currentAgentChatName) renderMemoryPanel(findAgentInfo(currentAgentChatName));
+  }
+});
+
+function showMemoryError(message) {
+  agentMemoryErrorEl.textContent = message;
+  agentMemoryErrorEl.hidden = false;
+}
+
+// Перерисовывает обе секции панели памяти из свежего AgentInfo (см.
+// llm_core::agent::AgentInfo — поля long_term/task приходят с бэкенда как есть,
+// в отличие от compression/facts/branching выше это не "живой статус стратегии",
+// а сами данные, поэтому просто отображаются, без отдельного кеша с диффом.
+function renderMemoryPanel(info) {
+  const longTerm = (info && info.long_term) || {};
+  const task = (info && info.task) || null;
+
+  const entries = Object.entries(longTerm);
+  agentLongtermListEl.innerHTML = entries.length
+    ? entries
+        .map(
+          ([key, item]) => `
+        <li>
+          <span class="memory-kv-cat">[${escapeHtml(item.category)}]</span>
+          <span class="memory-kv-text">${escapeHtml(key)} = ${escapeHtml(item.value)}</span>
+          <button type="button" class="memory-forget-btn" data-key="${escapeHtml(key)}" title="Забыть">✕</button>
+        </li>`
+        )
+        .join('')
+    : '<li class="card-hint">Пусто.</li>';
+  agentLongtermListEl.querySelectorAll('.memory-forget-btn').forEach((btn) => {
+    btn.addEventListener('click', () => forgetAgentMemory(btn.dataset.key));
+  });
+
+  agentTaskStartFormEl.hidden = !!task;
+  agentJoinableTasksListEl.hidden = !!task;
+  agentTaskActiveEl.hidden = !task;
+  if (task) {
+    agentTaskNameEl.textContent = task.name;
+    agentTaskGoalEl.textContent = task.goal ? `цель: ${task.goal}` : '';
+    const summary = lastSharedTasks.find((t) => t.name === task.name);
+    agentTaskMembersEl.textContent = summary && summary.members.length
+      ? `участники: ${summary.members.join(', ')}`
+      : '';
+    const dataEntries = Object.entries(task.data || {});
+    agentTaskDataListEl.innerHTML = dataEntries.length
+      ? dataEntries
+          .map(([key, value]) => `<li><span class="memory-kv-text">${escapeHtml(key)} = ${escapeHtml(value)}</span></li>`)
+          .join('')
+      : '<li class="card-hint">Данных пока нет.</li>';
+  } else {
+    // Список задач, доступных для task/join, — та же общая коллекция
+    // SharedTaskSummary, что и даталист названий ниже (для автодополнения).
+    agentJoinableTasksListEl.innerHTML = lastSharedTasks.length
+      ? lastSharedTasks
+          .map((t) => {
+            const goal = t.goal ? ` (цель: ${escapeHtml(t.goal)})` : '';
+            const members = t.members.length ? t.members.join(', ') : 'без участников';
+            return `<li><span class="memory-kv-text">${escapeHtml(t.name)}${goal} · ${escapeHtml(members)}</span></li>`;
+          })
+          .join('')
+      : '<li class="card-hint">Общих задач пока нет.</li>';
+    agentJoinableTasksOptionsEl.innerHTML = lastSharedTasks
+      .map((t) => `<option value="${escapeHtml(t.name)}"></option>`)
+      .join('');
+  }
+}
+
+async function postAgentMemory(name, path, body) {
+  const res = await fetch(`/api/agents/${encodeURIComponent(name)}/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json();
+}
+
+// После любого изменения памяти перечитываем список агентов (тот же путь, что
+// у Старт/Стоп выше) — это даёт свежий AgentInfo с обновлёнными long_term/task
+// без отдельного эндпоинта, и заодно держит lastAgentsSnapshot в согласованном
+// состоянии для остальной шапки чата.
+async function refreshAfterMemoryAction(name) {
+  await Promise.all([fetchAgents(), fetchSharedTasks()]);
+  if (currentAgentChatName === name) updateAgentChatHeader(name);
+}
+
+agentRememberBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const key = agentRememberKeyEl.value.trim();
+  const value = agentRememberValueEl.value.trim();
+  if (!key || !value) {
+    showMemoryError('Укажите ключ и значение.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'remember', { key, value, category: agentRememberCategoryEl.value.trim() });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  agentRememberKeyEl.value = '';
+  agentRememberValueEl.value = '';
+  agentRememberCategoryEl.value = '';
+  await refreshAfterMemoryAction(name);
+});
+
+async function forgetAgentMemory(key) {
+  const name = currentAgentChatName;
+  if (!name) return;
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'forget', { key });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  await refreshAfterMemoryAction(name);
+}
+
+agentTaskStartBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const taskName = agentTaskStartNameEl.value.trim();
+  if (!taskName) {
+    showMemoryError('Укажите название задачи.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  const goal = agentTaskStartGoalEl.value.trim();
+  const data = await postAgentMemory(name, 'task/start', { name: taskName, goal: goal || null });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  agentTaskStartNameEl.value = '';
+  agentTaskStartGoalEl.value = '';
+  await refreshAfterMemoryAction(name);
+});
+
+agentTaskJoinBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const taskName = agentTaskStartNameEl.value.trim();
+  if (!taskName) {
+    showMemoryError('Укажите название задачи, к которой хотите присоединиться.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/join', { name: taskName });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  agentTaskStartNameEl.value = '';
+  agentTaskStartGoalEl.value = '';
+  await refreshAfterMemoryAction(name);
+});
+
+agentTaskSetBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const key = agentTaskSetKeyEl.value.trim();
+  const value = agentTaskSetValueEl.value.trim();
+  if (!key || !value) {
+    showMemoryError('Укажите ключ и значение.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/set', { key, value });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  agentTaskSetKeyEl.value = '';
+  agentTaskSetValueEl.value = '';
+  await refreshAfterMemoryAction(name);
+});
+
+agentTaskFinishBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/finish', {});
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  await refreshAfterMemoryAction(name);
+});
+
 // Галочка "JSON запроса/ответа" в шапке чата с агентом — независимая от такой же
 // галочки в обычном чате (debugToggle): своя видимость, свой ключ в localStorage,
 // показывает/скрывает requestJson/responseJson (см. renderAgentMessage), которые
@@ -3601,6 +3995,7 @@ function updateAgentChatHeader(name) {
     stats.branching = info.branching || null;
   }
   updateAgentChatStats(name);
+  renderMemoryPanel(info);
 }
 
 function renderAgentChatMessages(name) {
@@ -3612,6 +4007,8 @@ function renderAgentChatMessages(name) {
 async function openAgentChat(name) {
   currentAgentChatName = name;
   if (!agentChats[name]) agentChats[name] = [];
+  agentMemoryErrorEl.hidden = true;
+  agentMemoryPanelEl.hidden = true;
   updateAgentChatHeader(name);
   renderAgentChatMessages(name);
   viewAgents.hidden = true;
