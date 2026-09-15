@@ -36,6 +36,15 @@
 //! агентам, явно присоединившимся к этой конкретной задаче по имени — см.
 //! [`AgentManager::list_tasks`] для списка всех существующих задач и их
 //! участников.
+//!
+//! ## Персонализация
+//!
+//! Независимая от памяти ось — см. модуль [`crate::profile`]: markdown-файл в
+//! каталоге профилей описывает манеру общения, язык ответа и ограничения и
+//! подключается к КАЖДОМУ запросу ([`Agent::handle_request`]), независимо от
+//! `context_strategy` и от памяти выше. `AgentConfig::profile` хранит только
+//! ИМЯ файла — [`Agent::profile_status`] читает его содержимое с диска заново
+//! при каждом обращении, как и долговременную/рабочую память.
 
 use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
 use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClient, Usage};
@@ -83,6 +92,15 @@ pub struct AgentConfig {
     /// `None` — используется общее значение из `LLM_SLIDING_WINDOW_SIZE`.
     #[serde(default)]
     pub window_size: Option<usize>,
+    /// Имя профиля персонализации (см. [`crate::profile`]) — markdown-файл в
+    /// каталоге профилей, описывающий манеру общения, язык ответа и
+    /// ограничения для конкретного человека. `None` разрешается в
+    /// [`crate::profile::DEFAULT_PROFILE`] (см. [`crate::profile::resolve_name`]);
+    /// значение [`crate::profile::NONE_PROFILE`] явно выключает персонализацию
+    /// для этого агента. Это отдельная ось от долговременной/рабочей памяти —
+    /// профиль описывает КАК отвечать, память — ЧТО агент знает.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl AgentConfig {
@@ -98,8 +116,33 @@ impl AgentConfig {
             reasoning: None,
             context_strategy: ContextStrategy::default(),
             window_size: None,
+            profile: None,
         }
     }
+}
+
+/// Живой статус персонализации агента (см. [`crate::profile`]): какое имя
+/// профиля реально используется, включена ли персонализация вообще,
+/// существует ли файл этого профиля на диске, его содержимое (если найден) и
+/// список всех профилей, доступных в каталоге — для интерфейсов, предлагающих
+/// выбор.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileStatus {
+    /// Имя профиля, разрешённое из `AgentConfig::profile` (см.
+    /// [`crate::profile::resolve_name`]) — либо явно заданное, либо
+    /// [`crate::profile::DEFAULT_PROFILE`].
+    pub name: String,
+    /// `false`, только если имя профиля — [`crate::profile::NONE_PROFILE`]
+    /// (персонализация явно выключена для этого агента).
+    pub enabled: bool,
+    /// `true`, если файл `<name>.md` найден в каталоге профилей — именно этот
+    /// признак определяет, попадёт ли `content` в запрос к LLM.
+    pub found: bool,
+    /// Содержимое файла профиля, если он найден и персонализация включена —
+    /// то же самое, что подмешивается в запрос (см. [`crate::profile::format_profile_block`]).
+    pub content: Option<String>,
+    /// Все профили, найденные сейчас в каталоге профилей (см. [`crate::profile::list_profiles`]).
+    pub available: Vec<String>,
 }
 
 /// Снимок состояния агента для отображения в интерфейсах и для сохранения на диск.
@@ -126,7 +169,7 @@ pub struct AgentInfo {
     /// Живой статус стратегии [`ContextStrategy::Branching`] — `Some` только
     /// пока она активна.
     pub branching: Option<BranchingInfo>,
-    /// Долговременная память — ОБЩАЯ для ВСЕХ агентов (профиль/решения/знания,
+    /// Долговременная память — ОБЩАЯ для ВСЕХ агентов (решения/знания,
     /// см. [`crate::memory`]), одинакова независимо от того, через какого
     /// агента её читают или какую задачу он выполняет; всегда присутствует
     /// (может быть пустой), не зависит от `context_strategy`: заполняется
@@ -140,6 +183,12 @@ pub struct AgentInfo {
     /// из кеша — эти данные могли только что измениться другим агентом,
     /// участвующим в той же задаче (см. [`Agent::task_state`]).
     pub task: Option<TaskState>,
+    /// Персонализация (см. [`crate::profile`]) — независимая от памяти ось:
+    /// описывает КАК агент должен отвечать (манера общения, язык, ограничения),
+    /// а не что он знает. Прочитано заново с диска на момент вызова, а не из
+    /// кеша — файл профиля мог только что измениться (правка вручную или через
+    /// другого агента, если несколько агентов используют один и тот же профиль).
+    pub profile: ProfileStatus,
 }
 
 /// Единица счёта здесь — сообщение ПОЛЬЗОВАТЕЛЯ (один его запрос + один ответ
@@ -484,6 +533,26 @@ impl Agent {
         Ok(())
     }
 
+    // --- Персонализация (см. модуль crate::profile) --------------------------
+    //
+    // Отдельная от памяти ось: профиль описывает КАК агент должен отвечать
+    // (манера общения, язык ответа, ограничения), а не что он знает. Хранится
+    // не в SQLite, а markdown-файлом в каталоге профилей — конфигурация
+    // агента содержит только ИМЯ профиля (`AgentConfig::profile`), поэтому
+    // несколько агентов могут ссылаться на один и тот же файл без дублирования
+    // текста. Ничего не кешируется в памяти процесса — читается с диска заново
+    // при каждом обращении, как и долговременная/рабочая память, потому что
+    // файл мог только что измениться вручную или через другого агента.
+
+    /// Снимок статуса персонализации — имя используемого профиля, найден ли он
+    /// на диске, его содержимое (если найден) и список всех доступных профилей.
+    pub fn profile_status(&self) -> ProfileStatus {
+        let name = crate::profile::resolve_name(self.config().profile.as_deref());
+        let enabled = !crate::profile::is_disabled(&name);
+        let content = if enabled { crate::profile::load(&name) } else { None };
+        ProfileStatus { found: content.is_some(), name, enabled, content, available: crate::profile::list_profiles() }
+    }
+
     // --- Долговременная память — ОБЩАЯ для всех агентов (см. модуль crate::memory) ---
     //
     // В отличие от рабочей памяти задачи (которую видят только присоединённые
@@ -669,6 +738,7 @@ impl Agent {
         let branching = self.branching_status(&config);
         let long_term = self.long_term_memory();
         let task = self.task_state();
+        let profile = self.profile_status();
         AgentInfo {
             running: self.is_running(),
             context_window: self.context_window(),
@@ -678,6 +748,7 @@ impl Agent {
             branching,
             long_term,
             task,
+            profile,
             config,
         }
     }
@@ -758,6 +829,21 @@ impl Agent {
             if !system_prompt.trim().is_empty() {
                 messages.push(ChatMessage::system(system_prompt.clone()));
             }
+        }
+
+        // Персонализация (см. crate::profile) подмешивается ПЕРЕД памятью и
+        // независимо от неё — это отдельная ось (КАК отвечать, а не что агент
+        // знает), поэтому подключена к каждому запросу так же безусловно, как
+        // системный промпт, а не завязана на context_strategy. Пусто, только
+        // если профиль явно отключён (`NONE_PROFILE`) или файл не найден на
+        // диске — тогда сообщение просто не добавляется, как и с пустой
+        // долговременной/рабочей памятью ниже.
+        let profile_name = crate::profile::resolve_name(config.profile.as_deref());
+        if let Some(profile_content) = crate::profile::load(&profile_name) {
+            messages.push(ChatMessage::system(crate::profile::format_profile_block(
+                &profile_name,
+                &profile_content,
+            )));
         }
 
         // Долговременная и рабочая память (см. crate::memory) подмешиваются в

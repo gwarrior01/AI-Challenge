@@ -1564,7 +1564,8 @@
     display: none;
   }
 
-  .memory-kv-form input[type="text"] {
+  .memory-kv-form input[type="text"],
+  .memory-kv-form select {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -1842,6 +1843,11 @@
         <label for="agent-window-size">Размер окна N (сообщений пользователя)</label>
         <input type="number" id="agent-window-size" min="1" step="1" placeholder="по умолчанию __SLIDING_WINDOW_SIZE__">
       </div>
+      <div class="settings-field">
+        <label for="agent-profile">Профиль персонализации</label>
+        <select id="agent-profile"></select>
+        <span class="field-hint">Манера общения, язык ответа и ограничения — markdown-файл в каталоге профилей, подключается к каждому запросу. Новые профили заводятся в панели «🧠 Память» любого агента.</span>
+      </div>
     </div>
     <button type="button" id="agent-create-btn">Добавить агента</button>
     <span class="field-error" id="agent-create-error" hidden></span>
@@ -1894,10 +1900,24 @@
     <span class="field-error" id="agent-branch-error" hidden></span>
   </div>
   <!-- Модель памяти агента (см. llm_core::memory): рабочая память ТЕКУЩЕЙ ЗАДАЧИ
-       и долговременная память (профиль/решения/знания) — обе заполняются только
-       явно, кнопками ниже, независимо от того, какая стратегия (context_strategy)
-       управляет краткосрочной историей диалога выше. См. renderMemoryPanel. -->
+       и долговременная память (решения/знания) — обе заполняются только явно,
+       кнопками ниже, независимо от того, какая стратегия (context_strategy)
+       управляет краткосрочной историей диалога выше. Персонализация (см.
+       llm_core::profile) — отдельная секция выше: не память, а КАК агент
+       должен отвечать. См. renderMemoryPanel. -->
   <div class="memory-panel" id="agent-memory-panel" hidden>
+    <div class="memory-section">
+      <h4>🎭 Персонализация — профиль (отдельная ось: КАК отвечать, не память)</h4>
+      <div class="card-hint" id="agent-profile-status"></div>
+      <div class="memory-kv-form">
+        <select id="agent-profile-select"></select>
+        <button type="button" class="settings-btn" id="agent-profile-set-btn">🎭 Переключить</button>
+      </div>
+      <div class="memory-kv-form">
+        <input type="text" id="agent-new-profile-name" placeholder="имя нового профиля">
+        <button type="button" class="settings-btn" id="agent-new-profile-btn">+ Создать профиль</button>
+      </div>
+    </div>
     <div class="memory-section">
       <h4>🧩 Рабочая память — данные ОБЩЕЙ задачи</h4>
       <div class="memory-kv-form" id="agent-task-start-form">
@@ -1924,14 +1944,13 @@
       </div>
     </div>
     <div class="memory-section">
-      <h4>🗄 Долговременная память — профиль, решения, знания (общая для всех агентов)</h4>
+      <h4>🗄 Долговременная память — решения, знания (общая для всех агентов)</h4>
       <ul class="memory-kv-list" id="agent-longterm-list"></ul>
       <div class="memory-kv-form">
         <input type="text" id="agent-remember-key" placeholder="ключ">
         <input type="text" id="agent-remember-value" placeholder="значение">
         <input type="text" id="agent-remember-category" placeholder="категория (по умолчанию knowledge)" list="agent-remember-category-options">
         <datalist id="agent-remember-category-options">
-          <option value="profile"></option>
           <option value="decision"></option>
           <option value="knowledge"></option>
         </datalist>
@@ -3173,6 +3192,7 @@ const agentContextStrategyEl = document.getElementById('agent-context-strategy')
 const agentWindowSizeField = document.getElementById('agent-window-size-field');
 const agentWindowSizeEl = document.getElementById('agent-window-size');
 const agentContextStrategyHintEl = document.getElementById('agent-context-strategy-hint');
+const agentProfileEl = document.getElementById('agent-profile');
 
 // Полное описание поведения каждой стратегии — показывается под селектом сразу
 // при выборе, а не только в усечённом тексте option'а (см. llm_core::ContextStrategy
@@ -3223,8 +3243,10 @@ const agentNewBranchBtnEl = document.getElementById('agent-new-branch-btn');
 const agentBranchErrorEl = document.getElementById('agent-branch-error');
 
 // Панель модели памяти агента (см. llm_core::memory) — независимая от branch-bar
-// выше: рабочая память (текущая задача) и долговременная память (профиль/решения/
-// знания) заполняются только явно, кнопками ниже, и не зависят от context_strategy.
+// выше: рабочая память (текущая задача) и долговременная память (решения/знания)
+// заполняются только явно, кнопками ниже, и не зависят от context_strategy.
+// Персонализация (см. llm_core::profile) рендерится в той же панели отдельной
+// секцией выше — она не память, а профиль манеры общения/языка/ограничений.
 const agentMemoryToggleBtn = document.getElementById('agent-memory-toggle');
 const agentMemoryPanelEl = document.getElementById('agent-memory-panel');
 const agentLongtermListEl = document.getElementById('agent-longterm-list');
@@ -3249,6 +3271,47 @@ const agentTaskSetValueEl = document.getElementById('agent-task-set-value');
 const agentTaskSetBtnEl = document.getElementById('agent-task-set-btn');
 const agentTaskFinishBtnEl = document.getElementById('agent-task-finish-btn');
 const agentMemoryErrorEl = document.getElementById('agent-memory-error');
+const agentProfileStatusEl = document.getElementById('agent-profile-status');
+const agentProfileSelectEl = document.getElementById('agent-profile-select');
+const agentProfileSetBtnEl = document.getElementById('agent-profile-set-btn');
+const agentNewProfileNameEl = document.getElementById('agent-new-profile-name');
+const agentNewProfileBtnEl = document.getElementById('agent-new-profile-btn');
+
+// Список профилей персонализации (см. llm_core::profile::list_profiles), не
+// привязан к конкретному агенту — обновляется через fetchProfiles() и
+// используется и формой создания агента, и переключателем профиля в панели памяти.
+// Оба <select> (форма создания агента и панель памяти) — НАСТОЯЩИЕ выпадающие
+// списки, а не текстовое поле с datalist: иначе только что созданный профиль
+// не был бы явно виден как вариант для выбора (см. renderProfileSelectOptions).
+let lastProfiles = [];
+
+function renderProfileSelectOptions(selectEl) {
+  const previous = selectEl.value;
+  const options = [
+    '<option value="">По умолчанию (default)</option>',
+    '<option value="none">Отключить персонализацию (none)</option>',
+  ];
+  for (const name of lastProfiles) {
+    if (name === 'default') continue; // уже представлен опцией "По умолчанию" выше
+    options.push(`<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`);
+  }
+  selectEl.innerHTML = options.join('');
+  if (Array.from(selectEl.options).some((o) => o.value === previous)) {
+    selectEl.value = previous;
+  }
+}
+
+async function fetchProfiles() {
+  try {
+    const res = await fetch('/api/profiles');
+    const data = await res.json();
+    lastProfiles = data.profiles || [];
+    renderProfileSelectOptions(agentProfileEl);
+    renderProfileSelectOptions(agentProfileSelectEl);
+  } catch (e) {
+    // сеть недоступна — оставляем предыдущий снимок
+  }
+}
 
 // Снимок всех ОБЩИХ задач (см. llm_core::memory::SharedTaskSummary) — не
 // привязан к конкретному агенту, обновляется через fetchSharedTasks() и
@@ -3269,7 +3332,7 @@ async function fetchSharedTasks() {
 agentMemoryToggleBtn.addEventListener('click', async () => {
   agentMemoryPanelEl.hidden = !agentMemoryPanelEl.hidden;
   if (!agentMemoryPanelEl.hidden) {
-    await fetchSharedTasks();
+    await Promise.all([fetchSharedTasks(), fetchProfiles()]);
     if (currentAgentChatName) renderMemoryPanel(findAgentInfo(currentAgentChatName));
   }
 });
@@ -3286,6 +3349,32 @@ function showMemoryError(message) {
 function renderMemoryPanel(info) {
   const longTerm = (info && info.long_term) || {};
   const task = (info && info.task) || null;
+  const profile = (info && info.profile) || null;
+
+  if (profile) {
+    // "default" — своя опция "По умолчанию" со значением "" (см.
+    // renderProfileSelectOptions); любое другое имя — опция с value = имя.
+    // Если сервер вернул имя, которого нет среди опций (профиль создан только
+    // что через другую вкладку/агента и список ещё не перечитан) — добавляем
+    // недостающий вариант, чтобы выбор не терялся молча.
+    const selectValue = profile.name === 'default' ? '' : profile.name;
+    if (!Array.from(agentProfileSelectEl.options).some((o) => o.value === selectValue)) {
+      agentProfileSelectEl.insertAdjacentHTML(
+        'beforeend',
+        `<option value="${escapeHtml(selectValue)}">${escapeHtml(profile.name)}</option>`
+      );
+    }
+    agentProfileSelectEl.value = selectValue;
+    if (!profile.enabled) {
+      agentProfileStatusEl.textContent = `Профиль «${profile.name}» — персонализация отключена явно.`;
+    } else if (profile.found) {
+      agentProfileStatusEl.textContent = `Профиль «${profile.name}» — подключён к каждому запросу.`;
+    } else {
+      agentProfileStatusEl.textContent = `Профиль «${profile.name}» — файл не найден, персонализация сейчас не применяется.`;
+    }
+  } else {
+    agentProfileStatusEl.textContent = '';
+  }
 
   const entries = Object.entries(longTerm);
   agentLongtermListEl.innerHTML = entries.length
@@ -3355,6 +3444,50 @@ async function refreshAfterMemoryAction(name) {
   await Promise.all([fetchAgents(), fetchSharedTasks()]);
   if (currentAgentChatName === name) updateAgentChatHeader(name);
 }
+
+agentProfileSetBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  // Пустое значение — опция "По умолчанию" (см. renderProfileSelectOptions);
+  // сервер разрешает "" точно так же, как отсутствие профиля (см.
+  // llm_core::profile::resolve_name), так что это не ошибка, а осознанный выбор.
+  const newProfile = agentProfileSelectEl.value;
+  agentMemoryErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'profile', { profile: newProfile });
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  await refreshAfterMemoryAction(name);
+});
+
+agentNewProfileBtnEl.addEventListener('click', async () => {
+  const profileName = agentNewProfileNameEl.value.trim();
+  if (!profileName) {
+    showMemoryError('Укажите имя нового профиля.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  try {
+    const res = await fetch('/api/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: profileName }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showMemoryError(data.error);
+      return;
+    }
+    agentNewProfileNameEl.value = '';
+    await fetchProfiles();
+    // Сразу показываем новый профиль выбранным — следующий клик по
+    // "Переключить" тут же подключит его этому агенту.
+    agentProfileSelectEl.value = profileName;
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+});
 
 agentRememberBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
@@ -3800,6 +3933,7 @@ function agentMetaLine(config) {
   if (config.reasoning === true) parts.push('reasoning: вкл');
   if (config.reasoning === false) parts.push('reasoning: выкл');
   parts.push('стратегия контекста: ' + (config.context_strategy || 'full'));
+  parts.push('профиль: ' + (config.profile && config.profile.trim() ? config.profile : 'default'));
   return parts.join(' · ');
 }
 
@@ -4203,6 +4337,7 @@ agentCreateBtn.addEventListener('click', async () => {
   const contextStrategy = advanced ? agentContextStrategyEl.value : 'full';
   const windowSizeRaw = advanced ? agentWindowSizeEl.value.trim() : '';
   const windowSize = windowSizeRaw ? parseInt(windowSizeRaw, 10) : null;
+  const profile = advanced ? agentProfileEl.value.trim() || null : null;
 
   agentCreateBtn.disabled = true;
   try {
@@ -4220,6 +4355,7 @@ agentCreateBtn.addEventListener('click', async () => {
         reasoning,
         context_strategy: contextStrategy,
         window_size: Number.isInteger(windowSize) && windowSize > 0 ? windowSize : null,
+        profile,
       }),
     });
     const data = await res.json();
@@ -4239,6 +4375,7 @@ agentCreateBtn.addEventListener('click', async () => {
     agentContextStrategyEl.value = 'full';
     agentWindowSizeEl.value = '';
     agentWindowSizeField.hidden = true;
+    agentProfileEl.value = '';
     updateAgentContextStrategyHint();
     document.getElementById('agent-mode-quick').click();
     await fetchAgents();
@@ -4256,6 +4393,7 @@ agentCreateBtn.addEventListener('click', async () => {
 document.getElementById('tab-agents').addEventListener('click', () => {
   currentAgentChatName = null;
   fetchAgents();
+  fetchProfiles();
 });
 </script>
 </body>

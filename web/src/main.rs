@@ -84,6 +84,10 @@ struct CreateAgentRequest {
     /// Переопределение размера окна для sliding-window/facts (см. AgentConfig::window_size).
     #[serde(default)]
     window_size: Option<usize>,
+    /// Имя профиля персонализации (см. llm_core::profile) — пусто/не задано
+    /// означает "default", "none" явно отключает персонализацию.
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 fn default_strategy_str() -> String {
@@ -98,6 +102,22 @@ struct AgentAskRequest {
 #[derive(Deserialize)]
 struct SetStrategyRequest {
     context_strategy: String,
+}
+
+/// Тело запроса на смену профиля персонализации агента (см. llm_core::profile) —
+/// `profile` может быть именем существующего файла, "default" или "none".
+#[derive(Deserialize)]
+struct SetProfileRequest {
+    profile: String,
+}
+
+/// Тело запроса на создание нового профиля (см. llm_core::profile::create) —
+/// `content` не задан → используется пустой шаблон (llm_core::profile::template).
+#[derive(Deserialize)]
+struct CreateProfileRequest {
+    name: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +275,7 @@ async fn create_agent(
         reasoning: req.reasoning,
         context_strategy,
         window_size: req.window_size.filter(|&n| n > 0),
+        profile: req.profile.filter(|s| !s.trim().is_empty()),
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -279,6 +300,47 @@ async fn set_agent_strategy(
     config.context_strategy = strategy;
     match agent.set_config(config) {
         Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Меняет профиль персонализации агента (см. llm_core::profile) — отдельная
+/// от context_strategy и от памяти ось: подключается к КАЖДОМУ запросу этого
+/// агента, независимо от них. `profile: "none"` явно отключает персонализацию.
+async fn set_agent_profile(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetProfileRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let mut config = agent.config();
+    config.profile = Some(req.profile);
+    match agent.set_config(config) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Список всех профилей, найденных в каталоге профилей (см.
+/// llm_core::profile::list_profiles) — используется фронтендом, чтобы
+/// предложить выбор при переключении профиля агента.
+async fn list_profiles() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "profiles": llm_core::list_profiles(),
+        "dir": llm_core::profile::profiles_dir().display().to_string(),
+    }))
+}
+
+/// Создаёт новый файл профиля на диске (см. llm_core::profile::create) — так
+/// профиль можно завести прямо из интерфейса, а не правкой файлов руками.
+/// Ошибка, если имя пустое, зарезервировано ("none") или профиль с таким
+/// именем уже существует.
+async fn create_profile(Json(req): Json<CreateProfileRequest>) -> Json<serde_json::Value> {
+    let content = req.content.unwrap_or_else(|| llm_core::profile::template(&req.name));
+    match llm_core::profile::create(&req.name, &content) {
+        Ok(()) => Json(serde_json::json!({ "profiles": llm_core::list_profiles() })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -486,6 +548,7 @@ async fn ask_agent(
                 "sliding_window": info.sliding_window,
                 "facts": info.facts,
                 "branching": info.branching,
+                "profile": info.profile,
             }))
         }
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
@@ -512,6 +575,7 @@ async fn agent_history(State(state): State<AppState>, Path(name): Path<String>) 
         "sliding_window": info.sliding_window,
         "facts": info.facts,
         "branching": info.branching,
+        "profile": info.profile,
     }))
 }
 
@@ -561,6 +625,8 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/ask", post(ask_agent))
         .route("/api/agents/:name/history", get(agent_history))
         .route("/api/agents/:name/strategy", post(set_agent_strategy))
+        .route("/api/agents/:name/profile", post(set_agent_profile))
+        .route("/api/profiles", get(list_profiles).post(create_profile))
         .route("/api/agents/:name/checkpoint", post(create_checkpoint))
         .route("/api/agents/:name/branch", post(create_branch))
         .route("/api/agents/:name/switch", post(switch_branch))

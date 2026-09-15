@@ -28,7 +28,7 @@
 //! обратно к диалогу), показывающий три уровня раздельно (см. llm_core::memory):
 //! краткосрочную (текущий диалог — обзорной строкой, сам диалог виден в чате),
 //! рабочую (данные ОБЩЕЙ ЗАДАЧИ, видны только присоединившимся к ней агентам)
-//! и долговременную (профиль/решения/знания — ОБЩАЯ для ВСЕХ агентов сразу,
+//! и долговременную (решения/знания — ОБЩАЯ для ВСЕХ агентов сразу,
 //! правка через одного агента видна через любого другого). Рабочая и
 //! долговременная память заполняются только явно, командами в поле ввода
 //! этого экрана — никакого автоматического попадания данных не по адресу:
@@ -41,6 +41,14 @@
 //! `task finish` (завершает задачу и удаляет её данные ДЛЯ ВСЕХ участников
 //! разом — синтаксис совпадает с одноимёнными подкомандами `llm-cli agent`,
 //! см. cli/src/main.rs, — поведение не расходится между интерфейсами).
+//!
+//! Этот же экран показывает **персонализацию** (см. llm_core::profile) —
+//! отдельную от трёх уровней памяти ось: markdown-профиль, описывающий манеру
+//! общения/язык ответа/ограничения, подключаемый к КАЖДОМУ запросу агента.
+//! Команда `profile <профиль|none>` меняет его на лету, `profile new <имя>`
+//! заводит новый профиль (пустой шаблон на диске, см. llm_core::profile::create)
+//! прямо из интерфейса — без правки файлов руками (создание агента (n) в
+//! расширенном режиме тоже спрашивает профиль отдельным шагом мастера).
 
 use anyhow::Result;
 use crossterm::{
@@ -176,10 +184,11 @@ enum CreateStep {
     Reasoning,
     ShowTokens,
     ContextStrategy,
+    Profile,
 }
 
 const CREATE_STEPS_TOTAL_QUICK: usize = 2;
-const CREATE_STEPS_TOTAL_ADVANCED: usize = 9;
+const CREATE_STEPS_TOTAL_ADVANCED: usize = 10;
 
 impl CreateStep {
     fn label(&self) -> String {
@@ -200,6 +209,18 @@ impl CreateStep {
                 llm_core::context::context_summary_chunk(),
                 llm_core::context::sliding_window_size(),
             ),
+            // Список доступных профилей собирается динамически из каталога
+            // профилей (см. llm_core::profile), чтобы подсказка не расходилась
+            // с тем, что реально можно выбрать.
+            CreateStep::Profile => {
+                let available = llm_core::list_profiles();
+                let hint = if available.is_empty() {
+                    "профилей в каталоге пока нет".to_string()
+                } else {
+                    available.join(", ")
+                };
+                format!(" Профиль персонализации: {hint} / none (Enter — default) ")
+            }
         }
     }
 
@@ -214,6 +235,7 @@ impl CreateStep {
             CreateStep::Reasoning => 7,
             CreateStep::ShowTokens => 8,
             CreateStep::ContextStrategy => 9,
+            CreateStep::Profile => 10,
         }
     }
 
@@ -232,7 +254,8 @@ impl CreateStep {
             TopP => Some(Reasoning),
             Reasoning => Some(ShowTokens),
             ShowTokens => Some(ContextStrategy),
-            ContextStrategy => None,
+            ContextStrategy => Some(Profile),
+            Profile => None,
         }
     }
 }
@@ -338,6 +361,9 @@ impl CreateWizard {
                         }
                     }
                 }
+            }
+            CreateStep::Profile => {
+                self.config.profile = if value.is_empty() { None } else { Some(value.to_string()) };
             }
         }
 
@@ -1263,6 +1289,7 @@ fn agent_meta_line(config: &AgentConfig) -> String {
         parts.push(format!("reasoning: {}", if r { "on" } else { "off" }));
     }
     parts.push(format!("стратегия контекста: {}", config.context_strategy));
+    parts.push(format!("профиль: {}", llm_core::profile::resolve_name(config.profile.as_deref())));
     parts.join(" · ")
 }
 
@@ -1472,6 +1499,10 @@ fn draw_agent_create(frame: &mut Frame, state: &DrawState) {
         ));
         lines.push(summary_line("Показывать токены", if wizard.config.show_tokens { "да" } else { "нет" }));
         lines.push(summary_line("Стратегия контекста", &wizard.config.context_strategy.to_string()));
+        lines.push(summary_line(
+            "Профиль",
+            &llm_core::profile::resolve_name(wizard.config.profile.as_deref()),
+        ));
     }
     if let Some(err) = &wizard.error {
         lines.push(Line::from(""));
@@ -1737,6 +1768,35 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
     let hint_style = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    lines.push(Line::from(Span::styled(
+        "Персонализация — профиль (отдельная ось: КАК отвечать, не память)",
+        section_style,
+    )));
+    match info.map(|i| &i.profile) {
+        Some(profile) if !profile.enabled => {
+            lines.push(Line::from("  отключена явно — команда: profile <профиль>"));
+        }
+        Some(profile) if profile.found => {
+            lines.push(Line::from(format!("  «{}» — подключён к каждому запросу", profile.name)));
+        }
+        Some(profile) => {
+            lines.push(Line::from(Span::styled(
+                format!("  «{}» — файл не найден, персонализация сейчас не применяется", profile.name),
+                hint_style,
+            )));
+        }
+        None => lines.push(Line::from(Span::styled("  ?", hint_style))),
+    }
+    if let Some(profile) = info.map(|i| &i.profile) {
+        if !profile.available.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  доступные профили: {}", profile.available.join(", ")),
+                hint_style,
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+
     lines.push(Line::from(Span::styled("Краткосрочная — текущий диалог", section_style)));
     lines.push(Line::from(format!(
         "  записей в истории: {} · стратегия контекста: {}",
@@ -1789,7 +1849,7 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
-        "Долговременная — профиль, решения, знания (общая для всех агентов)",
+        "Долговременная — решения, знания (общая для всех агентов)",
         section_style,
     )));
     match info.map(|i| &i.long_term) {
@@ -1813,7 +1873,8 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
         Some((text, is_error)) => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
         None => (
             " Команды: remember <ключ> <значение> [--category CAT] · forget <ключ> · \
-             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · task finish"
+             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · task finish · \
+             profile <профиль|none> · profile new <имя>"
                 .to_string(),
             Color::DarkGray,
         ),
@@ -1916,7 +1977,26 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             Some(other) => Err(format!("неизвестное действие «{other}» — task start/join/set/show/finish")),
             None => Err("укажите действие: task start/join/set/show/finish".to_string()),
         },
-        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task")),
+        Some("profile") => match tokens.get(1).copied() {
+            Some("new") => {
+                let profile_name = tokens.get(2).copied().ok_or("укажите имя: profile new <имя>")?;
+                llm_core::profile::create(profile_name, &llm_core::profile::template(profile_name))
+                    .map_err(|err| err.to_string())?;
+                Ok(format!("Профиль «{profile_name}» создан — подключить: profile {profile_name}"))
+            }
+            Some(new_profile) => {
+                let mut config = agent.config();
+                config.profile = Some(new_profile.to_string());
+                agent.set_config(config).map_err(|err| err.to_string())?;
+                if llm_core::profile::is_disabled(new_profile) {
+                    Ok("Персонализация отключена.".to_string())
+                } else {
+                    Ok(format!("Профиль переключён на «{new_profile}»."))
+                }
+            }
+            None => Err("укажите профиль: profile <профиль|none> или profile new <имя>".to_string()),
+        },
+        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile")),
         None => Ok(String::new()),
     }
 }
