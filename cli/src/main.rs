@@ -29,13 +29,25 @@
 //!   llm-cli agent task <имя> show                             -- показать текущую задачу
 //!   llm-cli agent task <имя> finish                           -- завершить задачу ДЛЯ ВСЕХ участников
 //!   llm-cli agent tasks                                       -- список всех общих задач и их участников
+//!   llm-cli agent profile <имя>                    -- показать текущий профиль персонализации агента
+//!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
+//!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
+//!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
+//!
+//! ## Персонализация (см. llm_core::profile)
+//!   Отдельная от памяти ось: markdown-файл в каталоге профилей (по умолчанию
+//!   `profiles/`, переопределяется `LLM_PROFILES_DIR`) описывает манеру
+//!   общения, язык ответа, формат и ограничения — подключается к КАЖДОМУ
+//!   запросу агента независимо от context-strategy. `AgentConfig::profile`
+//!   хранит только ИМЯ файла (без `.md`) — не заданное значение разрешается в
+//!   профиль `default`, значение `none` явно отключает персонализацию.
 //!
 //! ## Модель памяти агента (см. llm_core::memory)
 //!   краткосрочная -- текущий диалог (history/branches выше, управляется --context-strategy)
 //!   рабочая        -- данные ОБЩЕЙ ЗАДАЧИ: один агент создаёт её (task start), другие
 //!                      присоединяются по имени (task join) и делят её данные (task set) —
 //!                      завершение (task finish) удаляет задачу и её данные для ВСЕХ участников разом
-//!   долговременная -- профиль/решения/знания, ОДНА НА ВСЁ ПРИЛОЖЕНИЕ (agent remember/forget):
+//!   долговременная -- решения/знания, ОДНА НА ВСЁ ПРИЛОЖЕНИЕ (agent remember/forget):
 //!                      правка через одного агента сразу видна через любого другого,
 //!                      независимо от задачи, живёт, пока не удалят явно
 //! Все три хранятся раздельно (разные таблицы SQLite) и заполняются только явно —
@@ -60,6 +72,7 @@
 //!   --context-strategy STRAT    full|summary|sliding-window|facts|branching (см. выше)
 //!   --window-size N              переопределить размер окна для sliding-window/facts
 //!   --compress                   устаревший алиас --context-strategy summary
+//!   --profile NAME               профиль персонализации (иначе используется "default")
 //!
 //! Обязательные переменные окружения: LLM_API_URL, LLM_API_KEY (см. .env.example).
 //! Реестр агентов и история их диалогов хранятся в SQLite-файле AGENTS_STORE_PATH
@@ -415,6 +428,55 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 }
             }
         }
+        Some("profile") => {
+            let name = args.get(1).cloned().ok_or_else(|| {
+                anyhow!("укажите имя агента: llm-cli agent profile <имя> [<профиль|none>]")
+            })?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            match args.get(2).cloned() {
+                Some(new_profile) => {
+                    let mut config = agent.config();
+                    config.profile = Some(new_profile.clone());
+                    agent.set_config(config)?;
+                    if llm_core::profile::is_disabled(&new_profile) {
+                        println!("Персонализация агента «{name}» отключена.");
+                    } else {
+                        println!("Профиль агента «{name}» переключён на «{new_profile}».");
+                    }
+                }
+                None => print_profile_status(&agent),
+            }
+            Ok(())
+        }
+        Some("profiles") => match args.get(1).map(String::as_str) {
+            Some("create") => {
+                let profile_name = args
+                    .get(2)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("укажите имя профиля: llm-cli agent profiles create <имя>"))?;
+                let path = llm_core::profile::profiles_dir().join(format!("{profile_name}.md"));
+                llm_core::profile::create(&profile_name, &llm_core::profile::template(&profile_name))?;
+                println!("Профиль «{profile_name}» создан: {}", path.display());
+                println!("Подключить агенту: llm-cli agent profile <имя-агента> {profile_name}");
+                Ok(())
+            }
+            None => {
+                let profiles = llm_core::list_profiles();
+                if profiles.is_empty() {
+                    println!(
+                        "Профилей пока нет в каталоге «{}» — создайте: llm-cli agent profiles create <имя>.",
+                        llm_core::profile::profiles_dir().display()
+                    );
+                } else {
+                    println!("Каталог профилей: {}", llm_core::profile::profiles_dir().display());
+                    for profile in profiles {
+                        println!("- {profile}");
+                    }
+                }
+                Ok(())
+            }
+            Some(other) => bail!("неизвестное действие «{other}» — llm-cli agent profiles [create <имя>]"),
+        },
         Some("tasks") => {
             let tasks = manager.list_tasks();
             if tasks.is_empty() {
@@ -440,12 +502,16 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
 }
 
 /// Печатает все три уровня памяти агента: краткосрочную (сводка по диалогу),
-/// рабочую (текущая задача) и долговременную (профиль/решения/знания) — по
+/// рабочую (текущая задача) и долговременную (решения/знания) — по
 /// отдельности, чтобы граница между ними была видна и в интерфейсе, а не
 /// только в хранилище.
 fn print_memory_overview(agent: &Agent) {
     let config = agent.config();
     println!("=== Память агента «{}» ===\n", agent.name());
+
+    println!("-- Персонализация (профиль, отдельная ось — не память, а КАК отвечать) --");
+    print_profile_status(agent);
+    println!();
 
     println!("-- Краткосрочная (текущий диалог) --");
     println!(
@@ -466,7 +532,7 @@ fn print_memory_overview(agent: &Agent) {
     }
     println!();
 
-    println!("-- Долговременная (профиль, решения, знания — общая для ВСЕХ агентов) --");
+    println!("-- Долговременная (решения, знания — общая для ВСЕХ агентов) --");
     let long_term = agent.long_term_memory();
     if long_term.is_empty() {
         println!("(пусто — llm-cli agent remember {} <ключ> <значение>)", agent.name());
@@ -474,6 +540,28 @@ fn print_memory_overview(agent: &Agent) {
         for (key, item) in long_term {
             println!("- [{}] {key} = {}", item.category, item.value);
         }
+    }
+}
+
+/// Печатает статус персонализации агента: используемый профиль, найден ли он
+/// на диске (и подключён ли поэтому к запросам), и какие ещё профили есть в
+/// каталоге — доступно и как часть `agent memory`, и отдельно как `agent profile <имя>`.
+fn print_profile_status(agent: &Agent) {
+    let status = agent.profile_status();
+    if !status.enabled {
+        println!("Профиль: отключён явно (llm-cli agent profile {} <профиль> — включить снова).", agent.name());
+    } else if status.found {
+        println!("Профиль: «{}» — подключён к каждому запросу.", status.name);
+    } else {
+        println!(
+            "Профиль: «{}» — файл не найден в каталоге профилей, персонализация сейчас не применяется.",
+            status.name
+        );
+    }
+    if status.available.is_empty() {
+        println!("Доступных профилей в каталоге пока нет.");
+    } else {
+        println!("Доступные профили: {}", status.available.join(", "));
     }
 }
 
@@ -498,7 +586,7 @@ fn print_agent_usage() {
          \x20 llm-cli agent add <имя> [--system TEXT] [--model NAME] [--show-tokens]\n\
          \x20                        [--max-tokens N] [--temperature N] [--top-p N] [--reasoning on|off]\n\
          \x20                        [--context-strategy full|summary|sliding-window|facts|branching]\n\
-         \x20                        [--window-size N] [--compress]\n\
+         \x20                        [--window-size N] [--compress] [--profile NAME]\n\
          \x20 llm-cli agent remove <имя>\n\
          \x20 llm-cli agent start <имя>\n\
          \x20 llm-cli agent stop <имя>\n\
@@ -515,7 +603,11 @@ fn print_agent_usage() {
          \x20 llm-cli agent task <имя> set <ключ> <значение>           (видно всем участникам задачи)\n\
          \x20 llm-cli agent task <имя> show                            (рабочая память задачи)\n\
          \x20 llm-cli agent task <имя> finish                          (завершает задачу ДЛЯ ВСЕХ участников)\n\
-         \x20 llm-cli agent tasks                                      (список всех общих задач и их участников)"
+         \x20 llm-cli agent tasks                                      (список всех общих задач и их участников)\n\
+         \x20 llm-cli agent profile <имя>                              (показать текущий профиль персонализации)\n\
+         \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
+         \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
+         \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)"
     );
 }
 
@@ -550,6 +642,11 @@ fn parse_agent_add_flags(name: String, flags: &[String]) -> Result<AgentConfig> 
                 let raw = flags.get(i).ok_or_else(|| anyhow!("--window-size требует значение"))?;
                 config.window_size =
                     Some(raw.parse().map_err(|_| anyhow!("--window-size должно быть целым числом"))?);
+            }
+            "--profile" => {
+                i += 1;
+                let value = flags.get(i).ok_or_else(|| anyhow!("--profile требует значение"))?;
+                config.profile = Some(value.clone());
             }
             "--max-tokens" => {
                 i += 1;

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub use agent::{
     Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
-    FactsInfo, SlidingWindowInfo,
+    FactsInfo, ProfileStatus, SlidingWindowInfo,
 };
 
 pub mod context;
@@ -15,6 +15,9 @@ pub use context::ContextStrategy;
 
 pub mod memory;
 pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
+
+pub mod profile;
+pub use profile::{list_profiles, DEFAULT_PROFILE, NONE_PROFILE};
 
 pub mod pricing;
 pub use pricing::Pricing;
