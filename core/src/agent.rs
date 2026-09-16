@@ -46,7 +46,7 @@
 //! ИМЯ файла — [`Agent::profile_status`] читает его содержимое с диска заново
 //! при каждом обращении, как и долговременную/рабочую память.
 
-use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
+use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState};
 use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClient, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
@@ -59,6 +59,38 @@ use std::sync::{Arc, Mutex, RwLock};
 /// Имя ветки, с которой начинается диалог любого агента и которая остаётся
 /// единственной, пока активна не-ветвящаяся стратегия контекста.
 pub const MAIN_BRANCH: &str = "main";
+
+/// Предел кругов "вызов инструмента -> результат -> продолжение" внутри
+/// одного обмена (см. [`Agent::run_tool_loop`]) — защита от зацикливания
+/// модели на вызовах инструментов автомата задачи, а не архитектурное
+/// ограничение самого автомата.
+const MAX_TOOL_ROUNDS: usize = 6;
+
+/// Складывает метрики токенов/стоимости двух обменов — используется, чтобы
+/// показать пользователю честную сумму по всем кругам вызова инструментов
+/// внутри одного обмена ([`Agent::run_tool_loop`]), а не только последний.
+fn sum_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
+    fn add_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+    match (a, b) {
+        (None, b) => b,
+        (a, None) => a,
+        (Some(a), Some(b)) => Some(Usage {
+            prompt_tokens: a.prompt_tokens + b.prompt_tokens,
+            completion_tokens: a.completion_tokens + b.completion_tokens,
+            total_tokens: a.total_tokens + b.total_tokens,
+            cost: add_opt(a.cost, b.cost),
+            cost_input: add_opt(a.cost_input, b.cost_input),
+            cost_output: add_opt(a.cost_output, b.cost_output),
+        }),
+    }
+}
 
 /// Настраиваемое поведение агента: системный промпт, модель и параметры
 /// генерации, стратегия управления контекстом, а также флаг вывода количества
@@ -703,6 +735,382 @@ impl Agent {
         Ok(snapshot)
     }
 
+    // --- Конечный автомат задачи (Task State Machine, см. crate::memory::Stage) ---
+    //
+    // Слой поверх рабочей памяти задачи выше: та же общая задача, к которой
+    // присоединён агент, получает формализованное состояние — этап, текущий
+    // шаг и ожидаемое действие. Переходы между этапами не произвольны (см.
+    // Stage::allowed_next), пауза же независима от этапа и ставится на любом
+    // из них. Всё читается из БД заново при каждом обращении, как и остальная
+    // рабочая память — см. Agent::task_state.
+
+    fn current_task_name(&self) -> Result<String> {
+        self.db.agent_task_name(&self.name)?.ok_or_else(|| {
+            anyhow!(
+                "у агента «{}» нет активной задачи — сначала «agent task {} start <название>» \
+                 или «agent task {} join <название>»",
+                self.name,
+                self.name,
+                self.name
+            )
+        })
+    }
+
+    /// Переводит задачу, к которой присоединён агент, на следующий этап
+    /// конечного автомата — только если переход легален (см.
+    /// [`Stage::allowed_next`]); иначе — ошибка с перечислением того, куда
+    /// можно перейти прямо сейчас. Задачу нельзя двигать по этапам, пока она
+    /// на паузе — сначала [`Agent::task_resume`]. `step`/`expected_action`,
+    /// если заданы, обновляются вместе с переходом (см. [`Agent::task_step`]/
+    /// [`Agent::task_expect`] для правки без смены этапа).
+    pub fn task_advance(&self, stage: Stage, step: Option<&str>, expected_action: Option<&str>) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        let current = self.db.load_shared_task(&task_name)?.ok_or_else(|| {
+            anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)")
+        })?;
+        if current.paused {
+            bail!(
+                "задача «{task_name}» на паузе — сначала «agent task {} resume», прежде чем переходить \
+                 на другой этап",
+                self.name
+            );
+        }
+        if current.stage != stage {
+            let allowed = current.stage.allowed_next();
+            if !allowed.contains(&stage) {
+                let options = if allowed.is_empty() {
+                    "нет — это конечный этап".to_string()
+                } else {
+                    allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                };
+                bail!(
+                    "нельзя перейти из этапа «{}» сразу в «{stage}» — допустимые следующие этапы: {options}",
+                    current.stage
+                );
+            }
+        }
+        self.db.save_task_stage(&task_name, stage, step, expected_action)?;
+        Ok(())
+    }
+
+    /// Обновляет текущий шаг задачи, не меняя этап.
+    pub fn task_step(&self, step: &str) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        let stage = self.db.load_shared_task(&task_name)?.map(|t| t.stage).unwrap_or_default();
+        self.db.save_task_stage(&task_name, stage, Some(step), None)?;
+        Ok(())
+    }
+
+    /// Обновляет ожидаемое действие задачи, не меняя этап.
+    pub fn task_expect(&self, expected_action: &str) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        let stage = self.db.load_shared_task(&task_name)?.map(|t| t.stage).unwrap_or_default();
+        self.db.save_task_stage(&task_name, stage, None, Some(expected_action))?;
+        Ok(())
+    }
+
+    /// Ставит задачу на паузу — на ЛЮБОМ этапе, не меняя его. С этого момента
+    /// [`crate::memory::format_stage_block`] добавляет в каждый запрос к LLM
+    /// явную пометку "на паузе", чтобы модель не предпринимала новых действий
+    /// по задаче до [`Agent::task_resume`].
+    pub fn task_pause(&self) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        self.db.save_task_paused(&task_name, true)?;
+        Ok(())
+    }
+
+    /// Снимает паузу — задача продолжается с того же этапа/шага/ожидаемого
+    /// действия, на которых была приостановлена: ничего из этого не терялось
+    /// (хранилось в БД, не в памяти процесса), поэтому агенту не нужно заново
+    /// объяснять контекст — он снова придёт в каждом запросе автоматически.
+    pub fn task_resume(&self) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        self.db.save_task_paused(&task_name, false)?;
+        Ok(())
+    }
+
+    /// Применяет переход, который модель предложила вызовом `move_stage`, но
+    /// который требовал утверждения человеком (см. [`Stage::requires_approval_to`],
+    /// `TaskState::pending_stage`) — единственный способ провести такой переход.
+    /// Ошибка, если утверждать сейчас нечего.
+    pub fn task_approve(&self) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        let current = self
+            .db
+            .load_shared_task(&task_name)?
+            .ok_or_else(|| anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)"))?;
+        let Some(pending) = current.pending_stage else {
+            bail!("у задачи «{task_name}» нет перехода, ожидающего утверждения");
+        };
+        self.db.save_task_stage(&task_name, pending, None, None)?;
+        self.db.clear_task_pending(&task_name)?;
+        Ok(())
+    }
+
+    /// Отклоняет предложенный моделью переход — этап остаётся прежним,
+    /// `pending_stage`/`pending_outcome` снимаются, а `note` ложится в
+    /// «Ожидаемое действие», чтобы модель увидела причину отказа в следующем
+    /// запросе и могла предложить переход заново. Ошибка, если отклонять
+    /// сейчас нечего.
+    pub fn task_reject(&self, note: &str) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        let current = self
+            .db
+            .load_shared_task(&task_name)?
+            .ok_or_else(|| anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)"))?;
+        if current.pending_stage.is_none() {
+            bail!("у задачи «{task_name}» нет перехода, ожидающего утверждения");
+        }
+        self.db.clear_task_pending(&task_name)?;
+        let note = note.trim();
+        if !note.is_empty() {
+            self.db.save_task_stage(&task_name, current.stage, None, Some(note))?;
+        }
+        Ok(())
+    }
+
+    /// Описания инструментов автомата задачи (function calling) — единственная
+    /// инструкция модели о том, как ими пользоваться (см. документацию
+    /// [`crate::memory::Stage::directive`]): текст описания стабилен между
+    /// запросами (в отличие от блока статуса, см. [`crate::memory::format_stage_block`]),
+    /// поэтому не мешает кэшированию промпта на стороне провайдера.
+    fn task_tool_definitions() -> Vec<crate::ToolDefinition> {
+        vec![
+            crate::ToolDefinition {
+                name: "move_stage".to_string(),
+                description:
+                    "Предложить переход конечного автомата задачи на другой этап (planning/execution/\
+                     validation/done). Программа сверяет переход с картой — легально только: planning->execution, \
+                     execution->validation, validation->execution (доработка), validation->done. НЕЛЬЗЯ прыгать \
+                     через этап (например, из planning сразу в done, минуя execution/validation) — такой вызов \
+                     будет отклонён с объяснением, куда можно перейти прямо сейчас; если это случилось, вызови \
+                     move_stage ЕЩЁ РАЗ с тем этапом, что назван в объяснении как легальный, а не бросай работу \
+                     над задачей на середине. Переходы planning->execution и validation->done требуют \
+                     подтверждения человека: вызов НЕ применит переход сразу, а поставит его в ожидание — после \
+                     такого вызова остановись, сообщи человеку, что план/итог готов и ждёт его решения, и НЕ \
+                     продолжай работу дальше как будто переход уже произошёл. Переходы execution->validation и \
+                     validation->execution применяются сразу."
+                        .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "stage": {
+                            "type": "string",
+                            "enum": ["planning", "execution", "validation", "done"],
+                            "description": "Целевой этап перехода."
+                        },
+                        "outcome": {
+                            "type": "string",
+                            "description": "Итог текущего этапа — что сделано или к чему пришли, коротко."
+                        }
+                    },
+                    "required": ["stage", "outcome"]
+                }),
+            },
+            crate::ToolDefinition {
+                name: "update_step".to_string(),
+                description: "Обновить текущий шаг и/или ожидаемое действие задачи, не меняя этап — используй, \
+                     чтобы отметить прогресс внутри этапа."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "string", "description": "Текущий шаг работы."},
+                        "expected_action": {
+                            "type": "string",
+                            "description": "Чего ожидается дальше (необязательно)."
+                        }
+                    },
+                    "required": ["step"]
+                }),
+            },
+        ]
+    }
+
+    /// Крутит обмен через круги "запрос с инструментами -> (вызовы инструментов
+    /// -> результаты) -> запрос снова", пока модель не ответит текстом без
+    /// вызовов — см. документацию [`crate::RequestMessage`] за тем, почему
+    /// промежуточные сообщения этого круга никогда не персистятся в историю
+    /// диалога: они существуют только в границах этого одного обмена. Число
+    /// кругов ограничено [`MAX_TOOL_ROUNDS`] — если модель зациклилась на
+    /// вызовах, последний запрос идёт уже без инструментов, чтобы вынудить
+    /// текстовый ответ, а не оставить пользователя без ответа вовсе.
+    ///
+    /// Первый круг идёт с `require_tool_call = true` (`tool_choice: "required"`) —
+    /// живой прогон против реальной модели (локальный Qwen3 через LM Studio)
+    /// показал, что с `"auto"` модель нередко просто решает задачу текстом в
+    /// первом же ответе, не пытаясь вызвать ни одного инструмента, несмотря на
+    /// прямую инструкцию в [`crate::memory::Stage::directive`] — то есть именно
+    /// то поведение, из-за которого автомат вообще делался. Принуждение к вызову
+    /// действует только на первом круге: получив результат вызова, модель на
+    /// следующем круге (`"auto"`) уже свободно отвечает текстом — иначе она не
+    /// смогла бы задать пользователю уточняющий вопрос или сообщить, что ждёт
+    /// утверждения перехода.
+    async fn run_tool_loop(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &ChatOptions,
+    ) -> Result<crate::ChatCompletion> {
+        let tools = Self::task_tool_definitions();
+        let mut wire: Vec<crate::RequestMessage> = messages.iter().map(crate::RequestMessage::from).collect();
+        let mut usage_total: Option<Usage> = None;
+        // Модель нередко пишет содержательный текст (например, сам черновик)
+        // В ТОМ ЖЕ круге, где вызывает инструмент — например, если предложенный
+        // переход отклонён программой, следующий круг ссылается на этот текст
+        // ("письмо выше"), не повторяя его. Если сохранять только контент
+        // последнего круга, такой текст молча теряется и пользователь видит
+        // ссылку на текст, которого не видел. Поэтому копится контент КАЖДОГО
+        // круга с непустым текстом, а не только финального.
+        let mut visible_parts: Vec<String> = Vec::new();
+
+        for round in 0..MAX_TOOL_ROUNDS {
+            let require_tool_call = round == 0;
+            let completion = self.client.chat_with_tools(model, &wire, &tools, require_tool_call, options).await?;
+            usage_total = sum_usage(usage_total, completion.usage);
+            if !completion.content.trim().is_empty() {
+                visible_parts.push(completion.content.clone());
+            }
+
+            if completion.tool_calls.is_empty() {
+                return Ok(crate::ChatCompletion {
+                    content: visible_parts.join("\n\n"),
+                    usage: usage_total,
+                    tool_calls: Vec::new(),
+                    ..completion
+                });
+            }
+
+            wire.push(crate::RequestMessage::assistant_tool_calls(
+                completion.content.clone(),
+                completion.tool_calls.clone(),
+            ));
+            for call in &completion.tool_calls {
+                let result_text = self.execute_task_tool(call);
+                wire.push(crate::RequestMessage::tool_result(call.id.clone(), result_text));
+            }
+        }
+
+        // Предел кругов достигнут (см. документацию выше) — принудительно просим
+        // текстовый ответ без инструментов, чтобы обмен не завершился без ответа.
+        let completion = self.client.chat_with_tools(model, &wire, &[], false, options).await?;
+        usage_total = sum_usage(usage_total, completion.usage);
+        if !completion.content.trim().is_empty() {
+            visible_parts.push(completion.content.clone());
+        }
+        Ok(crate::ChatCompletion {
+            content: visible_parts.join("\n\n"),
+            usage: usage_total,
+            tool_calls: Vec::new(),
+            ..completion
+        })
+    }
+
+    /// Выполняет один вызов инструмента модели, разбирая доводы как JSON —
+    /// никогда не паникует на данных модели: неразбираемые или некорректные
+    /// доводы дают текстовый результат с объяснением, а не ошибку выполнения.
+    fn execute_task_tool(&self, call: &crate::ToolCallWire) -> String {
+        match call.function.name.as_str() {
+            "move_stage" => self.tool_move_stage(&call.function.arguments),
+            "update_step" => self.tool_update_step(&call.function.arguments),
+            other => format!("нет такого инструмента: {other}"),
+        }
+    }
+
+    fn tool_move_stage(&self, arguments: &str) -> String {
+        let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(arguments) {
+            Ok(v) if v.is_object() => v,
+            _ => return "доводы не разобраны: ожидался JSON-объект с полями stage и outcome".to_string(),
+        };
+        let Some(stage_raw) = value.get("stage").and_then(|v| v.as_str()) else {
+            return "доводы не разобраны: отсутствует поле stage".to_string();
+        };
+        let outcome = value.get("outcome").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if outcome.is_empty() {
+            return "доводы не разобраны: поле outcome не может быть пустым".to_string();
+        }
+        let stage: Stage = match stage_raw.parse() {
+            Ok(s) => s,
+            Err(err) => return format!("{err:#}"),
+        };
+
+        let task_name = match self.current_task_name() {
+            Ok(name) => name,
+            Err(err) => return format!("{err:#}"),
+        };
+        let current = match self.db.load_shared_task(&task_name) {
+            Ok(Some(t)) => t,
+            Ok(None) => return format!("задачи «{task_name}» больше нет — вызов не применён"),
+            Err(err) => return format!("не удалось прочитать задачу: {err:#}"),
+        };
+        if current.paused {
+            return "задача на паузе — вызовы инструментов сейчас не обрабатываются".to_string();
+        }
+        if let Some(pending) = current.pending_stage {
+            return format!("уже ждёт утверждения перехода в «{pending}» — дождись решения человека");
+        }
+        if current.stage == stage || !current.stage.allowed_next().contains(&stage) {
+            let allowed = current.stage.allowed_next();
+            return if allowed.is_empty() {
+                format!("нет такого перехода: этап «{}» конечный", current.stage)
+            } else {
+                format!(
+                    "нет такого перехода: из «{}» можно в {}",
+                    current.stage,
+                    allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            };
+        }
+
+        if current.stage.requires_approval_to(stage) {
+            if let Err(err) = self.db.save_task_pending(&task_name, stage, &outcome) {
+                return format!("не удалось сохранить предложение перехода: {err:#}");
+            }
+            format!(
+                "Переход в «{stage}» предложен и ждёт подтверждения человека (команда «agent task {0} approve» \
+                 или «agent task {0} reject <причина>»). Остановись, сообщи об этом человеку и жди — не веди \
+                 себя так, будто переход уже произошёл.",
+                self.name
+            )
+        } else {
+            let previous = current.stage;
+            if let Err(err) = self.db.save_task_stage(&task_name, stage, None, None) {
+                return format!("не удалось применить переход: {err:#}");
+            }
+            format!("Переход применён: этап теперь «{stage}» (было «{previous}»). Итог: {outcome}")
+        }
+    }
+
+    fn tool_update_step(&self, arguments: &str) -> String {
+        let value: serde_json::Value = match serde_json::from_str::<serde_json::Value>(arguments) {
+            Ok(v) if v.is_object() => v,
+            _ => return "доводы не разобраны: ожидался JSON-объект с полем step".to_string(),
+        };
+        let Some(step) = value.get("step").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return "доводы не разобраны: поле step не может быть пустым".to_string();
+        };
+        let expected_action =
+            value.get("expected_action").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+
+        let task_name = match self.current_task_name() {
+            Ok(name) => name,
+            Err(err) => return format!("{err:#}"),
+        };
+        let current = match self.db.load_shared_task(&task_name) {
+            Ok(Some(t)) => t,
+            Ok(None) => return format!("задачи «{task_name}» больше нет — вызов не применён"),
+            Err(err) => return format!("не удалось прочитать задачу: {err:#}"),
+        };
+        if current.paused {
+            return "задача на паузе — вызовы инструментов сейчас не обрабатываются".to_string();
+        }
+        if let Err(err) = self.db.save_task_stage(&task_name, current.stage, Some(step), expected_action) {
+            return format!("не удалось обновить шаг: {err:#}");
+        }
+        "Шаг обновлён.".to_string()
+    }
+
     fn require_branching_strategy(&self) -> Result<()> {
         if self.config().context_strategy != ContextStrategy::Branching {
             bail!(
@@ -856,9 +1264,19 @@ impl Agent {
         if !long_term.is_empty() {
             messages.push(ChatMessage::system(crate::memory::format_long_term_block(&long_term)));
         }
-        if let Some(task) = self.task_state() {
-            messages.push(ChatMessage::system(crate::memory::format_task_block(&task)));
+        let active_task = self.task_state();
+        if let Some(task) = &active_task {
+            messages.push(ChatMessage::system(crate::memory::format_task_block(task)));
         }
+        // Инструменты конечного автомата (move_stage/update_step, см. task_tool_definitions
+        // ниже) предлагаются модели, только пока есть активная задача, она не на паузе, не
+        // конечная и не ждёт утверждения человеком уже предложенного перехода — во всех этих
+        // случаях модель и так не должна двигать автомат, поэтому инструменты просто не даются
+        // (см. документацию Stage::directive/format_stage_block, откуда модель узнаёт, почему).
+        let tools_active = active_task
+            .as_ref()
+            .map(|t| !t.paused && t.stage != Stage::Done && t.pending_stage.is_none())
+            .unwrap_or(false);
 
         let window = config.window_size.unwrap_or_else(context::sliding_window_size);
         let window_raw = window * context::RAW_MESSAGES_PER_EXCHANGE;
@@ -909,7 +1327,11 @@ impl Agent {
         };
 
         let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
-        let completion = self.client.chat_with_model(&model, &messages, &options).await?;
+        let completion = if tools_active {
+            self.run_tool_loop(&model, &messages, &options).await?
+        } else {
+            self.client.chat_with_model(&model, &messages, &options).await?
+        };
 
         let user_message = ChatMessage::user(prompt.to_string());
         let assistant_message = ChatMessage::assistant(completion.content.clone());
@@ -1124,8 +1546,14 @@ impl Db {
                  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              );
              CREATE TABLE IF NOT EXISTS shared_tasks (
-                 name TEXT PRIMARY KEY,
-                 goal TEXT
+                 name            TEXT PRIMARY KEY,
+                 goal            TEXT,
+                 stage           TEXT NOT NULL DEFAULT 'planning',
+                 current_step    TEXT,
+                 expected_action TEXT,
+                 paused          INTEGER NOT NULL DEFAULT 0,
+                 pending_stage   TEXT,
+                 pending_outcome TEXT
              );
              CREATE TABLE IF NOT EXISTS shared_task_data (
                  task_name TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
@@ -1142,6 +1570,8 @@ impl Db {
         Self::migrate_token_columns(&conn).context("не удалось обновить схему БД агентов")?;
         Self::migrate_branch_column(&conn).context("не удалось обновить схему БД агентов (ветки)")?;
         Self::migrate_cost_columns(&conn).context("не удалось обновить схему БД агентов (стоимость)")?;
+        Self::migrate_task_stage_columns(&conn)
+            .context("не удалось обновить схему БД агентов (состояние задачи)")?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -1184,6 +1614,33 @@ impl Db {
             if !existing.iter().any(|c| c == column) {
                 conn.execute(&format!("ALTER TABLE messages ADD COLUMN {column} REAL"), [])?;
             }
+        }
+        Ok(())
+    }
+
+    /// Добавляет столбцы конечного автомата (`stage`/`current_step`/
+    /// `expected_action`/`paused`) в таблицу `shared_tasks`, созданную до
+    /// появления Task State Machine — существующие задачи при этом получают
+    /// `stage = 'planning'`, `paused = 0` (значения по умолчанию у столбцов).
+    fn migrate_task_stage_columns(conn: &Connection) -> Result<()> {
+        let existing = Self::table_columns(conn, "shared_tasks")?;
+        if !existing.iter().any(|c| c == "stage") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN stage TEXT NOT NULL DEFAULT 'planning'", [])?;
+        }
+        if !existing.iter().any(|c| c == "current_step") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN current_step TEXT", [])?;
+        }
+        if !existing.iter().any(|c| c == "expected_action") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN expected_action TEXT", [])?;
+        }
+        if !existing.iter().any(|c| c == "paused") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        if !existing.iter().any(|c| c == "pending_stage") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN pending_stage TEXT", [])?;
+        }
+        if !existing.iter().any(|c| c == "pending_outcome") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN pending_outcome TEXT", [])?;
         }
         Ok(())
     }
@@ -1391,21 +1848,114 @@ impl Db {
     /// одинаково всем агентам, которые к ней присоединены. `None`, если задачи
     /// с таким именем не существует.
     fn load_shared_task(&self, task_name: &str) -> Result<Option<TaskState>> {
+        type SharedTaskRow =
+            (Option<String>, String, Option<String>, Option<String>, bool, Option<String>, Option<String>);
         let conn = self.conn();
-        let goal: Option<String> = match conn.query_row(
-            "SELECT goal FROM shared_tasks WHERE name = ?1",
+        let row: Option<SharedTaskRow> = match conn.query_row(
+            "SELECT goal, stage, current_step, expected_action, paused, pending_stage, pending_outcome \
+             FROM shared_tasks WHERE name = ?1",
             [task_name],
-            |row| row.get(0),
+            |row| {
+                let paused: i64 = row.get(4)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, paused != 0, row.get(5)?, row.get(6)?))
+            },
         ) {
-            Ok(goal) => goal,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(err) => return Err(err.into()),
         };
+        let Some((goal, stage_raw, current_step, expected_action, paused, pending_stage_raw, pending_outcome)) = row
+        else {
+            return Ok(None);
+        };
+        let stage: Stage = stage_raw
+            .parse()
+            .with_context(|| format!("некорректное значение этапа «{stage_raw}» в БД для задачи «{task_name}»"))?;
+        let pending_stage = pending_stage_raw
+            .map(|s| {
+                s.parse::<Stage>().with_context(|| {
+                    format!("некорректное значение предложенного этапа «{s}» в БД для задачи «{task_name}»")
+                })
+            })
+            .transpose()?;
         let mut stmt = conn.prepare("SELECT key, value FROM shared_task_data WHERE task_name = ?1")?;
         let data: BTreeMap<String, String> = stmt
             .query_map([task_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
-        Ok(Some(TaskState { name: task_name.to_string(), goal, data }))
+        Ok(Some(TaskState {
+            name: task_name.to_string(),
+            goal,
+            data,
+            stage,
+            current_step,
+            expected_action,
+            paused,
+            pending_stage,
+            pending_outcome,
+        }))
+    }
+
+    /// Обновляет состояние конечного автомата задачи (этап/шаг/ожидаемое
+    /// действие) — `None` в `step`/`expected_action` оставляет соответствующее
+    /// поле как есть (не затирает его пустым значением), в отличие от `stage`,
+    /// который всегда перезаписывается явно.
+    fn save_task_stage(
+        &self,
+        task_name: &str,
+        stage: Stage,
+        step: Option<&str>,
+        expected_action: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE shared_tasks SET stage = ?2 WHERE name = ?1",
+            rusqlite::params![task_name, stage.as_str()],
+        )?;
+        if let Some(step) = step {
+            conn.execute(
+                "UPDATE shared_tasks SET current_step = ?2 WHERE name = ?1",
+                rusqlite::params![task_name, step],
+            )?;
+        }
+        if let Some(expected_action) = expected_action {
+            conn.execute(
+                "UPDATE shared_tasks SET expected_action = ?2 WHERE name = ?1",
+                rusqlite::params![task_name, expected_action],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ставит/снимает паузу задачи — независимо от этапа (см. документацию [`TaskState`]).
+    fn save_task_paused(&self, task_name: &str, paused: bool) -> Result<()> {
+        self.conn().execute(
+            "UPDATE shared_tasks SET paused = ?2 WHERE name = ?1",
+            rusqlite::params![task_name, paused as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Кладёт предложенный моделью переход (`move_stage` на этап, требующий
+    /// утверждения) на ожидание человека — `stage` задачи не меняется, см.
+    /// [`Stage::requires_approval_to`] и `TaskState::pending_stage`.
+    fn save_task_pending(&self, task_name: &str, pending_stage: Stage, pending_outcome: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE shared_tasks SET pending_stage = ?2, pending_outcome = ?3 WHERE name = ?1",
+            rusqlite::params![task_name, pending_stage.as_str(), pending_outcome],
+        )?;
+        Ok(())
+    }
+
+    /// Снимает ожидающее утверждения предложение (без применения) — используется
+    /// и при отклонении ([`crate::agent::Agent::task_reject`]), и после
+    /// применения ([`crate::agent::Agent::task_approve`]), и когда человек сам
+    /// ставит другой этап (см. `Agent::task_advance`).
+    fn clear_task_pending(&self, task_name: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE shared_tasks SET pending_stage = NULL, pending_outcome = NULL WHERE name = ?1",
+            [task_name],
+        )?;
+        Ok(())
     }
 
     /// Создаёт новую общую задачу — вызывающая сторона уже проверила, что

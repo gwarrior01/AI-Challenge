@@ -14,7 +14,7 @@ pub mod context;
 pub use context::ContextStrategy;
 
 pub mod memory;
-pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, TaskState};
+pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState};
 
 pub mod profile;
 pub use profile::{list_profiles, DEFAULT_PROFILE, NONE_PROFILE};
@@ -45,7 +45,7 @@ impl ChatMessage {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: &'a [RequestMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -60,6 +60,99 @@ struct ChatRequest<'a> {
     /// (Qwen3, DeepSeek, GLM и т.п.), которые поддерживают это поле в OpenAI-совместимом API.
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+/// Описание одного инструмента (function calling, формат OpenAI-совместимого
+/// API) — то, что модель может вызвать вместо (или вместе с) текстового
+/// ответа. Единственный сегодняшний потребитель — конечный автомат задачи
+/// (см. [`crate::agent::Agent::handle_request`] и `task_machine` в `agent.rs`):
+/// инструменты предлагаются модели, только пока активна задача и не на паузе,
+/// а их описания — это и есть инструкция модели об автомате (см. документацию
+/// там), поэтому здесь сознательно нет отдельного текстового промпта "как
+/// пользоваться инструментами".
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema параметров вызова (объект `{"type":"object","properties":{...}}`).
+    pub parameters: serde_json::Value,
+}
+
+impl ToolDefinition {
+    fn to_wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        })
+    }
+}
+
+/// Один вызов инструмента, сделанный моделью — `arguments` в точности как их
+/// прислала модель (сырой JSON-текст, не разобранный), потому что исполнитель
+/// инструмента (см. `crate::agent`) обязан сам решать, что делать с
+/// доводами, которые не разбираются как JSON-объект, не бросая паники на
+/// данных модели.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallWire {
+    pub id: String,
+    #[serde(rename = "type", default = "default_function_kind")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+fn default_function_kind() -> String {
+    "function".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Сообщение уровня "сырого" запроса к API — в отличие от [`ChatMessage`]
+/// (роль + текст: то, что храним в истории диалога и показываем в
+/// интерфейсах), несёт ещё вызовы инструментов у сообщения ассистента и
+/// `tool_call_id` у сообщения-результата (роль `tool`). Используется ТОЛЬКО
+/// внутри цикла вызова инструментов ([`crate::agent::Agent::handle_request`])
+/// и никогда не персистится и не попадает в [`ChatMessage`]-историю — весь
+/// этот обмен разворачивается и сворачивается в границах одного запроса
+/// пользователя, поэтому существующие стратегии управления контекстом
+/// (`core::context`) и хранение в SQLite его вообще не видят.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallWire>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl From<&ChatMessage> for RequestMessage {
+    fn from(m: &ChatMessage) -> Self {
+        Self { role: m.role.clone(), content: Some(m.content.clone()), tool_calls: None, tool_call_id: None }
+    }
+}
+
+impl RequestMessage {
+    pub fn assistant_tool_calls(content: String, calls: Vec<ToolCallWire>) -> Self {
+        let content = if content.is_empty() { None } else { Some(content) };
+        Self { role: "assistant".into(), content, tool_calls: Some(calls), tool_call_id: None }
+    }
+
+    pub fn tool_result(tool_call_id: String, content: String) -> Self {
+        Self { role: "tool".into(), content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id) }
+    }
 }
 
 /// Необязательные настройки генерации ответа. Пустые/`None` значения означают отсутствие
@@ -97,7 +190,12 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
-    content: String,
+    /// `null`, когда модель ответила только вызовами инструментов
+    /// (`finish_reason = "tool_calls"`) — не пустой ответ, а отсутствие текста.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallWire>>,
 }
 
 /// Зеркало `usage` ровно в том виде, в котором его присылает API — отдельно от
@@ -182,6 +280,10 @@ pub struct ChatCompletion {
     pub usage: Option<Usage>,
     pub request_json: String,
     pub response_json: String,
+    /// Вызовы инструментов, сделанные моделью вместо (или вместе с) текстового
+    /// ответа — пусто у обычного ответа. См. [`ToolDefinition`]/[`ToolCallWire`]
+    /// и `LlmClient::chat_with_tools`.
+    pub tool_calls: Vec<ToolCallWire>,
 }
 
 #[derive(Clone)]
@@ -260,6 +362,44 @@ impl LlmClient {
         messages: &[ChatMessage],
         options: &ChatOptions,
     ) -> Result<ChatCompletion> {
+        let wire: Vec<RequestMessage> = messages.iter().map(RequestMessage::from).collect();
+        self.send(model, &wire, &[], false, options).await
+    }
+
+    /// Запрос с набором доступных модели инструментов (function calling) — см.
+    /// [`ToolDefinition`]. В отличие от [`LlmClient::chat_with_model`], принимает
+    /// уже собранные [`RequestMessage`] (могут включать сообщения-результаты
+    /// инструментов из предыдущего круга того же обмена, роль `tool`) — этим
+    /// пользуется только цикл вызова инструментов в
+    /// [`crate::agent::Agent::handle_request`]; персистентная история диалога
+    /// (`ChatMessage`) этот цикл вообще не видит, см. документацию [`RequestMessage`].
+    ///
+    /// `require_tool_call = true` запрашивает `tool_choice: "required"` вместо
+    /// `"auto"` — модель ОБЯЗАНА вызвать один из инструментов, а не ответить
+    /// текстом. Живой прогон против реальной модели показал, что без этого
+    /// небольшие модели часто просто решают задачу текстом в первом же ответе,
+    /// игнорируя инструкцию не делать этого (см. документацию
+    /// [`crate::agent::Agent::run_tool_loop`], где `required` используется
+    /// только на первом круге каждого обмена).
+    pub async fn chat_with_tools(
+        &self,
+        model: &str,
+        messages: &[RequestMessage],
+        tools: &[ToolDefinition],
+        require_tool_call: bool,
+        options: &ChatOptions,
+    ) -> Result<ChatCompletion> {
+        self.send(model, messages, tools, require_tool_call, options).await
+    }
+
+    async fn send(
+        &self,
+        model: &str,
+        messages: &[RequestMessage],
+        tools: &[ToolDefinition],
+        require_tool_call: bool,
+        options: &ChatOptions,
+    ) -> Result<ChatCompletion> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = ChatRequest {
             model,
@@ -270,6 +410,8 @@ impl LlmClient {
             top_p: options.top_p,
             response_format: options.response_format.as_ref(),
             enable_thinking: options.reasoning,
+            tools: (!tools.is_empty()).then(|| tools.iter().map(ToolDefinition::to_wire).collect()),
+            tool_choice: (!tools.is_empty()).then_some(if require_tool_call { "required" } else { "auto" }),
         };
         let request_json =
             serde_json::to_string_pretty(&body).context("не удалось сериализовать запрос")?;
@@ -297,16 +439,13 @@ impl LlmClient {
             .with_context(|| format!("не удалось разобрать ответ LLM: {raw}"))?;
 
         let usage = parsed.usage.map(Usage::from);
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .context("LLM не вернул ни одного варианта ответа")?;
+        let choice = parsed.choices.into_iter().next().context("LLM не вернул ни одного варианта ответа")?;
+        let content = choice.message.content.unwrap_or_default();
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
 
         let response_json = pretty_print_json(&raw);
 
-        Ok(ChatCompletion { content, usage, request_json, response_json })
+        Ok(ChatCompletion { content, usage, request_json, response_json, tool_calls })
     }
 
     /// Упрощённый вызов: один текстовый запрос -> один ответ (текст + токены).
