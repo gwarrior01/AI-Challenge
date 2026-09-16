@@ -26,7 +26,14 @@
 //!   llm-cli agent task <имя> start <название> [--goal TEXT]  -- создать общую задачу и присоединиться
 //!   llm-cli agent task <имя> join <название>                 -- присоединиться к чужой общей задаче
 //!   llm-cli agent task <имя> set <ключ> <значение>            -- записать данные (видно всем участникам)
-//!   llm-cli agent task <имя> show                             -- показать текущую задачу
+//!   llm-cli agent task <имя> show                             -- показать текущую задачу (в т.ч. состояние автомата)
+//!   llm-cli agent task <имя> advance <этап> [--step T] [--expect T]  -- перейти на следующий легальный этап
+//!   llm-cli agent task <имя> step <текст>                     -- обновить текущий шаг, не меняя этап
+//!   llm-cli agent task <имя> expect <текст>                   -- обновить ожидаемое действие, не меняя этап
+//!   llm-cli agent task <имя> pause                            -- поставить задачу на паузу (на любом этапе)
+//!   llm-cli agent task <имя> resume                           -- снять паузу (без повторных объяснений агенту)
+//!   llm-cli agent task <имя> approve                          -- применить переход, предложенный моделью
+//!   llm-cli agent task <имя> reject <причина>                 -- отклонить предложенный моделью переход
 //!   llm-cli agent task <имя> finish                           -- завершить задачу ДЛЯ ВСЕХ участников
 //!   llm-cli agent tasks                                       -- список всех общих задач и их участников
 //!   llm-cli agent profile <имя>                    -- показать текущий профиль персонализации агента
@@ -52,6 +59,24 @@
 //!                      независимо от задачи, живёт, пока не удалят явно
 //! Все три хранятся раздельно (разные таблицы SQLite) и заполняются только явно —
 //! никакого автоматического попадания данных не по адресу.
+//!
+//! ## Конечный автомат задачи (Task State Machine, см. llm_core::memory::Stage)
+//!   Формализует рабочую память задачи выше: этап (planning -> execution -> validation
+//!   -> done, с откатом validation -> execution) + текущий шаг + ожидаемое действие +
+//!   независимая от этапа пауза (agent task <имя> pause/resume). Всё это попадает в
+//!   каждый запрос к LLM (как и остальная рабочая память) — поэтому resume не требует
+//!   заново объяснять агенту контекст: он читает его из БД, а не из истории диалога.
+//!
+//!   Модель двигает автомат САМА — вызовом инструментов (function calling)
+//!   move_stage/update_step, которые ей предлагаются, пока есть активная
+//!   задача, не на паузе и не ждущая утверждения. Программа проверяет
+//!   предложенный переход по карте (Stage::allowed_next) и применяет его —
+//!   КРОМЕ переходов planning->execution и validation->done: они требуют
+//!   утверждения человеком (Stage::requires_approval_to) и остаются в
+//!   ожидании (agent task <имя> approve/reject), пока их явно не откроют.
+//!   Именно это не даёт агенту решить задачу целиком в первом же ответе, минуя
+//!   этап планирования: пока модель не подтвердила план и не дождалась
+//!   approve, она вообще не может перейти к исполнению.
 //!
 //! ## Стратегии управления контекстом (`--context-strategy`)
 //!   full             -- без управления: вся история в каждом запросе (по умолчанию)
@@ -410,6 +435,74 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                     }
                     Ok(())
                 }
+                Some("advance") => {
+                    let stage_raw = args
+                        .get(3)
+                        .cloned()
+                        .ok_or_else(|| anyhow!(
+                            "укажите этап: llm-cli agent task {name} advance <planning|execution|validation|done> \
+                             [--step TEXT] [--expect TEXT]"
+                        ))?;
+                    let stage: llm_core::Stage = stage_raw.parse()?;
+                    let mut step: Option<String> = None;
+                    let mut expect: Option<String> = None;
+                    let mut i = 4;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--step" => {
+                                i += 1;
+                                step = Some(args.get(i).cloned().ok_or_else(|| anyhow!("--step требует значение"))?);
+                            }
+                            "--expect" => {
+                                i += 1;
+                                expect =
+                                    Some(args.get(i).cloned().ok_or_else(|| anyhow!("--expect требует значение"))?);
+                            }
+                            other => bail!("неизвестный флаг: {other}"),
+                        }
+                        i += 1;
+                    }
+                    agent.task_advance(stage, step.as_deref(), expect.as_deref())?;
+                    println!("Задача переведена на этап «{stage}».");
+                    Ok(())
+                }
+                Some("step") => {
+                    let text = args.get(3..).map(|s| s.join(" ")).filter(|s| !s.is_empty()).ok_or_else(|| {
+                        anyhow!("укажите текущий шаг: llm-cli agent task {name} step <текст>")
+                    })?;
+                    agent.task_step(&text)?;
+                    println!("Текущий шаг задачи обновлён: {text}");
+                    Ok(())
+                }
+                Some("expect") => {
+                    let text = args.get(3..).map(|s| s.join(" ")).filter(|s| !s.is_empty()).ok_or_else(|| {
+                        anyhow!("укажите ожидаемое действие: llm-cli agent task {name} expect <текст>")
+                    })?;
+                    agent.task_expect(&text)?;
+                    println!("Ожидаемое действие задачи обновлено: {text}");
+                    Ok(())
+                }
+                Some("pause") => {
+                    agent.task_pause()?;
+                    println!("Задача поставлена на паузу.");
+                    Ok(())
+                }
+                Some("resume") => {
+                    agent.task_resume()?;
+                    println!("Задача возобновлена — этап/шаг/ожидаемое действие не менялись.");
+                    Ok(())
+                }
+                Some("approve") => {
+                    agent.task_approve()?;
+                    println!("Предложенный моделью переход применён.");
+                    Ok(())
+                }
+                Some("reject") => {
+                    let note = args.get(3..).map(|s| s.join(" ")).unwrap_or_default();
+                    agent.task_reject(&note)?;
+                    println!("Предложенный моделью переход отклонён — этап не изменился.");
+                    Ok(())
+                }
                 Some("finish") => match agent.task_finish()? {
                     Some(task) => {
                         println!(
@@ -424,7 +517,10 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                     }
                 },
                 _ => {
-                    bail!("укажите действие: llm-cli agent task {name} <start|join|set|show|finish> ...");
+                    bail!(
+                        "укажите действие: llm-cli agent task {name} \
+                         <start|join|set|show|advance|step|expect|pause|resume|approve|reject|finish> ..."
+                    );
                 }
             }
         }
@@ -569,6 +665,18 @@ fn print_task(task: &llm_core::TaskState) {
     match &task.goal {
         Some(goal) => println!("Задача «{}» (цель: {goal})", task.name),
         None => println!("Задача «{}»", task.name),
+    }
+    let pause_suffix = if task.paused { "  ⏸ НА ПАУЗЕ" } else { "" };
+    println!("Этап: {}{pause_suffix}", task.stage);
+    if let Some(step) = task.current_step.as_deref().filter(|s| !s.is_empty()) {
+        println!("Текущий шаг: {step}");
+    }
+    if let Some(expect) = task.expected_action.as_deref().filter(|s| !s.is_empty()) {
+        println!("Ожидаемое действие: {expect}");
+    }
+    if let Some(pending) = task.pending_stage {
+        let outcome = task.pending_outcome.as_deref().unwrap_or("(не указан)");
+        println!("⏳ Предложен переход на этап «{pending}» (итог: {outcome}) — ждёт approve/reject");
     }
     if task.data.is_empty() {
         println!("(данных пока нет)");

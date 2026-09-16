@@ -41,6 +41,59 @@ Independently of the `context_strategy` above (which only governs how the *dialo
 
 Both working and long-term memory (when non-empty) are injected as extra system messages on *every* request, regardless of `context_strategy` — that axis only controls how much of the raw dialogue is resent. `agent memory <name>` prints all three tiers side by side (plus the current personalization profile, see below) so the boundary between them is visible, not just present in storage. `agent tasks` lists every existing shared task and its current members, independent of any single agent — useful to find the name of a task before `join`ing it.
 
+### Task State Machine
+
+The shared task from working memory above also carries a **formalized finite-state machine** (`Stage` in `core/src/memory.rs`): a **stage**, a free-text **current step**, and a free-text **expected action** — plus a **pause** flag independent of the stage. Four stages, matching a typical work cycle:
+
+```
+planning → execution → validation → done
+              ↑             │
+              └─────────────┘   (rework after a failed check)
+```
+
+Transitions are validated, not free-form: from `planning` the only legal next stage is `execution`; from `execution`, only `validation`; from `validation`, either `done` (passed) or back to `execution` (failed — rework); `done` is terminal. Jumping stages (e.g. `planning → validation`) is rejected with an error listing what's actually legal from the current stage.
+
+```bash
+cargo run -p llm-cli -- agent task Аналитик advance validation                            # -- ошибка: из planning нельзя сразу в validation
+cargo run -p llm-cli -- agent task Аналитик advance execution --step "собрать требования" --expect "черновик плана готов"
+cargo run -p llm-cli -- agent task Аналитик step "переписать раздел 2"                     # -- обновить шаг, не меняя этап
+cargo run -p llm-cli -- agent task Аналитик expect "жду ревью от коллеги"
+cargo run -p llm-cli -- agent task Аналитик pause                                          # -- пауза НА ЛЮБОМ этапе
+cargo run -p llm-cli -- agent task Аналитик resume                                         # -- снять паузу, этап/шаг/ожидание не менялись
+cargo run -p llm-cli -- agent task Аналитик show                                           # -- показать этап/шаг/ожидание/паузу
+```
+
+Pause is orthogonal to stage — not a fifth stage, just a flag that can be set or cleared at any point in the cycle (`agent task <name> pause` / `resume`), and advancing is blocked while paused (`resume` first). What makes pausing actually useful rather than just a status flag: the whole snapshot (stage, step, expected action, pause) is read fresh from SQLite and injected into *every* request to the model — the same way working/long-term memory are (see above) — so resuming a paused task doesn't require re-explaining anything to the agent: it already sees where things were left off, in its very next reply, from state rather than from conversation history. The CLI and the TUI's agent-memory screen (`F3`) expose the same explicit commands: `agent task <name> advance|step|expect|pause|resume`. The **web UI is different on purpose** (see next section): there is no manual task form at all — the task is managed automatically, and its status/controls live in the chat itself, not in the memory tab.
+
+#### The model drives the automaton itself — via tool calls, gated by a human
+
+The commands above are the *manual* interface — a human moving the automaton by hand. Left at that, the agent itself never actually behaves differently per stage: asked to do the task, it just solves it in one reply regardless of what stage the task is nominally in, because nothing stops it. The actual fix is that **the model moves the automaton itself**, through two tools (OpenAI-compatible function calling) offered on every request while a task is active, not paused, not terminal (`done`), and not already waiting on a pending proposal:
+
+- **`move_stage(stage, outcome)`** — propose a transition. The program validates it against `Stage::allowed_next` exactly like `agent task advance` does; an illegal stage is rejected with the same "here's what's actually legal" message. If the transition is one of the two gated ones (see below), it is **not applied** — instead it's parked as `TaskState::pending_stage`/`pending_outcome` and the tool result tells the model to stop and wait, not act as if the transition happened.
+- **`update_step(step, expected_action)`** — record progress within the current stage without changing it (maps onto `agent task step`/`expect`).
+
+Two transitions require a human to open the gate (`Stage::requires_approval_to`) — the two moments where the agent would otherwise be able to do (or declare) the whole task without anyone signing off: **`planning → execution`** (don't start acting until the plan is confirmed) and **`validation → done`** (don't declare the task finished until the result is confirmed). `execution → validation` and `validation → execution` (rework) apply immediately — that direction is safe and reversible. A pending proposal is opened with `agent task <name> approve` (applies it, same code path as a direct `advance`) or closed with `agent task <name> reject <note>` (stage unchanged, the note becomes the new "expected action" so the model sees why on its next turn) — never by anything the model says in plain text ("looks good" is not consent).
+
+```bash
+# модель сама вызывает move_stage(execution, outcome="...") вместо того, чтобы просто написать письмо —
+# переход остаётся в ожидании, пока его явно не откроют:
+cargo run -p llm-cli -- agent task Аналитик show      # -- покажет "⏳ Предложен переход на этап «execution» ... ждёт approve/reject"
+cargo run -p llm-cli -- agent task Аналитик approve   # -- применяет предложенный переход
+cargo run -p llm-cli -- agent task Аналитик reject "план неполный, распиши шаг 3"  # -- отклоняет, этап не меняется
+```
+
+A live smoke test against a real local model (Qwen3 via LM Studio) surfaced the actual failure mode this closes: with `tool_choice: "auto"`, a capable-enough model will often just *ignore* the tools and answer the whole task directly in plain text on the first turn, tool descriptions notwithstanding. So the first round of every exchange is sent with `tool_choice: "required"` (LLM API call `chat_with_tools`, `require_tool_call` parameter) — the model *must* call one of the two tools before it's allowed to just talk; once it has (recording a step, asking a clarifying question via `expected_action`, or proposing a transition), the next round reverts to `"auto"` so it can reply in plain text normally. Intermediate tool-call/tool-result messages exist only within that one exchange (`core::RequestMessage`, distinct from the persisted `ChatMessage`) — they're never written to the branch history or SQLite, so none of the four context-management strategies above need to know tool calling exists, and a runaway loop is capped (`MAX_TOOL_ROUNDS`) with a final tools-off call to force a reply either way.
+
+#### Web UI: no manual task form, status lives in the chat itself
+
+The web UI deliberately doesn't expose the manual `task start`/`join`/`set` commands above at all — a named agent's task is created **automatically** by the first message sent to it (`POST /api/agents/:name/ask` calls an `ensure_task` helper before `handle_request` if the agent has no active task yet, naming it after the agent itself), starting in `planning` the same as everywhere else. This is a web-UI-only convenience layered on top of the same `Agent`/`Stage` machinery — the CLI and TUI are untouched and still require an explicit `agent task <name> start`, consistent with the "nothing is written automatically" memory philosophy above.
+
+Because the task is no longer something the person sets up, its status isn't tucked away in the "🧠 Память" tab either (that tab now only holds personalization and long-term memory). Instead:
+- A **stage strip right under the chat header** (top of the dialogue) shows the current stage badge plus a one-line hint (current step / expected action) and a "🏁 Новая задача" button that finishes the task so the next message starts a fresh one.
+- A **compact action bar directly above the composer**, next to the "Отправить" button, holds Пауза/Возобновить and, only when the model has a transition awaiting sign-off, an inline Утвердить/Отклонить alert with a reject-reason field — the same `approve`/`reject`/`pause`/`resume` endpoints as the CLI, just surfaced where the conversation is happening instead of a separate screen.
+
+Both are driven by the same `AgentInfo.task` field the CLI/TUI already use, now also echoed back in the `/ask` response itself (`task`) so the status updates immediately after every reply instead of waiting on a separate refetch.
+
 ### Personalization: profiles
 
 Independent of the memory model above (which is about what an agent *knows*), each named agent also has a **personalization profile** (`core/src/profile.rs`) describing *how* it should talk to a specific person — tone/manner, response language, format preferences, and constraints, with examples. Unlike memory, a profile isn't stored in SQLite: it's a **markdown file** on disk in a profiles directory (`profiles/` by default, overridable via `LLM_PROFILES_DIR`, see below) — meant to be written and edited by hand, not accumulated fact-by-fact. `AgentConfig.profile` stores only the *name* of the file an agent uses (so several agents can share one profile without duplicating the text): unset resolves to `default` (`profiles/default.md`, included in this repo as an editable template/example), and the special value `none` explicitly turns personalization off for that agent. Whichever profile is resolved, its file (if found) is injected as a system message on *every* request — right alongside the system prompt, independently of `context_strategy` and of working/long-term memory.
@@ -178,7 +231,14 @@ cargo run -p llm-cli -- agent forget Переводчик <key>                 
 cargo run -p llm-cli -- agent task Переводчик start <task> [--goal TEXT]         # create a shared task + attach
 cargo run -p llm-cli -- agent task Аналитик join <task>                          # attach another agent to it
 cargo run -p llm-cli -- agent task Переводчик set <key> <value>                  # shared working memory
-cargo run -p llm-cli -- agent task Переводчик show                               # shared working memory
+cargo run -p llm-cli -- agent task Переводчик show                               # shared working memory + FSM state
+cargo run -p llm-cli -- agent task Переводчик advance <stage> [--step T] [--expect T]  # Task State Machine — see below
+cargo run -p llm-cli -- agent task Переводчик step <text>                        # update current step, same stage
+cargo run -p llm-cli -- agent task Переводчик expect <text>                      # update expected action, same stage
+cargo run -p llm-cli -- agent task Переводчик pause                              # pause at any stage
+cargo run -p llm-cli -- agent task Переводчик resume                             # resume — no re-explaining needed
+cargo run -p llm-cli -- agent task Переводчик approve                            # apply a transition the model proposed
+cargo run -p llm-cli -- agent task Переводчик reject <note>                      # reject it — stage stays put
 cargo run -p llm-cli -- agent task Переводчик finish                             # ends the task for ALL members
 cargo run -p llm-cli -- agent tasks                                              # list all shared tasks + members
 ```

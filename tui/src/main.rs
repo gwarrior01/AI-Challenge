@@ -38,9 +38,16 @@
 //! <название>` (присоединяет к УЖЕ существующей задаче — созданной этим же
 //! или другим агентом; экран списком показывает задачи, доступные для join),
 //! `task set <ключ> <значение>` (видно сразу всем присоединённым агентам),
-//! `task finish` (завершает задачу и удаляет её данные ДЛЯ ВСЕХ участников
-//! разом — синтаксис совпадает с одноимёнными подкомандами `llm-cli agent`,
-//! см. cli/src/main.rs, — поведение не расходится между интерфейсами).
+//! `task advance <planning|execution|validation|done> [--step T] [--expect T]`
+//! (переход конечного автомата задачи — см. llm_core::memory::Stage — только
+//! на легальный следующий этап), `task step <текст>`/`task expect <текст>`
+//! (правка текущего шага/ожидаемого действия без смены этапа), `task pause`/
+//! `task resume` (пауза независима от этапа — ставится на любом; резюме не
+//! требует переобъяснять контекст агенту, т.к. этап/шаг/ожидание читаются из
+//! БД при каждом запросе), `task finish` (завершает задачу и удаляет её данные
+//! ДЛЯ ВСЕХ участников разом — синтаксис совпадает с одноимёнными
+//! подкомандами `llm-cli agent`, см. cli/src/main.rs, — поведение не
+//! расходится между интерфейсами).
 //!
 //! Этот же экран показывает **персонализацию** (см. llm_core::profile) —
 //! отдельную от трёх уровней памяти ось: markdown-профиль, описывающий манеру
@@ -1819,6 +1826,29 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
             if !members.is_empty() {
                 lines.push(Line::from(Span::styled(format!("  участники: {members}"), hint_style)));
             }
+            let stage_style = if task.paused {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let pause_suffix = if task.paused { "  ⏸ НА ПАУЗЕ" } else { "" };
+            lines.push(Line::from(vec![
+                Span::raw("  этап: "),
+                Span::styled(format!("{}{pause_suffix}", task.stage), stage_style),
+            ]));
+            if let Some(step) = task.current_step.as_deref().filter(|s| !s.is_empty()) {
+                lines.push(Line::from(format!("  текущий шаг: {step}")));
+            }
+            if let Some(expect) = task.expected_action.as_deref().filter(|s| !s.is_empty()) {
+                lines.push(Line::from(format!("  ожидаемое действие: {expect}")));
+            }
+            if let Some(pending) = task.pending_stage {
+                let outcome = task.pending_outcome.as_deref().unwrap_or("(не указан)");
+                lines.push(Line::from(Span::styled(
+                    format!("  ⏳ предложен переход в «{pending}» (итог: {outcome}) — approve/reject"),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+            }
             if task.data.is_empty() {
                 lines.push(Line::from(Span::styled("  (данных пока нет)", hint_style)));
             } else {
@@ -1873,8 +1903,9 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
         Some((text, is_error)) => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
         None => (
             " Команды: remember <ключ> <значение> [--category CAT] · forget <ключ> · \
-             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · task finish · \
-             profile <профиль|none> · profile new <имя>"
+             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · \
+             task advance <этап> [--step T] [--expect T] · task pause · task resume · \
+             task approve · task reject <причина> · task finish · profile <профиль|none> · profile new <имя>"
                 .to_string(),
             Color::DarkGray,
         ),
@@ -1891,8 +1922,8 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
 }
 
 /// Разбирает и выполняет одну команду экрана памяти агента ([`Screen::AgentMemory`]) —
-/// `remember`/`forget`/`task start|join|set|show|finish`, синтаксически
-/// совпадающие с одноимёнными подкомандами `llm-cli agent` (см.
+/// `remember`/`forget`/`task start|join|set|show|advance|step|expect|pause|resume|finish`,
+/// синтаксически совпадающие с одноимёнными подкомандами `llm-cli agent` (см.
 /// cli/src/main.rs), чтобы поведение этой модели памяти не расходилось между
 /// интерфейсами. `task` работает с ОБЩЕЙ задачей (см. `crate::memory` в
 /// llm-core) — `start` создаёт её и сразу присоединяет агента, `join`
@@ -1966,6 +1997,59 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
                 agent.task_set(key, &value).map_err(|err| err.to_string())?;
                 Ok(format!("Рабочая память обновлена (видно всем участникам): {key} = {value}"))
             }
+            Some("advance") => {
+                let stage_raw =
+                    tokens.get(2).copied().ok_or("укажите этап: task advance <planning|execution|validation|done> [--step T] [--expect T]")?;
+                let stage: llm_core::Stage = stage_raw.parse().map_err(|err: anyhow::Error| err.to_string())?;
+                let mut step: Option<String> = None;
+                let mut expect: Option<String> = None;
+                let mut i = 3;
+                while i < tokens.len() {
+                    match tokens[i] {
+                        "--step" => {
+                            i += 1;
+                            step = Some(tokens.get(i).copied().ok_or("--step требует значение")?.to_string());
+                        }
+                        "--expect" => {
+                            i += 1;
+                            expect = Some(tokens.get(i).copied().ok_or("--expect требует значение")?.to_string());
+                        }
+                        other => return Err(format!("неизвестный флаг «{other}»")),
+                    }
+                    i += 1;
+                }
+                agent.task_advance(stage, step.as_deref(), expect.as_deref()).map_err(|err| err.to_string())?;
+                Ok(format!("Задача переведена на этап «{stage_raw}»."))
+            }
+            Some("step") => {
+                let text = tokens.get(2..).map(|s| s.join(" ")).filter(|s| !s.is_empty())
+                    .ok_or("укажите текущий шаг: task step <текст>")?;
+                agent.task_step(&text).map_err(|err| err.to_string())?;
+                Ok(format!("Текущий шаг обновлён: {text}"))
+            }
+            Some("expect") => {
+                let text = tokens.get(2..).map(|s| s.join(" ")).filter(|s| !s.is_empty())
+                    .ok_or("укажите ожидаемое действие: task expect <текст>")?;
+                agent.task_expect(&text).map_err(|err| err.to_string())?;
+                Ok(format!("Ожидаемое действие обновлено: {text}"))
+            }
+            Some("pause") => {
+                agent.task_pause().map_err(|err| err.to_string())?;
+                Ok("Задача поставлена на паузу.".to_string())
+            }
+            Some("resume") => {
+                agent.task_resume().map_err(|err| err.to_string())?;
+                Ok("Задача возобновлена — контекст не потерян.".to_string())
+            }
+            Some("approve") => {
+                agent.task_approve().map_err(|err| err.to_string())?;
+                Ok("Предложенный моделью переход применён.".to_string())
+            }
+            Some("reject") => {
+                let note = tokens.get(2..).map(|s| s.join(" ")).unwrap_or_default();
+                agent.task_reject(&note).map_err(|err| err.to_string())?;
+                Ok("Предложенный моделью переход отклонён — этап не изменился.".to_string())
+            }
             Some("finish") => match agent.task_finish() {
                 Ok(Some(task)) => {
                     Ok(format!("Задача «{}» завершена и удалена ДЛЯ ВСЕХ участников.", task.name))
@@ -1974,8 +2058,14 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
                 Err(err) => Err(err.to_string()),
             },
             Some("show") => Ok("Текущее состояние показано выше.".to_string()),
-            Some(other) => Err(format!("неизвестное действие «{other}» — task start/join/set/show/finish")),
-            None => Err("укажите действие: task start/join/set/show/finish".to_string()),
+            Some(other) => Err(format!(
+                "неизвестное действие «{other}» — task start/join/set/show/advance/step/expect/pause/resume/\
+                 approve/reject/finish"
+            )),
+            None => Err(
+                "укажите действие: task start/join/set/show/advance/step/expect/pause/resume/approve/reject/finish"
+                    .to_string(),
+            ),
         },
         Some("profile") => match tokens.get(1).copied() {
             Some("new") => {
@@ -2098,8 +2188,22 @@ mod tests {
     /// completion_tokens остаётся на самом ответе.
     #[test]
     fn pairs_usage_across_user_and_assistant_messages() {
-        let usage1 = Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
-        let usage2 = Usage { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 };
+        let usage1 = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cost: None,
+            cost_input: None,
+            cost_output: None,
+        };
+        let usage2 = Usage {
+            prompt_tokens: 20,
+            completion_tokens: 8,
+            total_tokens: 28,
+            cost: None,
+            cost_input: None,
+            cost_output: None,
+        };
         let messages = vec![
             (ChatMessage::user("привет"), None),
             (ChatMessage::assistant("здравствуйте"), Some(usage1)),

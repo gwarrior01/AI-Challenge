@@ -1512,13 +1512,6 @@
     gap: 4px;
   }
 
-  /* Тот же баг specificity, что и у .memory-kv-form[hidden] выше — без этого
-     agent-joinable-tasks-list (класс memory-kv-list) не скрывался бы, пока
-     активна задача (см. renderMemoryPanel). */
-  .memory-kv-list[hidden] {
-    display: none;
-  }
-
   .memory-kv-list li {
     display: flex;
     align-items: center;
@@ -1557,13 +1550,6 @@
     align-items: center;
   }
 
-  /* Тот же баг specificity, что и у .branch-bar[hidden] выше — без этого
-     agent-task-start-form (класс memory-kv-form) не скрывался бы, пока
-     активна задача (см. renderMemoryPanel). */
-  .memory-kv-form[hidden] {
-    display: none;
-  }
-
   .memory-kv-form input[type="text"],
   .memory-kv-form select {
     background: var(--panel);
@@ -1580,12 +1566,89 @@
     font-size: 12px;
   }
 
-  .memory-task-head {
+  .stage-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    background: var(--accent-soft, rgba(99, 102, 241, 0.15));
+    color: var(--accent, #6366f1);
+  }
+
+  .stage-badge.paused {
+    background: rgba(234, 179, 8, 0.18);
+    color: #ca8a04;
+  }
+
+  /* Верх диалога — статус конечного автомата задачи (см. Stage в llm_core::memory),
+     тот же визуальный ряд, что у .branch-bar чуть выше. */
+  .task-stage-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 14px;
+    padding: 8px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+    font-size: 12px;
+  }
+
+  .task-stage-bar[hidden] {
+    display: none;
+  }
+
+  /* Низ диалога, рядом с полем ввода — пауза/возобновление и утверждение
+     предложенного моделью перехода, без переключения на отдельную вкладку. */
+  .task-action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    max-width: 900px;
+    margin: 0 auto 10px;
+  }
+
+  .task-action-bar[hidden] {
+    display: none;
+  }
+
+  .task-pending-alert {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
-    margin-bottom: 8px;
+    flex: 1 1 100%;
+    padding: 6px 10px;
+    border: 1px solid rgba(234, 179, 8, 0.5);
+    border-radius: 8px;
+    background: rgba(234, 179, 8, 0.08);
+    font-size: 12px;
+  }
+
+  .task-pending-alert[hidden] {
+    display: none;
+  }
+
+  .task-pending-alert input[type="text"] {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 5px 8px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+  }
+
+  /* .settings-btn задаёт display: flex той же специфичностью, что и встроенный
+     [hidden] { display: none } — при равной специфичности побеждает авторский
+     класс, а не UA-стиль, поэтому .hidden = true в JS не прятал бы кнопки
+     паузы/возобновления без явного правила через ID (специфичность выше). */
+  #agent-task-pause-btn[hidden],
+  #agent-task-resume-btn[hidden] {
+    display: none;
   }
 
   .agent-chat-footer {
@@ -1899,12 +1962,24 @@
     </div>
     <span class="field-error" id="agent-branch-error" hidden></span>
   </div>
-  <!-- Модель памяти агента (см. llm_core::memory): рабочая память ТЕКУЩЕЙ ЗАДАЧИ
-       и долговременная память (решения/знания) — обе заполняются только явно,
-       кнопками ниже, независимо от того, какая стратегия (context_strategy)
-       управляет краткосрочной историей диалога выше. Персонализация (см.
-       llm_core::profile) — отдельная секция выше: не память, а КАК агент
-       должен отвечать. См. renderMemoryPanel. -->
+  <!-- Конечный автомат задачи (Task State Machine, см. llm_core::memory::Stage) —
+       ВЕРХ ДИАЛОГА: задача заводится автоматически первым же вопросом агенту
+       (см. ensure_task в web/src/main.rs) и сразу начинается в planning, без
+       ручного создания. Полоска — ТОЛЬКО бейдж этапа, намеренно без шага и
+       ожидаемого действия рядом (решение пользователя): подробности — в
+       самом диалоге, а не рядом с индикатором. Кнопка "Новая задача"
+       завершает текущую, чтобы следующий вопрос завёл новую. -->
+  <div class="task-stage-bar" id="agent-task-stage-bar" hidden>
+    <span class="stage-badge" id="agent-task-stage-badge"></span>
+    <button type="button" class="settings-btn" id="agent-task-new-btn">🏁 Новая задача</button>
+  </div>
+  <!-- Долговременная память (решения/знания, см. llm_core::memory) — заполняется
+       только явно, кнопкой ниже, независимо от того, какая стратегия
+       (context_strategy) управляет краткосрочной историей диалога выше.
+       Рабочая память ТЕКУЩЕЙ ЗАДАЧИ (конечный автомат) сюда больше не входит —
+       она теперь в диалоге (task-stage-bar/task-action-bar выше), не в этой
+       вкладке. Персонализация (см. llm_core::profile) — отдельная секция
+       выше: не память, а КАК агент должен отвечать. См. renderMemoryPanel. -->
   <div class="memory-panel" id="agent-memory-panel" hidden>
     <div class="memory-section">
       <h4>🎭 Персонализация — профиль (отдельная ось: КАК отвечать, не память)</h4>
@@ -1916,31 +1991,6 @@
       <div class="memory-kv-form">
         <input type="text" id="agent-new-profile-name" placeholder="имя нового профиля">
         <button type="button" class="settings-btn" id="agent-new-profile-btn">+ Создать профиль</button>
-      </div>
-    </div>
-    <div class="memory-section">
-      <h4>🧩 Рабочая память — данные ОБЩЕЙ задачи</h4>
-      <div class="memory-kv-form" id="agent-task-start-form">
-        <input type="text" id="agent-task-start-name" placeholder="название задачи" list="agent-joinable-tasks-options">
-        <datalist id="agent-joinable-tasks-options"></datalist>
-        <input type="text" id="agent-task-start-goal" placeholder="цель (только для новой)">
-        <button type="button" class="settings-btn" id="agent-task-start-btn">▶ Создать</button>
-        <button type="button" class="settings-btn" id="agent-task-join-btn">🔗 Присоединиться</button>
-      </div>
-      <ul class="memory-kv-list" id="agent-joinable-tasks-list"></ul>
-      <div id="agent-task-active" hidden>
-        <div class="memory-task-head">
-          <strong id="agent-task-name"></strong>
-          <span class="card-hint" id="agent-task-goal"></span>
-          <button type="button" class="settings-btn" id="agent-task-finish-btn">✔ Завершить для всех</button>
-        </div>
-        <div class="card-hint" id="agent-task-members"></div>
-        <ul class="memory-kv-list" id="agent-task-data-list"></ul>
-        <div class="memory-kv-form">
-          <input type="text" id="agent-task-set-key" placeholder="ключ">
-          <input type="text" id="agent-task-set-value" placeholder="значение">
-          <button type="button" class="settings-btn" id="agent-task-set-btn">+ Сохранить</button>
-        </div>
       </div>
     </div>
     <div class="memory-section">
@@ -1961,6 +2011,21 @@
   </div>
   <main class="agent-chat-main" id="agent-chat-main"></main>
   <footer class="agent-chat-footer">
+    <!-- Управление конечным автоматом задачи — РЯДОМ С КНОПКОЙ ОТПРАВИТЬ, а не
+         в отдельной вкладке: человек видит и утверждает/отклоняет предложенный
+         моделью переход (move_stage), не переключаясь с диалога, и может
+         поставить задачу на паузу в любой момент прямо отсюда. -->
+    <div class="task-action-bar" id="agent-task-action-bar" hidden>
+      <div class="task-pending-alert" id="agent-task-pending-block" hidden>
+        <span id="agent-task-pending-line"></span>
+        <button type="button" class="settings-btn" id="agent-task-approve-btn">✔ Утвердить</button>
+        <input type="text" id="agent-task-reject-note" placeholder="причина отклонения (необязательно)">
+        <button type="button" class="settings-btn" id="agent-task-reject-btn">✕ Отклонить</button>
+      </div>
+      <button type="button" class="settings-btn" id="agent-task-pause-btn">⏸ Пауза</button>
+      <button type="button" class="settings-btn" id="agent-task-resume-btn">▶ Возобновить</button>
+      <span class="field-error" id="agent-task-error" hidden></span>
+    </div>
     <div class="composer">
       <textarea id="agent-chat-input" placeholder="Написать агенту..." rows="1"></textarea>
       <button type="button" id="agent-chat-send">Отправить</button>
@@ -3254,22 +3319,22 @@ const agentRememberKeyEl = document.getElementById('agent-remember-key');
 const agentRememberValueEl = document.getElementById('agent-remember-value');
 const agentRememberCategoryEl = document.getElementById('agent-remember-category');
 const agentRememberBtnEl = document.getElementById('agent-remember-btn');
-const agentTaskStartFormEl = document.getElementById('agent-task-start-form');
-const agentTaskStartNameEl = document.getElementById('agent-task-start-name');
-const agentTaskStartGoalEl = document.getElementById('agent-task-start-goal');
-const agentTaskStartBtnEl = document.getElementById('agent-task-start-btn');
-const agentTaskJoinBtnEl = document.getElementById('agent-task-join-btn');
-const agentJoinableTasksListEl = document.getElementById('agent-joinable-tasks-list');
-const agentJoinableTasksOptionsEl = document.getElementById('agent-joinable-tasks-options');
-const agentTaskActiveEl = document.getElementById('agent-task-active');
-const agentTaskNameEl = document.getElementById('agent-task-name');
-const agentTaskGoalEl = document.getElementById('agent-task-goal');
-const agentTaskMembersEl = document.getElementById('agent-task-members');
-const agentTaskDataListEl = document.getElementById('agent-task-data-list');
-const agentTaskSetKeyEl = document.getElementById('agent-task-set-key');
-const agentTaskSetValueEl = document.getElementById('agent-task-set-value');
-const agentTaskSetBtnEl = document.getElementById('agent-task-set-btn');
-const agentTaskFinishBtnEl = document.getElementById('agent-task-finish-btn');
+// Конечный автомат задачи (см. llm_core::memory::Stage) — теперь НЕ в панели
+// памяти: полоска статуса вверху диалога (task-stage-bar) и панель действий
+// рядом с кнопкой "Отправить" (task-action-bar), обе обновляются из
+// renderTaskBar (см. ниже) при каждом обновлении AgentInfo. Задача заводится
+// автоматически первым вопросом агенту — см. ensure_task в web/src/main.rs.
+const agentTaskStageBarEl = document.getElementById('agent-task-stage-bar');
+const agentTaskStageBadgeEl = document.getElementById('agent-task-stage-badge');
+const agentTaskNewBtnEl = document.getElementById('agent-task-new-btn');
+const agentTaskActionBarEl = document.getElementById('agent-task-action-bar');
+const agentTaskPendingBlockEl = document.getElementById('agent-task-pending-block');
+const agentTaskPendingLineEl = document.getElementById('agent-task-pending-line');
+const agentTaskApproveBtnEl = document.getElementById('agent-task-approve-btn');
+const agentTaskRejectNoteEl = document.getElementById('agent-task-reject-note');
+const agentTaskRejectBtnEl = document.getElementById('agent-task-reject-btn');
+const agentTaskPauseBtnEl = document.getElementById('agent-task-pause-btn');
+const agentTaskResumeBtnEl = document.getElementById('agent-task-resume-btn');
 const agentMemoryErrorEl = document.getElementById('agent-memory-error');
 const agentProfileStatusEl = document.getElementById('agent-profile-status');
 const agentProfileSelectEl = document.getElementById('agent-profile-select');
@@ -3313,26 +3378,10 @@ async function fetchProfiles() {
   }
 }
 
-// Снимок всех ОБЩИХ задач (см. llm_core::memory::SharedTaskSummary) — не
-// привязан к конкретному агенту, обновляется через fetchSharedTasks() и
-// используется renderMemoryPanel, чтобы показать список участников активной
-// задачи и список задач, доступных для task/join.
-let lastSharedTasks = [];
-
-async function fetchSharedTasks() {
-  try {
-    const res = await fetch('/api/tasks');
-    const data = await res.json();
-    lastSharedTasks = data.tasks || [];
-  } catch (e) {
-    // сеть недоступна — оставляем предыдущий снимок, не ломаем остальную панель
-  }
-}
-
 agentMemoryToggleBtn.addEventListener('click', async () => {
   agentMemoryPanelEl.hidden = !agentMemoryPanelEl.hidden;
   if (!agentMemoryPanelEl.hidden) {
-    await Promise.all([fetchSharedTasks(), fetchProfiles()]);
+    await fetchProfiles();
     if (currentAgentChatName) renderMemoryPanel(findAgentInfo(currentAgentChatName));
   }
 });
@@ -3342,10 +3391,11 @@ function showMemoryError(message) {
   agentMemoryErrorEl.hidden = false;
 }
 
-// Перерисовывает обе секции панели памяти из свежего AgentInfo (см.
-// llm_core::agent::AgentInfo — поля long_term/task приходят с бэкенда как есть,
-// в отличие от compression/facts/branching выше это не "живой статус стратегии",
-// а сами данные, поэтому просто отображаются, без отдельного кеша с диффом.
+// Перерисовывает панель памяти (персонализация + долговременная память) и,
+// отдельно, полоску/панель конечного автомата задачи (см. renderTaskBar ниже)
+// из свежего AgentInfo (см. llm_core::agent::AgentInfo) — поля long_term/task
+// приходят с бэкенда как есть, в отличие от compression/facts/branching это
+// не "живой статус стратегии", а сами данные, поэтому просто отображаются.
 function renderMemoryPanel(info) {
   const longTerm = (info && info.long_term) || {};
   const task = (info && info.task) || null;
@@ -3393,37 +3443,35 @@ function renderMemoryPanel(info) {
     btn.addEventListener('click', () => forgetAgentMemory(btn.dataset.key));
   });
 
-  agentTaskStartFormEl.hidden = !!task;
-  agentJoinableTasksListEl.hidden = !!task;
-  agentTaskActiveEl.hidden = !task;
-  if (task) {
-    agentTaskNameEl.textContent = task.name;
-    agentTaskGoalEl.textContent = task.goal ? `цель: ${task.goal}` : '';
-    const summary = lastSharedTasks.find((t) => t.name === task.name);
-    agentTaskMembersEl.textContent = summary && summary.members.length
-      ? `участники: ${summary.members.join(', ')}`
-      : '';
-    const dataEntries = Object.entries(task.data || {});
-    agentTaskDataListEl.innerHTML = dataEntries.length
-      ? dataEntries
-          .map(([key, value]) => `<li><span class="memory-kv-text">${escapeHtml(key)} = ${escapeHtml(value)}</span></li>`)
-          .join('')
-      : '<li class="card-hint">Данных пока нет.</li>';
+  renderTaskBar(task);
+}
+
+// Полоска этапа вверху диалога + панель действий рядом с кнопкой "Отправить"
+// (см. task-stage-bar/task-action-bar в разметке) — конечный автомат задачи
+// живёт здесь, а не в отдельной вкладке "Память": человек видит этап и
+// утверждает/отклоняет предложенный моделью переход, не переключая экран.
+// Задача заводится автоматически первым вопросом агенту (ensure_task на
+// бэкенде) — до первого сообщения task === null, полоски скрыты.
+function renderTaskBar(task) {
+  agentTaskStageBarEl.hidden = !task;
+  agentTaskActionBarEl.hidden = !task;
+  if (!task) return;
+
+  agentTaskStageBadgeEl.textContent = task.paused ? `${task.stage} ⏸` : task.stage;
+  agentTaskStageBadgeEl.classList.toggle('paused', !!task.paused);
+
+  agentTaskPauseBtnEl.hidden = !!task.paused;
+  agentTaskResumeBtnEl.hidden = !task.paused;
+
+  // Переход, предложенный моделью вызовом инструмента move_stage и ждущий
+  // approve/reject человеком (см. llm_core::memory::TaskState::pending_stage).
+  if (task.pending_stage) {
+    agentTaskPendingBlockEl.hidden = false;
+    agentTaskPendingLineEl.textContent =
+      `⏳ Предложен переход в «${task.pending_stage}» (итог: ${task.pending_outcome || '—'})`;
   } else {
-    // Список задач, доступных для task/join, — та же общая коллекция
-    // SharedTaskSummary, что и даталист названий ниже (для автодополнения).
-    agentJoinableTasksListEl.innerHTML = lastSharedTasks.length
-      ? lastSharedTasks
-          .map((t) => {
-            const goal = t.goal ? ` (цель: ${escapeHtml(t.goal)})` : '';
-            const members = t.members.length ? t.members.join(', ') : 'без участников';
-            return `<li><span class="memory-kv-text">${escapeHtml(t.name)}${goal} · ${escapeHtml(members)}</span></li>`;
-          })
-          .join('')
-      : '<li class="card-hint">Общих задач пока нет.</li>';
-    agentJoinableTasksOptionsEl.innerHTML = lastSharedTasks
-      .map((t) => `<option value="${escapeHtml(t.name)}"></option>`)
-      .join('');
+    agentTaskPendingBlockEl.hidden = true;
+    agentTaskPendingLineEl.textContent = '';
   }
 }
 
@@ -3441,7 +3489,7 @@ async function postAgentMemory(name, path, body) {
 // без отдельного эндпоинта, и заодно держит lastAgentsSnapshot в согласованном
 // состоянии для остальной шапки чата.
 async function refreshAfterMemoryAction(name) {
-  await Promise.all([fetchAgents(), fetchSharedTasks()]);
+  await fetchAgents();
   if (currentAgentChatName === name) updateAgentChatHeader(name);
 }
 
@@ -3522,74 +3570,85 @@ async function forgetAgentMemory(key) {
   await refreshAfterMemoryAction(name);
 }
 
-agentTaskStartBtnEl.addEventListener('click', async () => {
+const agentTaskErrorEl = document.getElementById('agent-task-error');
+function showTaskError(message) {
+  agentTaskErrorEl.textContent = message;
+  agentTaskErrorEl.hidden = false;
+}
+
+agentTaskPauseBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
   if (!name) return;
-  const taskName = agentTaskStartNameEl.value.trim();
-  if (!taskName) {
-    showMemoryError('Укажите название задачи.');
-    return;
-  }
-  agentMemoryErrorEl.hidden = true;
-  const goal = agentTaskStartGoalEl.value.trim();
-  const data = await postAgentMemory(name, 'task/start', { name: taskName, goal: goal || null });
+  agentTaskErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/pause', {});
   if (data.error) {
-    showMemoryError(data.error);
+    showTaskError(data.error);
     return;
   }
-  agentTaskStartNameEl.value = '';
-  agentTaskStartGoalEl.value = '';
+  renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
 });
 
-agentTaskJoinBtnEl.addEventListener('click', async () => {
+agentTaskResumeBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
   if (!name) return;
-  const taskName = agentTaskStartNameEl.value.trim();
-  if (!taskName) {
-    showMemoryError('Укажите название задачи, к которой хотите присоединиться.');
-    return;
-  }
-  agentMemoryErrorEl.hidden = true;
-  const data = await postAgentMemory(name, 'task/join', { name: taskName });
+  agentTaskErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/resume', {});
   if (data.error) {
-    showMemoryError(data.error);
+    showTaskError(data.error);
     return;
   }
-  agentTaskStartNameEl.value = '';
-  agentTaskStartGoalEl.value = '';
+  renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
 });
 
-agentTaskSetBtnEl.addEventListener('click', async () => {
+agentTaskApproveBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
   if (!name) return;
-  const key = agentTaskSetKeyEl.value.trim();
-  const value = agentTaskSetValueEl.value.trim();
-  if (!key || !value) {
-    showMemoryError('Укажите ключ и значение.');
-    return;
-  }
-  agentMemoryErrorEl.hidden = true;
-  const data = await postAgentMemory(name, 'task/set', { key, value });
+  agentTaskErrorEl.hidden = true;
+  const data = await postAgentMemory(name, 'task/approve', {});
   if (data.error) {
-    showMemoryError(data.error);
+    showTaskError(data.error);
     return;
   }
-  agentTaskSetKeyEl.value = '';
-  agentTaskSetValueEl.value = '';
+  renderTaskBar(data.agent ? data.agent.task : null);
+  await refreshAfterMemoryAction(name);
+  // Переход утверждён — модель уже видит новый этап (он читается из БД при
+  // каждом запросе), но без этого обмена она заговорит только на СЛЕДУЮЩЕЕ
+  // сообщение человека. Отправляем продолжение сами, чтобы после approve не
+  // нужно было вручную набирать что-то вроде "продолжай".
+  await sendAgentChatMessage('Продолжай.');
+});
+
+agentTaskRejectBtnEl.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  agentTaskErrorEl.hidden = true;
+  const note = agentTaskRejectNoteEl.value.trim();
+  const data = await postAgentMemory(name, 'task/reject', { note });
+  if (data.error) {
+    showTaskError(data.error);
+    return;
+  }
+  agentTaskRejectNoteEl.value = '';
+  renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
 });
 
-agentTaskFinishBtnEl.addEventListener('click', async () => {
+// "Новая задача" — завершает текущую (для всех, если бы у неё были другие
+// участники — в автоматическом режиме их не бывает) так же, как раньше
+// "Завершить для всех"; следующий вопрос агенту заведёт новую задачу заново
+// в planning (см. ensure_task в web/src/main.rs) — ручного создания больше нет.
+agentTaskNewBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
   if (!name) return;
-  agentMemoryErrorEl.hidden = true;
+  agentTaskErrorEl.hidden = true;
   const data = await postAgentMemory(name, 'task/finish', {});
   if (data.error) {
-    showMemoryError(data.error);
+    showTaskError(data.error);
     return;
   }
+  renderTaskBar(null);
   await refreshAfterMemoryAction(name);
 });
 
@@ -4211,12 +4270,22 @@ agentChatToggleBtn.addEventListener('click', async () => {
   }
 });
 
-async function sendAgentChatMessage() {
+// `promptOverride` — когда обмен запускается программно, а не вводом человека
+// (см. approve-обработчик ниже: после утверждения предложенного моделью
+// перехода запрос на продолжение уходит сам, без набора текста пользователем).
+// В этом случае поле ввода не трогаем — там не было и не должно быть текста.
+// Проверка именно на `typeof ... === 'string'`, а не `!== undefined` — если
+// функцию по ошибке навесят на click-обработчик без обёртки в стрелочную
+// функцию, аргументом придёт объект события, а не текст; тогда используем
+// поле ввода, как при обычном вызове без промпта, вместо отправки события
+// как есть (оно бы не прошло как JSON-строка на бэкенде).
+async function sendAgentChatMessage(promptOverride) {
   const name = currentAgentChatName;
   if (!name) return;
-  const prompt = agentChatInputEl.value.trim();
+  const hasOverride = typeof promptOverride === 'string';
+  const prompt = hasOverride ? promptOverride : agentChatInputEl.value.trim();
   if (!prompt) return;
-  agentChatInputEl.value = '';
+  if (!hasOverride) agentChatInputEl.value = '';
   agentChatSendBtn.disabled = true;
 
   const userMsg = { role: 'user', text: prompt };
@@ -4260,6 +4329,12 @@ async function sendAgentChatMessage() {
       stats.branching = data.branching || null;
       addDialogueCost(name, data.usage);
       if (currentAgentChatName === name) updateAgentChatStats(name);
+      // Этап конечного автомата задачи после ЭТОГО обмена — задача могла
+      // только что завестись автоматически (первый вопрос агенту) или
+      // сдвинуться вызовом инструмента move_stage внутри handle_request; берём
+      // прямо из ответа /ask, а не отдельным перезапросом, иначе полоска
+      // отставала бы от реального состояния на один обмен.
+      if (currentAgentChatName === name) renderTaskBar(data.task || null);
 
       // Момент сжатия контекста (стратегия summary): модель только что
       // пересчитала сводку устаревшей части истории — показываем это отдельной
@@ -4312,7 +4387,7 @@ agentChatInputEl.addEventListener('keydown', (e) => {
     sendAgentChatMessage();
   }
 });
-agentChatSendBtn.addEventListener('click', sendAgentChatMessage);
+agentChatSendBtn.addEventListener('click', () => sendAgentChatMessage());
 
 agentCreateBtn.addEventListener('click', async () => {
   const name = agentNameEl.value.trim();

@@ -173,6 +173,28 @@ struct TaskSetRequest {
     value: String,
 }
 
+/// Тело запроса на переход конечного автомата задачи (см. llm_core::memory::Stage) —
+/// `stage` обязателен, `step`/`expect` опциональны (не заданы = соответствующее
+/// поле не меняется при этом переходе, см. `Agent::task_advance`).
+#[derive(Deserialize)]
+struct TaskAdvanceRequest {
+    stage: String,
+    #[serde(default)]
+    step: Option<String>,
+    #[serde(default)]
+    expect: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TaskStepRequest {
+    step: String,
+}
+
+#[derive(Deserialize)]
+struct TaskExpectRequest {
+    expect: String,
+}
+
 /// Тело запроса на сжатие фрагмента истории обычного чата в сводку (см.
 /// `llm_core::context`) — обычный чат не хранит состояние на сервере, поэтому
 /// сама сводка и счётчик уже сжатых сообщений живут в браузере, а сервер лишь
@@ -491,6 +513,115 @@ async fn task_finish_agent(State(state): State<AppState>, Path(name): Path<Strin
     }
 }
 
+/// Переводит задачу, к которой присоединён агент, на следующий этап
+/// конечного автомата (см. `Agent::task_advance`) — только если переход
+/// легален; иначе `error` объясняет, куда можно перейти прямо сейчас.
+async fn task_advance_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskAdvanceRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let stage: llm_core::Stage = match req.stage.parse() {
+        Ok(stage) => stage,
+        Err(err) => return Json(serde_json::json!({ "error": format!("{err:#}") })),
+    };
+    match agent.task_advance(stage, req.step.as_deref(), req.expect.as_deref()) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Обновляет текущий шаг задачи, не меняя этап.
+async fn task_step_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskStepRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_step(&req.step) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Обновляет ожидаемое действие задачи, не меняя этап.
+async fn task_expect_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskExpectRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_expect(&req.expect) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Ставит задачу на паузу — на любом этапе, независимо от него.
+async fn task_pause_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_pause() {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Снимает паузу — задача продолжается с того же этапа/шага/ожидаемого
+/// действия, без необходимости заново объяснять контекст агенту (см.
+/// `Agent::task_resume`).
+async fn task_resume_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_resume() {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Применяет переход, который модель предложила вызовом инструмента
+/// `move_stage`, но который требовал утверждения человеком — см.
+/// `Agent::task_approve` и `TaskState::pending_stage`.
+async fn task_approve_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_approve() {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskRejectRequest {
+    #[serde(default)]
+    note: String,
+}
+
+/// Отклоняет предложенный моделью переход — см. `Agent::task_reject`.
+async fn task_reject_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskRejectRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_reject(&req.note) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
 /// Список всех существующих общих задач с их участниками — не привязан к
 /// конкретному агенту, используется фронтендом, чтобы предложить задачи,
 /// доступные для `.../task/join`.
@@ -529,6 +660,7 @@ async fn ask_agent(
     let Some(agent) = state.agents.get(&name) else {
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
+    ensure_task(&agent, &name);
     match agent.handle_request(&req.prompt).await {
         Ok(reply) => {
             // Свежий статус стратегии ПОСЛЕ этого обмена (и возможного пересчёта
@@ -549,10 +681,43 @@ async fn ask_agent(
                 "facts": info.facts,
                 "branching": info.branching,
                 "profile": info.profile,
+                // Этап конечного автомата задачи ПОСЛЕ этого обмена — задача уже
+                // заведена (ensure_task выше) и могла сдвинуться вызовом move_stage
+                // внутри handle_request; веб-интерфейс показывает его прямо в чате
+                // (полоска вверху + панель у кнопки "Отправить"), не в панели памяти.
+                "task": info.task,
             }))
         }
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
+}
+
+/// Веб-интерфейс ведёт задачу за пользователя, без ручного `agent task start`:
+/// первый же вопрос агенту без активной задачи заводит её автоматически, сразу
+/// в этапе `planning` (значение по умолчанию [`llm_core::Stage`]) — см.
+/// документацию модуля [`llm_core::memory`] за тем, что это довесок только для
+/// веб-интерфейса: CLI и TUI по-прежнему требуют явного `agent task start`,
+/// как и весь остальной "ничего не пишется автоматически" принцип рабочей и
+/// долговременной памяти.
+///
+/// Имя задачи — имя самого агента: у каждого именованного агента в этом
+/// потоке не больше одной активной задачи одновременно, и после `task/finish`
+/// то же имя свободно для следующей. Коллизия (то же имя занято ЧУЖИМ
+/// агентом) — редкий случай при обычном использовании веб-интерфейса,
+/// поэтому просто добавляем метку времени и пробуем ещё раз, не блокируя
+/// обмен из-за этого.
+fn ensure_task(agent: &llm_core::Agent, agent_name: &str) {
+    if agent.task_state().is_some() {
+        return;
+    }
+    if agent.task_start(agent_name, None).is_ok() {
+        return;
+    }
+    let unique = format!(
+        "{agent_name}-{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    );
+    let _ = agent.task_start(&unique, None);
 }
 
 /// Возвращает историю диалога агента, восстановленную из SQLite — используется
@@ -635,11 +800,19 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/task/start", post(task_start_agent))
         .route("/api/agents/:name/task/join", post(task_join_agent))
         .route("/api/agents/:name/task/set", post(task_set_agent))
+        .route("/api/agents/:name/task/advance", post(task_advance_agent))
+        .route("/api/agents/:name/task/step", post(task_step_agent))
+        .route("/api/agents/:name/task/expect", post(task_expect_agent))
+        .route("/api/agents/:name/task/pause", post(task_pause_agent))
+        .route("/api/agents/:name/task/resume", post(task_resume_agent))
+        .route("/api/agents/:name/task/approve", post(task_approve_agent))
+        .route("/api/agents/:name/task/reject", post(task_reject_agent))
         .route("/api/agents/:name/task/finish", post(task_finish_agent))
         .route("/api/tasks", get(list_tasks))
         .with_state(state);
 
-    let addr = "0.0.0.0:8080";
+    let port = std::env::var("PORT").ok().and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(8080);
+    let addr = format!("0.0.0.0:{port}");
     println!("Веб-интерфейс запущен: http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
