@@ -45,13 +45,43 @@
 //! `context_strategy` и от памяти выше. `AgentConfig::profile` хранит только
 //! ИМЯ файла — [`Agent::profile_status`] читает его содержимое с диска заново
 //! при каждом обращении, как и долговременную/рабочую память.
+//!
+//! ## Инварианты
+//!
+//! Ещё одна независимая, самая приоритетная ось — см. модуль
+//! [`crate::invariants`]: жёсткие правила (архитектура, технические решения,
+//! ограничения по стеку, бизнес-правила), которые ассистент не имеет права
+//! нарушать ни на одном этапе работы. Три источника, каждый со своим
+//! масштабом действия:
+//!
+//! - **Глобальные — файлы** каталога инвариантов (markdown, отдельно от
+//!   диалога и от SQLite) — один общий набор для ВСЕХ агентов и задач, как
+//!   долговременная память.
+//! - **Глобальные — долговременная память**: записи с категорией
+//!   `"invariant"` ([`crate::invariants::MEMORY_CATEGORY`]) — та же сила
+//!   действия, что и у файловых, но заводятся обычной командой `agent
+//!   remember`, без отдельного файла (например, короткое правило "не
+//!   транслитерировать английские термины").
+//! - **Задачи** — [`crate::memory::TaskState::invariants`] (текстовые) и
+//!   `blocked_transitions`/`extra_approval_transitions` (структурные —
+//!   дополнительные запреты/гейты согласия на конкретные переходы автомата,
+//!   см. [`Agent::task_forbid_transition`]/[`Agent::task_require_approval`]) —
+//!   действуют ТОЛЬКО пока агент работает над этой конкретной задачей, и
+//!   структурные из них не просто описаны в промпте, а реально проверяются
+//!   кодом в [`Agent::task_advance`]/`tool_move_stage`, а не только текстом.
+//!
+//! Оба глобальных источника объединяются в один блок и подключаются ПЕРВЫМ
+//! системным сообщением у каждого запроса ([`Agent::handle_request`]), раньше
+//! системного промпта и персонализации, потому что они могут ему
+//! противоречить, но не отменяют его. Задачные — часть блока задачи
+//! ([`crate::memory::format_task_block`]), видны только пока задача активна.
 
 use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState};
 use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClient, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -710,6 +740,35 @@ impl Agent {
         Ok(())
     }
 
+    /// Явно сохраняет (или обновляет) текстовый инвариант, привязанный
+    /// ТОЛЬКО к задаче, к которой сейчас присоединён агент (см.
+    /// [`crate::memory::TaskState::invariants`] и
+    /// [`crate::memory::format_task_invariants_block`]) — обязателен наравне
+    /// с глобальными инвариантами ([`crate::invariants`]), но действует и
+    /// виден только пока идёт работа над этой конкретной задачей: снимается
+    /// сам собой при `task finish`, без отдельной очистки. Ошибка, если
+    /// агент ни к какой задаче не присоединён.
+    pub fn task_invariant_set(&self, id: &str, text: &str) -> Result<()> {
+        let id = id.trim();
+        if id.is_empty() {
+            bail!("идентификатор инварианта задачи не может быть пустым");
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("текст инварианта задачи не может быть пустым");
+        }
+        let task_name = self.current_task_name()?;
+        self.db.save_task_invariant(&task_name, id, text)?;
+        Ok(())
+    }
+
+    /// Удаляет инвариант задачи, к которой сейчас присоединён агент.
+    /// Возвращает `true`, если он существовал.
+    pub fn task_invariant_remove(&self, id: &str) -> Result<bool> {
+        let task_name = self.current_task_name()?;
+        self.db.delete_task_invariant(&task_name, id)
+    }
+
     /// Снимок задачи, к которой сейчас присоединён агент, — читается из БД
     /// заново при каждом вызове (см. документацию поля [`Agent`] выше), `None`,
     /// если агент ни к какой задаче не присоединён.
@@ -788,9 +847,57 @@ impl Agent {
                     current.stage
                 );
             }
+            // Абсолютный запрет инвариантом ЭТОЙ задачи (см.
+            // TaskState::blocked_transitions) — в отличие от гейтов согласия
+            // ниже, действует одинаково и на ручной переход человеком, и на
+            // переход, предложенный моделью (см. tool_move_stage): снять его
+            // может только человек, а не сам этот вызов.
+            if current.transition_blocked(current.stage, stage) {
+                bail!(
+                    "переход «{}» -> «{stage}» запрещён инвариантом задачи «{task_name}» (не временное \
+                     ограничение, а прямой запрет) — снять его: «agent task {} allow {} {stage}»",
+                    current.stage,
+                    self.name,
+                    current.stage
+                );
+            }
         }
         self.db.save_task_stage(&task_name, stage, step, expected_action)?;
         Ok(())
+    }
+
+    /// Дополнительно ЗАПРЕЩАЕТ переход `from -> to` для задачи, к которой
+    /// присоединён агент, сверх общей карты [`Stage::allowed_next`] (см.
+    /// [`crate::memory::TaskState::blocked_transitions`]) — абсолютный
+    /// запрет, действует и на [`Agent::task_advance`], и на переход,
+    /// предложенный моделью.
+    pub fn task_forbid_transition(&self, from: Stage, to: Stage) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        self.db.save_task_transition_rule(&task_name, from, to, "block")
+    }
+
+    /// Снимает запрет, поставленный [`Agent::task_forbid_transition`].
+    /// Возвращает `true`, если он существовал.
+    pub fn task_allow_transition(&self, from: Stage, to: Stage) -> Result<bool> {
+        let task_name = self.current_task_name()?;
+        self.db.delete_task_transition_rule(&task_name, from, to, "block")
+    }
+
+    /// Требует для этой задачи подтверждения человеком на переход `from ->
+    /// to` ДОПОЛНИТЕЛЬНО к двум переходам, гейтящимся всегда (см.
+    /// [`crate::memory::TaskState::extra_approval_transitions`]) — действует
+    /// только на переход, который предлагает МОДЕЛЬ (`move_stage`); ручной
+    /// [`Agent::task_advance`] — это и так решение человека.
+    pub fn task_require_approval(&self, from: Stage, to: Stage) -> Result<()> {
+        let task_name = self.current_task_name()?;
+        self.db.save_task_transition_rule(&task_name, from, to, "approve")
+    }
+
+    /// Снимает дополнительный гейт, поставленный [`Agent::task_require_approval`].
+    /// Возвращает `true`, если он существовал.
+    pub fn task_unrequire_approval(&self, from: Stage, to: Stage) -> Result<bool> {
+        let task_name = self.current_task_name()?;
+        self.db.delete_task_transition_rule(&task_name, from, to, "approve")
     }
 
     /// Обновляет текущий шаг задачи, не меняя этап.
@@ -889,7 +996,10 @@ impl Agent {
                      подтверждения человека: вызов НЕ применит переход сразу, а поставит его в ожидание — после \
                      такого вызова остановись, сообщи человеку, что план/итог готов и ждёт его решения, и НЕ \
                      продолжай работу дальше как будто переход уже произошёл. Переходы execution->validation и \
-                     validation->execution применяются сразу."
+                     validation->execution применяются сразу. КОНКРЕТНАЯ ЗАДАЧА может дополнительно (см. блок \
+                     «Состояние задачи» в этом же запросе) запрещать отдельные переходы совсем (тогда вызов \
+                     отклоняется — это инвариант, не обойти) или требовать подтверждения человека там, где по \
+                     умолчанию оно не нужно (тогда вызов ставится в ожидание, как и planning->execution/validation->done)."
                         .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -1061,8 +1171,19 @@ impl Agent {
                 )
             };
         }
+        // Абсолютный запрет инвариантом ЭТОЙ задачи (см.
+        // TaskState::blocked_transitions) — в отличие от гейта согласия ниже,
+        // модель не может провести этот переход НИКАК, даже поставив его в
+        // ожидание: снять запрет может только человек (agent task ... allow).
+        if current.transition_blocked(current.stage, stage) {
+            return format!(
+                "нет такого перехода: «{}» -> «{stage}» запрещён инвариантом ЭТОЙ задачи — это прямой \
+                 запрет, а не гейт согласия, снять его может только человек («agent task {} allow {} {stage}»)",
+                current.stage, self.name, current.stage
+            );
+        }
 
-        if current.stage.requires_approval_to(stage) {
+        if current.transition_requires_approval(current.stage, stage) {
             if let Err(err) = self.db.save_task_pending(&task_name, stage, &outcome) {
                 return format!("не удалось сохранить предложение перехода: {err:#}");
             }
@@ -1233,6 +1354,29 @@ impl Agent {
 
         let config = self.config();
         let mut messages = Vec::new();
+
+        // Долговременная память читается здесь, раньше остальных блоков ниже,
+        // потому что она — один из ТРЁХ источников глобальных инвариантов
+        // (файлы каталога инвариантов, записи долговременной памяти с
+        // категорией "invariant" — см. crate::invariants::from_long_term — и,
+        // отдельно, текстовые/структурные инварианты активной задачи ниже) —
+        // без повторного обращения к БД для одного и того же снимка.
+        let long_term = self.long_term_memory();
+
+        // Инварианты (см. crate::invariants) подмешиваются ПЕРВЫМ системным
+        // сообщением — раньше системного промпта, персонализации и памяти —
+        // потому что это самый приоритетный слой: все они могут ему
+        // противоречить, но не могут его отменить. Читаются заново на каждый
+        // запрос, как и профиль ниже, а не кешируются — файл каталога или
+        // запись долговременной памяти могли только что измениться. Пусто ->
+        // блок не добавляется, как и с пустой долговременной памятью/профилем.
+        let mut invariants = crate::invariants::load_all();
+        invariants.extend(crate::invariants::from_long_term(&long_term));
+        let invariants_block = crate::invariants::format_invariants_block(&invariants);
+        if !invariants_block.is_empty() {
+            messages.push(ChatMessage::system(invariants_block));
+        }
+
         if let Some(system_prompt) = &config.system_prompt {
             if !system_prompt.trim().is_empty() {
                 messages.push(ChatMessage::system(system_prompt.clone()));
@@ -1260,7 +1404,6 @@ impl Agent {
         // это ортогональная ось и её выключить нельзя, зато обе заполняются
         // только явно (Agent::remember/task_set), поэтому попадание сюда
         // лишнего исключено самой моделью данных, а не проверкой здесь.
-        let long_term = self.long_term_memory();
         if !long_term.is_empty() {
             messages.push(ChatMessage::system(crate::memory::format_long_term_block(&long_term)));
         }
@@ -1560,6 +1703,19 @@ impl Db {
                  key       TEXT NOT NULL,
                  value     TEXT NOT NULL,
                  PRIMARY KEY (task_name, key)
+             );
+             CREATE TABLE IF NOT EXISTS shared_task_invariants (
+                 task_name TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
+                 id        TEXT NOT NULL,
+                 text      TEXT NOT NULL,
+                 PRIMARY KEY (task_name, id)
+             );
+             CREATE TABLE IF NOT EXISTS shared_task_transition_rules (
+                 task_name  TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
+                 from_stage TEXT NOT NULL,
+                 to_stage   TEXT NOT NULL,
+                 kind       TEXT NOT NULL,
+                 PRIMARY KEY (task_name, from_stage, to_stage, kind)
              );
              CREATE TABLE IF NOT EXISTS agent_current_task (
                  agent_name TEXT PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
@@ -1882,6 +2038,30 @@ impl Db {
         let data: BTreeMap<String, String> = stmt
             .query_map([task_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
+        let mut inv_stmt = conn.prepare("SELECT id, text FROM shared_task_invariants WHERE task_name = ?1")?;
+        let invariants: BTreeMap<String, String> = inv_stmt
+            .query_map([task_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut rules_stmt =
+            conn.prepare("SELECT from_stage, to_stage, kind FROM shared_task_transition_rules WHERE task_name = ?1")?;
+        let rule_rows: Vec<(String, String, String)> = rules_stmt
+            .query_map([task_name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut blocked_transitions = BTreeSet::new();
+        let mut extra_approval_transitions = BTreeSet::new();
+        for (from_raw, to_raw, kind) in rule_rows {
+            let from: Stage = from_raw.parse().with_context(|| {
+                format!("некорректный этап «{from_raw}» в правиле перехода задачи «{task_name}»")
+            })?;
+            let to: Stage = to_raw.parse().with_context(|| {
+                format!("некорректный этап «{to_raw}» в правиле перехода задачи «{task_name}»")
+            })?;
+            match kind.as_str() {
+                "block" => blocked_transitions.insert((from, to)),
+                "approve" => extra_approval_transitions.insert((from, to)),
+                other => bail!("неизвестный тип правила перехода «{other}» в БД для задачи «{task_name}»"),
+            };
+        }
         Ok(Some(TaskState {
             name: task_name.to_string(),
             goal,
@@ -1892,6 +2072,9 @@ impl Db {
             paused,
             pending_stage,
             pending_outcome,
+            invariants,
+            blocked_transitions,
+            extra_approval_transitions,
         }))
     }
 
@@ -1988,6 +2171,48 @@ impl Db {
             rusqlite::params![task_name, key, value],
         )?;
         Ok(())
+    }
+
+    /// Сохраняет (или обновляет) текстовый инвариант, привязанный ТОЛЬКО к
+    /// этой задаче (см. [`crate::agent::Agent::task_invariant_set`]).
+    fn save_task_invariant(&self, task_name: &str, id: &str, text: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO shared_task_invariants (task_name, id, text) VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_name, id) DO UPDATE SET text = excluded.text",
+            rusqlite::params![task_name, id, text],
+        )?;
+        Ok(())
+    }
+
+    /// Удаляет инвариант задачи. Возвращает `true`, если он существовал.
+    fn delete_task_invariant(&self, task_name: &str, id: &str) -> Result<bool> {
+        let affected = self.conn().execute(
+            "DELETE FROM shared_task_invariants WHERE task_name = ?1 AND id = ?2",
+            rusqlite::params![task_name, id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Добавляет структурное правило автомата задачи — `kind` — `"block"`
+    /// (см. [`crate::memory::TaskState::blocked_transitions`]) или `"approve"`
+    /// (см. [`crate::memory::TaskState::extra_approval_transitions`]).
+    fn save_task_transition_rule(&self, task_name: &str, from: Stage, to: Stage, kind: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO shared_task_transition_rules (task_name, from_stage, to_stage, kind) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(task_name, from_stage, to_stage, kind) DO NOTHING",
+            rusqlite::params![task_name, from.as_str(), to.as_str(), kind],
+        )?;
+        Ok(())
+    }
+
+    /// Снимает структурное правило автомата задачи. Возвращает `true`, если оно существовало.
+    fn delete_task_transition_rule(&self, task_name: &str, from: Stage, to: Stage, kind: &str) -> Result<bool> {
+        let affected = self.conn().execute(
+            "DELETE FROM shared_task_transition_rules \
+             WHERE task_name = ?1 AND from_stage = ?2 AND to_stage = ?3 AND kind = ?4",
+            rusqlite::params![task_name, from.as_str(), to.as_str(), kind],
+        )?;
+        Ok(affected > 0)
     }
 
     /// Удаляет общую задачу целиком — каскадно удаляет и её данные
@@ -2201,6 +2426,15 @@ impl AgentManager {
     /// к каким задачам можно присоединиться командой `agent task <имя> join`.
     pub fn list_tasks(&self) -> Vec<SharedTaskSummary> {
         self.db.list_shared_tasks().unwrap_or_default()
+    }
+
+    /// Снимок всей долговременной памяти — как и [`Agent::long_term_memory`],
+    /// но без привязки к конкретному агенту (данные ОДНИ на всё приложение,
+    /// см. [`crate::memory`]): удобно там, где нужно показать (например,
+    /// глобальные инварианты категории `"invariant"`, см.
+    /// [`crate::invariants::from_long_term`]) их до выбора конкретного агента.
+    pub fn long_term_memory(&self) -> LongTermMemory {
+        self.db.load_long_term().unwrap_or_default()
     }
 
     /// Удаляет агента вместе со всей его историей диалога в БД.

@@ -35,11 +35,37 @@
 //!   llm-cli agent task <имя> approve                          -- применить переход, предложенный моделью
 //!   llm-cli agent task <имя> reject <причина>                 -- отклонить предложенный моделью переход
 //!   llm-cli agent task <имя> finish                           -- завершить задачу ДЛЯ ВСЕХ участников
+//!   llm-cli agent task <имя> invariant set <id> <текст>       -- инвариант ТОЛЬКО этой задачи
+//!   llm-cli agent task <имя> invariant remove <id>            -- снять инвариант этой задачи
+//!   llm-cli agent task <имя> forbid <из> <в>                  -- запретить переход для этой задачи (абсолютно)
+//!   llm-cli agent task <имя> allow <из> <в>                   -- снять запрет перехода
+//!   llm-cli agent task <имя> require-approval <из> <в>        -- доп. гейт согласия (для перехода МОДЕЛИ)
+//!   llm-cli agent task <имя> unrequire-approval <из> <в>      -- снять доп. гейт согласия
 //!   llm-cli agent tasks                                       -- список всех общих задач и их участников
 //!   llm-cli agent profile <имя>                    -- показать текущий профиль персонализации агента
 //!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
 //!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
 //!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
+//!   llm-cli agent invariants                       -- список жёстких инвариантов (общих для всех агентов)
+//!   llm-cli agent invariants show <id>             -- показать текст одного инварианта
+//!   llm-cli agent invariants create <id>           -- создать новый инвариант (пустой шаблон) на диске
+//!   llm-cli agent invariants remove <id>           -- удалить инвариант (единственный способ его снять)
+//!
+//! ## Инварианты (см. llm_core::invariants)
+//!   Три источника, каждый со своим масштабом действия:
+//!   - Глобальные-файлы: markdown в каталоге инвариантов (по умолчанию
+//!     `invariants/`, переопределяется `LLM_INVARIANTS_DIR`) — архитектура,
+//!     технические решения, ограничения по стеку, бизнес-правила.
+//!   - Глобальные-память: записи `agent remember <ключ> <текст> --category
+//!     invariant` — та же сила действия, без отдельного файла.
+//!   - Задачи: `agent task <имя> invariant set/remove` (текстовые) и
+//!     `agent task <имя> forbid/allow/require-approval/unrequire-approval`
+//!     (структурные — реально проверяются кодом, не только промптом) —
+//!     действуют ТОЛЬКО пока агент работает над этой конкретной задачей.
+//!
+//!   Оба глобальных источника подключаются ПЕРВЫМ системным сообщением к
+//!   каждому запросу — модель обязана отказываться от того, что их нарушает,
+//!   называя нарушенный инвариант и причину; задачные — часть блока задачи.
 //!
 //! ## Персонализация (см. llm_core::profile)
 //!   Отдельная от памяти ось: markdown-файл в каталоге профилей (по умолчанию
@@ -516,10 +542,78 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                         Ok(())
                     }
                 },
+                Some("invariant") => match args.get(3).map(String::as_str) {
+                    Some("set") => {
+                        let id = args.get(4).cloned().ok_or_else(|| {
+                            anyhow!("укажите id: llm-cli agent task {name} invariant set <id> <текст>")
+                        })?;
+                        let text = args.get(5..).map(|s| s.join(" ")).filter(|s| !s.is_empty()).ok_or_else(
+                            || anyhow!("укажите текст: llm-cli agent task {name} invariant set <id> <текст>"),
+                        )?;
+                        agent.task_invariant_set(&id, &text)?;
+                        println!(
+                            "Инвариант задачи «{id}» сохранён — обязателен наравне с глобальными, пока идёт \
+                             работа над этой задачей: {text}"
+                        );
+                        Ok(())
+                    }
+                    Some("remove") => {
+                        let id = args.get(4).cloned().ok_or_else(|| {
+                            anyhow!("укажите id: llm-cli agent task {name} invariant remove <id>")
+                        })?;
+                        if agent.task_invariant_remove(&id)? {
+                            println!("Инвариант задачи «{id}» удалён.");
+                        } else {
+                            println!("Инварианта задачи «{id}» нет.");
+                        }
+                        Ok(())
+                    }
+                    _ => bail!(
+                        "укажите действие: llm-cli agent task {name} invariant <set <id> <текст>|remove <id>>"
+                    ),
+                },
+                Some("forbid") => {
+                    let (from, to) = parse_transition_pair(&name, "forbid", &args[3..])?;
+                    agent.task_forbid_transition(from, to)?;
+                    println!(
+                        "Переход «{from}» -> «{to}» запрещён для этой задачи (абсолютно, не обойти даже \
+                         вручную) — снять: llm-cli agent task {name} allow {from} {to}"
+                    );
+                    Ok(())
+                }
+                Some("allow") => {
+                    let (from, to) = parse_transition_pair(&name, "allow", &args[3..])?;
+                    if agent.task_allow_transition(from, to)? {
+                        println!("Запрет на переход «{from}» -> «{to}» для этой задачи снят.");
+                    } else {
+                        println!("Переход «{from}» -> «{to}» для этой задачи и не был запрещён.");
+                    }
+                    Ok(())
+                }
+                Some("require-approval") => {
+                    let (from, to) = parse_transition_pair(&name, "require-approval", &args[3..])?;
+                    agent.task_require_approval(from, to)?;
+                    println!(
+                        "Переход «{from}» -> «{to}», предложенный МОДЕЛЬЮ, теперь для этой задачи \
+                         дополнительно требует подтверждения человеком — снять: llm-cli agent task {name} \
+                         unrequire-approval {from} {to}"
+                    );
+                    Ok(())
+                }
+                Some("unrequire-approval") => {
+                    let (from, to) = parse_transition_pair(&name, "unrequire-approval", &args[3..])?;
+                    if agent.task_unrequire_approval(from, to)? {
+                        println!("Дополнительное требование подтверждения на «{from}» -> «{to}» снято.");
+                    } else {
+                        println!("Для перехода «{from}» -> «{to}» дополнительного требования и не было.");
+                    }
+                    Ok(())
+                }
                 _ => {
                     bail!(
                         "укажите действие: llm-cli agent task {name} \
-                         <start|join|set|show|advance|step|expect|pause|resume|approve|reject|finish> ..."
+                         <start|join|set|show|advance|step|expect|pause|resume|approve|reject|finish|\
+                         invariant|forbid|allow|require-approval|unrequire-approval> ..."
                     );
                 }
             }
@@ -573,6 +667,54 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             }
             Some(other) => bail!("неизвестное действие «{other}» — llm-cli agent profiles [create <имя>]"),
         },
+        Some("invariants") => match args.get(1).map(String::as_str) {
+            Some("create") => {
+                let id = args
+                    .get(2)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("укажите идентификатор: llm-cli agent invariants create <id>"))?;
+                let path = llm_core::invariants::invariants_dir().join(format!("{id}.md"));
+                llm_core::invariants::create(&id, &llm_core::invariants::template(&id))?;
+                println!("Инвариант «{id}» создан: {}", path.display());
+                println!(
+                    "Отредактируйте файл, чтобы описать правило — оно подключится к каждому запросу \
+                     каждого агента без перезапуска."
+                );
+                Ok(())
+            }
+            Some("remove") => {
+                let id = args
+                    .get(2)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("укажите идентификатор: llm-cli agent invariants remove <id>"))?;
+                if llm_core::invariants::remove(&id)? {
+                    println!("Инвариант «{id}» удалён — его действие снято для всех агентов.");
+                } else {
+                    println!("Инварианта «{id}» нет в каталоге.");
+                }
+                Ok(())
+            }
+            Some("show") => {
+                let id = args
+                    .get(2)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("укажите идентификатор: llm-cli agent invariants show <id>"))?;
+                match llm_core::invariants::load(&id) {
+                    Some(content) => {
+                        println!("=== Инвариант «{id}» ===\n\n{content}");
+                        Ok(())
+                    }
+                    None => bail!("инвариант «{id}» не найден в каталоге инвариантов"),
+                }
+            }
+            None => {
+                print_invariants_list(Some(&manager.long_term_memory()));
+                Ok(())
+            }
+            Some(other) => {
+                bail!("неизвестное действие «{other}» — llm-cli agent invariants [show|create|remove] <id>")
+            }
+        },
         Some("tasks") => {
             let tasks = manager.list_tasks();
             if tasks.is_empty() {
@@ -603,7 +745,12 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
 /// только в хранилище.
 fn print_memory_overview(agent: &Agent) {
     let config = agent.config();
+    let long_term = agent.long_term_memory();
     println!("=== Память агента «{}» ===\n", agent.name());
+
+    println!("-- Инварианты (жёсткие правила, общие для ВСЕХ агентов, приоритетнее всего остального) --");
+    print_invariants_list(Some(&long_term));
+    println!();
 
     println!("-- Персонализация (профиль, отдельная ось — не память, а КАК отвечать) --");
     print_profile_status(agent);
@@ -629,7 +776,6 @@ fn print_memory_overview(agent: &Agent) {
     println!();
 
     println!("-- Долговременная (решения, знания — общая для ВСЕХ агентов) --");
-    let long_term = agent.long_term_memory();
     if long_term.is_empty() {
         println!("(пусто — llm-cli agent remember {} <ключ> <значение>)", agent.name());
     } else {
@@ -661,6 +807,36 @@ fn print_profile_status(agent: &Agent) {
     }
 }
 
+/// Печатает файловые инварианты и, если передана долговременная память,
+/// также инварианты без файла (категория `"invariant"`, см.
+/// llm_core::invariants::from_long_term) — оба источника глобальные, общие
+/// для ВСЕХ агентов, поэтому не принимает имя агента.
+fn print_invariants_list(long_term: Option<&llm_core::LongTermMemory>) {
+    let ids = llm_core::invariants::list_ids();
+    if ids.is_empty() {
+        println!(
+            "Файловых инвариантов пока нет в каталоге «{}» — создайте: llm-cli agent invariants create <id>.",
+            llm_core::invariants::invariants_dir().display()
+        );
+    } else {
+        println!("Каталог инвариантов: {}", llm_core::invariants::invariants_dir().display());
+        for id in ids {
+            println!("- {id}");
+        }
+    }
+    if let Some(long_term) = long_term {
+        let memory_invariants = llm_core::invariants::from_long_term(long_term);
+        if !memory_invariants.is_empty() {
+            println!(
+                "Инварианты из долговременной памяти (категория «invariant», без отдельного файла):"
+            );
+            for inv in memory_invariants {
+                println!("- [{}] {}", inv.id, inv.content);
+            }
+        }
+    }
+}
+
 fn print_task(task: &llm_core::TaskState) {
     match &task.goal {
         Some(goal) => println!("Задача «{}» (цель: {goal})", task.name),
@@ -678,6 +854,21 @@ fn print_task(task: &llm_core::TaskState) {
         let outcome = task.pending_outcome.as_deref().unwrap_or("(не указан)");
         println!("⏳ Предложен переход на этап «{pending}» (итог: {outcome}) — ждёт approve/reject");
     }
+    if !task.blocked_transitions.is_empty() {
+        let items: Vec<String> = task.blocked_transitions.iter().map(|(f, t)| format!("{f}->{t}")).collect();
+        println!("🚫 Запрещено инвариантом этой задачи: {}", items.join(", "));
+    }
+    if !task.extra_approval_transitions.is_empty() {
+        let items: Vec<String> =
+            task.extra_approval_transitions.iter().map(|(f, t)| format!("{f}->{t}")).collect();
+        println!("🔒 Дополнительно требует подтверждения (для переходов модели): {}", items.join(", "));
+    }
+    if !task.invariants.is_empty() {
+        println!("Инварианты этой задачи:");
+        for (id, text) in &task.invariants {
+            println!("  - [{id}] {text}");
+        }
+    }
     if task.data.is_empty() {
         println!("(данных пока нет)");
     } else {
@@ -685,6 +876,21 @@ fn print_task(task: &llm_core::TaskState) {
             println!("- {key} = {value}");
         }
     }
+}
+
+/// Разбирает пару этапов `<from> <to>` из хвоста аргументов подкоманд
+/// forbid/allow/require-approval/unrequire-approval — общая для всех четырёх,
+/// чтобы не повторять один и тот же разбор и текст ошибки четыре раза.
+fn parse_transition_pair(name: &str, action: &str, args: &[String]) -> Result<(llm_core::Stage, llm_core::Stage)> {
+    let from_raw = args
+        .first()
+        .ok_or_else(|| anyhow!("укажите этапы: llm-cli agent task {name} {action} <из-этапа> <в-этап>"))?;
+    let to_raw = args
+        .get(1)
+        .ok_or_else(|| anyhow!("укажите этапы: llm-cli agent task {name} {action} <из-этапа> <в-этап>"))?;
+    let from: llm_core::Stage = from_raw.parse()?;
+    let to: llm_core::Stage = to_raw.parse()?;
+    Ok((from, to))
 }
 
 fn print_agent_usage() {
@@ -711,11 +917,22 @@ fn print_agent_usage() {
          \x20 llm-cli agent task <имя> set <ключ> <значение>           (видно всем участникам задачи)\n\
          \x20 llm-cli agent task <имя> show                            (рабочая память задачи)\n\
          \x20 llm-cli agent task <имя> finish                          (завершает задачу ДЛЯ ВСЕХ участников)\n\
+         \x20 llm-cli agent task <имя> invariant set <id> <текст>      (инвариант ТОЛЬКО этой задачи)\n\
+         \x20 llm-cli agent task <имя> invariant remove <id>           (снять инвариант этой задачи)\n\
+         \x20 llm-cli agent task <имя> forbid <из> <в>                 (запретить переход для этой задачи, абсолютно)\n\
+         \x20 llm-cli agent task <имя> allow <из> <в>                  (снять запрет перехода)\n\
+         \x20 llm-cli agent task <имя> require-approval <из> <в>       (доп. гейт согласия — только для переходов модели)\n\
+         \x20 llm-cli agent task <имя> unrequire-approval <из> <в>     (снять доп. гейт согласия)\n\
          \x20 llm-cli agent tasks                                      (список всех общих задач и их участников)\n\
          \x20 llm-cli agent profile <имя>                              (показать текущий профиль персонализации)\n\
          \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
          \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
-         \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)"
+         \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)\n\
+         \x20 llm-cli agent invariants                                 (жёсткие правила, общие для ВСЕХ агентов)\n\
+         \x20 llm-cli agent invariants show <id>                       (показать текст одного инварианта)\n\
+         \x20 llm-cli agent invariants create <id>                     (создать новый инвариант — пустой шаблон)\n\
+         \x20 llm-cli agent invariants remove <id>                     (снять инвариант — удалить его файл)\n\
+         \x20 llm-cli agent remember <имя> <ключ> <текст> --category invariant  (глобальный инвариант без файла)"
     );
 }
 

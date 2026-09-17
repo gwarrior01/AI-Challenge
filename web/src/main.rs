@@ -120,6 +120,16 @@ struct CreateProfileRequest {
     content: Option<String>,
 }
 
+/// Тело запроса на создание нового инварианта (см. llm_core::invariants::create) —
+/// `content` не задан → используется пустой шаблон (llm_core::invariants::template).
+/// В отличие от профиля инвариант ни к какому агенту не привязан — общий для всех.
+#[derive(Deserialize)]
+struct CreateInvariantRequest {
+    id: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct CheckpointRequest {
     label: String,
@@ -363,6 +373,37 @@ async fn create_profile(Json(req): Json<CreateProfileRequest>) -> Json<serde_jso
     let content = req.content.unwrap_or_else(|| llm_core::profile::template(&req.name));
     match llm_core::profile::create(&req.name, &content) {
         Ok(()) => Json(serde_json::json!({ "profiles": llm_core::list_profiles() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Список ВСЕХ инвариантов (см. llm_core::invariants) вместе с их текстом —
+/// в отличие от профилей это не выбор для конкретного агента, а полный набор
+/// правил, действующих сразу для всех, поэтому отдаём содержимое целиком, а
+/// не только идентификаторы (фронтенду нужно показать текст, не просто список).
+async fn list_invariants() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "invariants": llm_core::invariants::load_all(),
+        "dir": llm_core::invariants::invariants_dir().display().to_string(),
+    }))
+}
+
+/// Создаёт новый инвариант на диске (см. llm_core::invariants::create) — как
+/// и профиль, заводится через интерфейс, а не правкой файлов руками. Ошибка,
+/// если идентификатор пустой или инвариант с таким id уже существует.
+async fn create_invariant(Json(req): Json<CreateInvariantRequest>) -> Json<serde_json::Value> {
+    let content = req.content.unwrap_or_else(|| llm_core::invariants::template(&req.id));
+    match llm_core::invariants::create(&req.id, &content) {
+        Ok(()) => Json(serde_json::json!({ "invariants": llm_core::invariants::load_all() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Удаляет инвариант по идентификатору (см. llm_core::invariants::remove) —
+/// единственный способ снять его действие для всех агентов сразу.
+async fn delete_invariant(Path(id): Path<String>) -> Json<serde_json::Value> {
+    match llm_core::invariants::remove(&id) {
+        Ok(_) => Json(serde_json::json!({ "invariants": llm_core::invariants::load_all() })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -622,6 +663,139 @@ async fn task_reject_agent(
     }
 }
 
+/// Тело запроса на инвариант, привязанный ТОЛЬКО к задаче (см.
+/// llm_core::memory::TaskState::invariants) — в отличие от глобальных
+/// (`/api/invariants`, `/api/agents/:name/remember` с category="invariant"),
+/// виден и действует только пока агент работает над этой задачей.
+#[derive(Deserialize)]
+struct TaskInvariantRequest {
+    id: String,
+    text: String,
+}
+
+/// Сохраняет текстовый инвариант задачи — см. `Agent::task_invariant_set`.
+async fn task_invariant_set_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskInvariantRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_invariant_set(&req.id, &req.text) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Удаляет инвариант задачи — см. `Agent::task_invariant_remove`.
+async fn task_invariant_remove_agent(
+    State(state): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.task_invariant_remove(&id) {
+        Ok(_) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Тело запроса на структурное правило перехода автомата задачи (см.
+/// llm_core::memory::TaskState::blocked_transitions/extra_approval_transitions) —
+/// `from`/`to` — машинные имена этапов (planning/execution/validation/done).
+#[derive(Deserialize)]
+struct TaskTransitionRuleRequest {
+    from: String,
+    to: String,
+}
+
+fn parse_transition_rule_request(
+    req: &TaskTransitionRuleRequest,
+) -> anyhow::Result<(llm_core::Stage, llm_core::Stage)> {
+    Ok((req.from.parse()?, req.to.parse()?))
+}
+
+/// Дополнительно ЗАПРЕЩАЕТ переход для этой задачи (абсолютно) — см.
+/// `Agent::task_forbid_transition`.
+async fn task_forbid_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskTransitionRuleRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let (from, to) = match parse_transition_rule_request(&req) {
+        Ok(pair) => pair,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
+    match agent.task_forbid_transition(from, to) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Снимает запрет, поставленный `task_forbid_agent` — см. `Agent::task_allow_transition`.
+async fn task_allow_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskTransitionRuleRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let (from, to) = match parse_transition_rule_request(&req) {
+        Ok(pair) => pair,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
+    match agent.task_allow_transition(from, to) {
+        Ok(_) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Требует для этой задачи подтверждения человеком на переход, предложенный
+/// МОДЕЛЬЮ — см. `Agent::task_require_approval`.
+async fn task_require_approval_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskTransitionRuleRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let (from, to) = match parse_transition_rule_request(&req) {
+        Ok(pair) => pair,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
+    match agent.task_require_approval(from, to) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Снимает гейт, поставленный `task_require_approval_agent` — см.
+/// `Agent::task_unrequire_approval`.
+async fn task_unrequire_approval_agent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<TaskTransitionRuleRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let (from, to) = match parse_transition_rule_request(&req) {
+        Ok(pair) => pair,
+        Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+    };
+    match agent.task_unrequire_approval(from, to) {
+        Ok(_) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
 /// Список всех существующих общих задач с их участниками — не привязан к
 /// конкретному агенту, используется фронтендом, чтобы предложить задачи,
 /// доступные для `.../task/join`.
@@ -792,6 +966,11 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/strategy", post(set_agent_strategy))
         .route("/api/agents/:name/profile", post(set_agent_profile))
         .route("/api/profiles", get(list_profiles).post(create_profile))
+        .route(
+            "/api/invariants",
+            get(list_invariants).post(create_invariant),
+        )
+        .route("/api/invariants/:id", axum::routing::delete(delete_invariant))
         .route("/api/agents/:name/checkpoint", post(create_checkpoint))
         .route("/api/agents/:name/branch", post(create_branch))
         .route("/api/agents/:name/switch", post(switch_branch))
@@ -808,6 +987,15 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/task/approve", post(task_approve_agent))
         .route("/api/agents/:name/task/reject", post(task_reject_agent))
         .route("/api/agents/:name/task/finish", post(task_finish_agent))
+        .route("/api/agents/:name/task/invariant", post(task_invariant_set_agent))
+        .route(
+            "/api/agents/:name/task/invariant/:id",
+            axum::routing::delete(task_invariant_remove_agent),
+        )
+        .route("/api/agents/:name/task/forbid", post(task_forbid_agent))
+        .route("/api/agents/:name/task/allow", post(task_allow_agent))
+        .route("/api/agents/:name/task/require-approval", post(task_require_approval_agent))
+        .route("/api/agents/:name/task/unrequire-approval", post(task_unrequire_approval_agent))
         .route("/api/tasks", get(list_tasks))
         .with_state(state);
 

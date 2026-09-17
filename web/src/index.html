@@ -926,48 +926,80 @@
     white-space: pre-wrap;
   }
 
-  /* Markdown, отрендеренный из ответа модели */
-  .challenge-answer > :first-child { margin-top: 0; }
-  .challenge-answer > :last-child { margin-bottom: 0; }
+  /* Markdown, отрендеренный из ответа модели (renderMarkdown) — общий класс
+     .markdown-body переиспользуется везде, где рендерится markdown-ответ
+     модели: здесь (вкладка "Задача · 4 способа") и в пузырях чата (.bubble/
+     .agent-message, см. addRow/renderAgentMessage) — контейнер задаёт свой
+     цвет/фон/отступы сам, а эти правила только про вложенные элементы. */
+  .challenge-answer > :first-child,
+  .markdown-body > :first-child { margin-top: 0; }
+  .challenge-answer > :last-child,
+  .markdown-body > :last-child { margin-bottom: 0; }
+
+  /* Пузыри чата по умолчанию сохраняют переносы строк как есть (white-space:
+     pre-wrap, см. .bubble/.agent-message) — это верно для простого текста
+     (ошибки/системные пометки), но ломает обычное перетекание markdown-абзаца
+     (перенос строки внутри одного абзаца исходника не должен становиться
+     жёстким разрывом). .markdown-body сбрасывает это в normal, как у
+     .challenge-answer, который таким же свойством и не пользуется. */
+  .markdown-body {
+    white-space: normal;
+  }
 
   .challenge-answer h1,
   .challenge-answer h2,
   .challenge-answer h3,
   .challenge-answer h4,
   .challenge-answer h5,
-  .challenge-answer h6 {
+  .challenge-answer h6,
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3,
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 {
     margin: 14px 0 6px;
     font-weight: 600;
     line-height: 1.3;
   }
 
-  .challenge-answer h1 { font-size: 18px; }
-  .challenge-answer h2 { font-size: 16.5px; }
-  .challenge-answer h3 { font-size: 15px; }
+  .challenge-answer h1, .markdown-body h1 { font-size: 18px; }
+  .challenge-answer h2, .markdown-body h2 { font-size: 16.5px; }
+  .challenge-answer h3, .markdown-body h3 { font-size: 15px; }
   .challenge-answer h4,
   .challenge-answer h5,
-  .challenge-answer h6 { font-size: 13.5px; }
+  .challenge-answer h6,
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 { font-size: 13.5px; }
 
-  .challenge-answer p {
+  .challenge-answer p,
+  .markdown-body p {
     margin: 0 0 10px;
   }
 
   .challenge-answer ul,
-  .challenge-answer ol {
+  .challenge-answer ol,
+  .markdown-body ul,
+  .markdown-body ol {
     margin: 0 0 10px;
     padding-left: 22px;
   }
 
-  .challenge-answer li {
+  .challenge-answer li,
+  .markdown-body li {
     margin: 3px 0;
   }
 
   .challenge-answer li > ul,
-  .challenge-answer li > ol {
+  .challenge-answer li > ol,
+  .markdown-body li > ul,
+  .markdown-body li > ol {
     margin: 3px 0 3px;
   }
 
-  .challenge-answer code {
+  .challenge-answer code,
+  .markdown-body code {
     background: var(--challenge-surface-2);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -976,7 +1008,8 @@
     font-size: 12.5px;
   }
 
-  .challenge-answer pre {
+  .challenge-answer pre,
+  .markdown-body pre {
     margin: 0 0 10px;
     padding: 10px 12px;
     background: var(--challenge-surface-2);
@@ -985,7 +1018,8 @@
     overflow-x: auto;
   }
 
-  .challenge-answer pre code {
+  .challenge-answer pre code,
+  .markdown-body pre code {
     background: none;
     border: none;
     padding: 0;
@@ -994,28 +1028,33 @@
     white-space: pre;
   }
 
-  .challenge-answer blockquote {
+  .challenge-answer blockquote,
+  .markdown-body blockquote {
     margin: 0 0 10px;
     padding: 4px 12px;
     border-left: 3px solid var(--accent);
     color: var(--muted);
   }
 
-  .challenge-answer hr {
+  .challenge-answer hr,
+  .markdown-body hr {
     margin: 14px 0;
     border: none;
     border-top: 1px solid var(--border);
   }
 
-  .challenge-answer a {
+  .challenge-answer a,
+  .markdown-body a {
     color: var(--accent);
   }
 
-  .challenge-answer strong {
+  .challenge-answer strong,
+  .markdown-body strong {
     font-weight: 700;
   }
 
-  .challenge-answer table {
+  .challenge-answer table,
+  .markdown-body table {
     border-collapse: collapse;
     margin: 0 0 10px;
     width: 100%;
@@ -1023,7 +1062,9 @@
   }
 
   .challenge-answer th,
-  .challenge-answer td {
+  .challenge-answer td,
+  .markdown-body th,
+  .markdown-body td {
     border: 1px solid var(--border);
     padding: 5px 8px;
     text-align: left;
@@ -1037,7 +1078,8 @@
   }
 
   /* KaTeX по умолчанию рисует формулы чёрным текстом — подгоняем под тёмную тему. */
-  .challenge-answer .katex { color: var(--text); font-size: 1.05em; }
+  .challenge-answer .katex,
+  .markdown-body .katex { color: var(--text); font-size: 1.05em; }
 
   /* ---------- Вкладка "Температура" ---------- */
 
@@ -1982,6 +2024,16 @@
        выше: не память, а КАК агент должен отвечать. См. renderMemoryPanel. -->
   <div class="memory-panel" id="agent-memory-panel" hidden>
     <div class="memory-section">
+      <h4>🚫 Инварианты — жёсткие правила (общие для ВСЕХ агентов, приоритетнее всего остального)</h4>
+      <div class="card-hint">Заданы отдельно от диалога; агент обязан отказываться от того, что им противоречит.</div>
+      <ul class="memory-kv-list" id="agent-invariants-list"></ul>
+      <div class="memory-kv-form">
+        <input type="text" id="agent-new-invariant-id" placeholder="id инварианта (напр. stack)">
+        <input type="text" id="agent-new-invariant-content" placeholder="текст правила">
+        <button type="button" class="settings-btn" id="agent-new-invariant-btn">+ Создать инвариант</button>
+      </div>
+    </div>
+    <div class="memory-section">
       <h4>🎭 Персонализация — профиль (отдельная ось: КАК отвечать, не память)</h4>
       <div class="card-hint" id="agent-profile-status"></div>
       <div class="memory-kv-form">
@@ -2294,7 +2346,21 @@ function addRow(role, text) {
   row.className = 'row ' + role;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = text;
+  // Markdown рендерится и для запроса пользователя, и для ответа модели
+  // (renderMarkdown/renderMathIn — та же функция, что и у вкладки "Задача ·
+  // 4 способа", см. её определение ниже) — служебные строки (ошибка,
+  // отметка о сжатии контекста) остаются простым текстом, их сути форматирование
+  // не нужно, а лишний парсинг мог бы неожиданно превратить в разметку то, что
+  // никогда не было markdown (например, техническое сообщение об ошибке).
+  if (role === 'user' || role === 'assistant') {
+    const body = document.createElement('div');
+    body.className = 'markdown-body';
+    body.innerHTML = renderMarkdown(text);
+    bubble.appendChild(body);
+    renderMathIn(body);
+  } else {
+    bubble.textContent = text;
+  }
   row.appendChild(bubble);
   chatEl.appendChild(row);
   scrollToBottom();
@@ -3341,6 +3407,13 @@ const agentProfileSelectEl = document.getElementById('agent-profile-select');
 const agentProfileSetBtnEl = document.getElementById('agent-profile-set-btn');
 const agentNewProfileNameEl = document.getElementById('agent-new-profile-name');
 const agentNewProfileBtnEl = document.getElementById('agent-new-profile-btn');
+// Инварианты (см. llm_core::invariants) — в отличие от профиля, ни к какому
+// агенту не привязаны: один общий список для всех, поэтому здесь нет
+// select'а переключения, только список действующих правил + форма создания.
+const agentInvariantsListEl = document.getElementById('agent-invariants-list');
+const agentNewInvariantIdEl = document.getElementById('agent-new-invariant-id');
+const agentNewInvariantContentEl = document.getElementById('agent-new-invariant-content');
+const agentNewInvariantBtnEl = document.getElementById('agent-new-invariant-btn');
 
 // Список профилей персонализации (см. llm_core::profile::list_profiles), не
 // привязан к конкретному агенту — обновляется через fetchProfiles() и
@@ -3378,10 +3451,83 @@ async function fetchProfiles() {
   }
 }
 
+// Список инвариантов (см. llm_core::invariants::load_all) — общий для всех
+// агентов, читается заново при каждом открытии панели памяти, как и профили.
+async function fetchInvariants() {
+  try {
+    const res = await fetch('/api/invariants');
+    const data = await res.json();
+    renderInvariantsList(data.invariants || []);
+  } catch (e) {
+    // сеть недоступна — оставляем предыдущий снимок
+  }
+}
+
+function renderInvariantsList(invariants) {
+  agentInvariantsListEl.innerHTML = invariants.length
+    ? invariants
+        .map(
+          (inv) => `
+        <li>
+          <span class="memory-kv-cat">[${escapeHtml(inv.id)}]</span>
+          <span class="memory-kv-text">${escapeHtml(inv.content)}</span>
+          <button type="button" class="memory-forget-btn" data-id="${escapeHtml(inv.id)}" title="Удалить (снять инвариант)">✕</button>
+        </li>`
+        )
+        .join('')
+    : '<li class="card-hint">Пусто — агент сейчас не ограничен ни одним инвариантом.</li>';
+  agentInvariantsListEl.querySelectorAll('.memory-forget-btn').forEach((btn) => {
+    btn.addEventListener('click', () => deleteInvariant(btn.dataset.id));
+  });
+}
+
+async function deleteInvariant(id) {
+  agentMemoryErrorEl.hidden = true;
+  try {
+    const res = await fetch(`/api/invariants/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.error) {
+      showMemoryError(data.error);
+      return;
+    }
+    renderInvariantsList(data.invariants || []);
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+}
+
+agentNewInvariantBtnEl.addEventListener('click', async () => {
+  const id = agentNewInvariantIdEl.value.trim();
+  const content = agentNewInvariantContentEl.value.trim();
+  if (!id || !content) {
+    showMemoryError('Укажите id и текст инварианта.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  try {
+    const res = await fetch('/api/invariants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, content }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      showMemoryError(data.error);
+      return;
+    }
+    agentNewInvariantIdEl.value = '';
+    agentNewInvariantContentEl.value = '';
+    renderInvariantsList(data.invariants || []);
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+});
+
 agentMemoryToggleBtn.addEventListener('click', async () => {
   agentMemoryPanelEl.hidden = !agentMemoryPanelEl.hidden;
   if (!agentMemoryPanelEl.hidden) {
     await fetchProfiles();
+    await fetchInvariants();
     if (currentAgentChatName) renderMemoryPanel(findAgentInfo(currentAgentChatName));
   }
 });
@@ -4008,9 +4154,24 @@ function renderAgentMessage(msg) {
     return row;
   }
   const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
-  const text = document.createElement('span');
-  text.textContent = prefix + msg.text;
-  row.appendChild(text);
+  // Markdown — только для user/assistant (сути диалога), как и в addRow
+  // простого чата: "Ошибка: ..." — техническое сообщение, не ответ модели,
+  // ему форматирование не нужно и могло бы неожиданно превратить в разметку
+  // то, что markdown-ом не было.
+  if (msg.role === 'user' || msg.role === 'assistant') {
+    if (prefix) {
+      row.appendChild(document.createTextNode(prefix));
+    }
+    const body = document.createElement('div');
+    body.className = 'markdown-body';
+    body.innerHTML = renderMarkdown(msg.text);
+    row.appendChild(body);
+    renderMathIn(body);
+  } else {
+    const text = document.createElement('span');
+    text.textContent = prefix + msg.text;
+    row.appendChild(text);
+  }
 
   const tokens = msg.role === 'user' ? msg.requestTokens : msg.role === 'assistant' ? msg.responseTokens : null;
   const usage = msg.role === 'user' ? msg.requestUsage : msg.role === 'assistant' ? msg.usage : null;
