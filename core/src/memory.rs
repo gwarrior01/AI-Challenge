@@ -58,7 +58,7 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Одна запись долговременной памяти: значение и произвольная категория
@@ -81,7 +81,7 @@ pub type LongTermMemory = BTreeMap<String, LongTermItem>;
 /// проверки) — см. [`Stage::allowed_next`]. Прямых переходов через этап
 /// (например, `planning → validation`) автомат не допускает — см.
 /// [`crate::agent::Agent::task_advance`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     #[default]
@@ -224,6 +224,52 @@ pub struct TaskState {
     /// `pending_stage`.
     #[serde(default)]
     pub pending_outcome: Option<String>,
+    /// Текстовые инварианты, привязанные ТОЛЬКО к этой задаче — обязательны
+    /// наравне с глобальными (см. [`crate::invariants`] и [`crate::agent::Agent::handle_request`]),
+    /// но действуют и видны ТОЛЬКО пока агент присоединён именно к этой
+    /// задаче: например, правило конкретного отчёта или клиента, не нужное
+    /// после `task finish`. Заполняются явно —
+    /// [`crate::agent::Agent::task_invariant_set`]/[`crate::agent::Agent::task_invariant_remove`].
+    #[serde(default)]
+    pub invariants: BTreeMap<String, String>,
+    /// Переходы автомата, дополнительно ЗАПРЕЩЁННЫЕ для этой конкретной
+    /// задачи сверх общей карты [`Stage::allowed_next`] — например, "для
+    /// этой задачи откат `validation -> execution` не имеет смысла, запретить
+    /// совсем". Это абсолютный запрет: в отличие от `extra_approval_transitions`
+    /// ниже, действует одинаково и на ручной переход человеком
+    /// ([`crate::agent::Agent::task_advance`]), и на переход, предложенный
+    /// моделью (`move_stage`) — снять его может только человек
+    /// ([`crate::agent::Agent::task_allow_transition`]).
+    #[serde(default)]
+    pub blocked_transitions: BTreeSet<(Stage, Stage)>,
+    /// Переходы, которые для этой задачи ДОПОЛНИТЕЛЬНО требуют подтверждения
+    /// человеком сверх двух переходов, гейтящихся всегда
+    /// ([`Stage::requires_approval_to`]) — например, "для этой задачи откат
+    /// `validation -> execution` тоже нужно подтверждать, а не только выход
+    /// из planning и объявление done". В отличие от `blocked_transitions`
+    /// выше, это гейт СОГЛАСИЯ, а не запрет — он действует только на переход,
+    /// который предлагает МОДЕЛЬ (`move_stage`): ручной `task_advance` — это
+    /// и так решение человека, гейтить его нечем и незачем.
+    #[serde(default)]
+    pub extra_approval_transitions: BTreeSet<(Stage, Stage)>,
+}
+
+impl TaskState {
+    /// `true`, если переход `from -> to` дополнительно запрещён инвариантом
+    /// ЭТОЙ задачи (см. `blocked_transitions`) — проверяется и в
+    /// [`crate::agent::Agent::task_advance`], и в переходе, предложенном
+    /// моделью, независимо от того, разрешён ли он общей картой автомата.
+    pub fn transition_blocked(&self, from: Stage, to: Stage) -> bool {
+        self.blocked_transitions.contains(&(from, to))
+    }
+
+    /// `true`, если переход `from -> to`, предложенный МОДЕЛЬЮ, требует
+    /// подтверждения человеком — либо это один из двух переходов, гейтящихся
+    /// всегда ([`Stage::requires_approval_to`]), либо дополнительный гейт,
+    /// заданный инвариантом этой задачи (`extra_approval_transitions`).
+    pub fn transition_requires_approval(&self, from: Stage, to: Stage) -> bool {
+        from.requires_approval_to(to) || self.extra_approval_transitions.contains(&(from, to))
+    }
 }
 
 /// Краткая сводка одной общей задачи для списков (см.
@@ -259,12 +305,38 @@ pub fn format_task_block(task: &TaskState) -> String {
     } else {
         task.data.iter().map(|(k, v)| format!("- {k} = {v}")).collect::<Vec<_>>().join("\n")
     };
+    let invariants_suffix = format_task_invariants_block(task);
+    let invariants_suffix =
+        if invariants_suffix.is_empty() { String::new() } else { format!("\n\n{invariants_suffix}") };
     format!(
         "Рабочая память текущей задачи «{}»{goal_suffix} — общая для всех агентов, присоединившихся \
          к этой задаче (данные явно сохранены командой «agent task set», видны всем участникам и будут \
-         удалены для всех сразу при завершении задачи — «agent task finish»):\n\n{}\n\n{body}",
+         удалены для всех сразу при завершении задачи — «agent task finish»):\n\n{}\n\n{body}{invariants_suffix}",
         task.name,
         format_stage_block(task),
+    )
+}
+
+/// Форматирует текстовые инварианты, привязанные ТОЛЬКО к этой задаче (см.
+/// [`TaskState::invariants`]) — пустая строка, если их нет. Как и глобальные
+/// (см. [`crate::invariants::format_invariants_block`]), формулировка не
+/// просит "иметь в виду", а прямо предписывает отказываться от решений,
+/// нарушающих хотя бы один пункт, называя нарушенный и причину — с той же
+/// силой, что и глобальные, но действует только пока идёт работа над этой
+/// конкретной задачей (после `task finish` пункты пропадают вместе с задачей).
+pub fn format_task_invariants_block(task: &TaskState) -> String {
+    if task.invariants.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = task.invariants.iter().map(|(id, text)| format!("- [{id}] {text}")).collect();
+    format!(
+        "ИНВАРИАНТЫ ЭТОЙ ЗАДАЧИ («{}») — обязательны наравне с жёсткими инвариантами проекта выше, но, \
+         в отличие от них, действуют ТОЛЬКО пока идёт работа над этой задачей (заведены командой \
+         «agent task <имя> invariant set», снимаются «agent task <имя> invariant remove»). При конфликте \
+         с запросом — откажись от нарушающей части, назови нарушенный пункт и причину, как и с глобальными \
+         инвариантами:\n\n{}",
+        task.name,
+        lines.join("\n")
     )
 }
 
@@ -278,6 +350,26 @@ pub fn format_task_block(task: &TaskState) -> String {
 /// диалога.
 pub fn format_stage_block(task: &TaskState) -> String {
     let mut lines = vec![format!("Состояние задачи (конечный автомат): этап = {}", task.stage)];
+    // Структурные инварианты автомата ЭТОЙ задачи (см. TaskState::blocked_transitions/
+    // extra_approval_transitions) — показываются всегда, независимо от паузы/ожидающего
+    // перехода ниже, потому что это факт об устройстве автомата, а не о текущем моменте.
+    if !task.blocked_transitions.is_empty() {
+        let items: Vec<String> =
+            task.blocked_transitions.iter().map(|(from, to)| format!("{from} → {to}")).collect();
+        lines.push(format!(
+            "🚫 ЗАПРЕЩЕНО инвариантом этой задачи (абсолютно, не обойти даже вручную): {}",
+            items.join(", ")
+        ));
+    }
+    if !task.extra_approval_transitions.is_empty() {
+        let items: Vec<String> =
+            task.extra_approval_transitions.iter().map(|(from, to)| format!("{from} → {to}")).collect();
+        lines.push(format!(
+            "🔒 Для этой задачи ДОПОЛНИТЕЛЬНО требуют подтверждения человеком (сверх обычных гейтов \
+             планирования/итога), если предлагаешь их сама через move_stage: {}",
+            items.join(", ")
+        ));
+    }
     if let Some(step) = task.current_step.as_deref().filter(|s| !s.trim().is_empty()) {
         lines.push(format!("Текущий шаг: {step}"));
     }

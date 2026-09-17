@@ -56,6 +56,18 @@
 //! заводит новый профиль (пустой шаблон на диске, см. llm_core::profile::create)
 //! прямо из интерфейса — без правки файлов руками (создание агента (n) в
 //! расширенном режиме тоже спрашивает профиль отдельным шагом мастера).
+//!
+//! И **инварианты** (см. llm_core::invariants) — самая приоритетная ось,
+//! показанная первой в этом же экране: жёсткие правила (архитектура, стек,
+//! бизнес-правила), общие для ВСЕХ агентов (не выбираются на агента, как
+//! профиль), подключаются первым системным сообщением к каждому запросу.
+//! Команды `invariants new <id>`/`invariants remove <id>` заводят/снимают
+//! глобальный (файловый) инвариант прямо из интерфейса; список действующих
+//! виден в самом экране. Инварианты ТОЛЬКО этой задачи (текстовые — `task
+//! invariant set <id> <текст>`/`invariant remove <id>`, и структурные —
+//! `task forbid/allow/require-approval/unrequire-approval <из> <в>`, реально
+//! проверяемые кодом на переходах автомата, а не только текстом) показаны в
+//! секции "Рабочая — данные ОБЩЕЙ задачи" того же экрана.
 
 use anyhow::Result;
 use crossterm::{
@@ -1776,6 +1788,23 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
+        "Инварианты — жёсткие правила (общие для ВСЕХ агентов, приоритетнее всего остального)",
+        section_style,
+    )));
+    let invariant_ids = llm_core::invariants::list_ids();
+    if invariant_ids.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  пусто — команда: invariants new <id>",
+            hint_style,
+        )));
+    } else {
+        for id in &invariant_ids {
+            lines.push(Line::from(format!("  - {id}")));
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
         "Персонализация — профиль (отдельная ось: КАК отвечать, не память)",
         section_style,
     )));
@@ -1849,6 +1878,28 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )));
             }
+            if !task.blocked_transitions.is_empty() {
+                let items: Vec<String> =
+                    task.blocked_transitions.iter().map(|(f, t)| format!("{f}->{t}")).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  🚫 запрещено инвариантом задачи: {}", items.join(", ")),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            if !task.extra_approval_transitions.is_empty() {
+                let items: Vec<String> =
+                    task.extra_approval_transitions.iter().map(|(f, t)| format!("{f}->{t}")).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  🔒 доп. согласие для модели: {}", items.join(", ")),
+                    hint_style,
+                )));
+            }
+            if !task.invariants.is_empty() {
+                lines.push(Line::from("  инварианты этой задачи:"));
+                for (id, text) in &task.invariants {
+                    lines.push(Line::from(format!("    - [{id}] {text}")));
+                }
+            }
             if task.data.is_empty() {
                 lines.push(Line::from(Span::styled("  (данных пока нет)", hint_style)));
             } else {
@@ -1905,7 +1956,9 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
             " Команды: remember <ключ> <значение> [--category CAT] · forget <ключ> · \
              task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · \
              task advance <этап> [--step T] [--expect T] · task pause · task resume · \
-             task approve · task reject <причина> · task finish · profile <профиль|none> · profile new <имя>"
+             task approve · task reject <причина> · task finish · task invariant set/remove <id> [текст] · \
+             task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
+             profile new <имя> · invariants new <id> · invariants remove <id>"
                 .to_string(),
             Color::DarkGray,
         ),
@@ -1934,6 +1987,17 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
 /// строки статуса — `Ok` при успехе, `Err` при ошибке (некорректная команда
 /// или отказ метода `Agent`, например повторный `task start`/`join` без
 /// предварительного `finish`).
+/// Разбирает пару этапов `<из> <в>` из хвоста команд forbid/allow/
+/// require-approval/unrequire-approval (см. [`run_memory_command`]) — общая
+/// для всех четырёх: `tokens[2]` — исходный этап, `tokens[3]` — целевой.
+fn parse_tui_transition_pair(tokens: &[&str], action: &str) -> Result<(llm_core::Stage, llm_core::Stage), String> {
+    let from_raw = tokens.get(2).copied().ok_or_else(|| format!("укажите этапы: task {action} <из> <в>"))?;
+    let to_raw = tokens.get(3).copied().ok_or_else(|| format!("укажите этапы: task {action} <из> <в>"))?;
+    let from: llm_core::Stage = from_raw.parse().map_err(|err: anyhow::Error| err.to_string())?;
+    let to: llm_core::Stage = to_raw.parse().map_err(|err: anyhow::Error| err.to_string())?;
+    Ok((from, to))
+}
+
 fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, String> {
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     match tokens.first().copied() {
@@ -2057,13 +2121,55 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
                 Ok(None) => Ok("Активной задачи не было.".to_string()),
                 Err(err) => Err(err.to_string()),
             },
+            Some("invariant") => match tokens.get(1).copied() {
+                Some("set") => {
+                    let id = tokens.get(2).copied().ok_or("укажите id: task invariant set <id> <текст>")?;
+                    let text = tokens.get(3..).map(|s| s.join(" ")).filter(|s| !s.is_empty())
+                        .ok_or("укажите текст: task invariant set <id> <текст>")?;
+                    agent.task_invariant_set(id, &text).map_err(|err| err.to_string())?;
+                    Ok(format!("Инвариант задачи «{id}» сохранён."))
+                }
+                Some("remove") => {
+                    let id = tokens.get(2).copied().ok_or("укажите id: task invariant remove <id>")?;
+                    match agent.task_invariant_remove(id).map_err(|err| err.to_string())? {
+                        true => Ok(format!("Инвариант задачи «{id}» удалён.")),
+                        false => Err(format!("инварианта задачи «{id}» нет")),
+                    }
+                }
+                _ => Err("укажите действие: task invariant set <id> <текст> | task invariant remove <id>".to_string()),
+            },
+            Some("forbid") => {
+                let (from, to) = parse_tui_transition_pair(&tokens, "forbid")?;
+                agent.task_forbid_transition(from, to).map_err(|err| err.to_string())?;
+                Ok(format!("Переход «{from}» -> «{to}» запрещён для этой задачи (абсолютно)."))
+            }
+            Some("allow") => {
+                let (from, to) = parse_tui_transition_pair(&tokens, "allow")?;
+                match agent.task_allow_transition(from, to).map_err(|err| err.to_string())? {
+                    true => Ok(format!("Запрет на «{from}» -> «{to}» снят.")),
+                    false => Err(format!("переход «{from}» -> «{to}» и не был запрещён")),
+                }
+            }
+            Some("require-approval") => {
+                let (from, to) = parse_tui_transition_pair(&tokens, "require-approval")?;
+                agent.task_require_approval(from, to).map_err(|err| err.to_string())?;
+                Ok(format!("Переход «{from}» -> «{to}» (модели) теперь требует подтверждения человеком."))
+            }
+            Some("unrequire-approval") => {
+                let (from, to) = parse_tui_transition_pair(&tokens, "unrequire-approval")?;
+                match agent.task_unrequire_approval(from, to).map_err(|err| err.to_string())? {
+                    true => Ok(format!("Доп. требование подтверждения на «{from}» -> «{to}» снято.")),
+                    false => Err(format!("для «{from}» -> «{to}» доп. требования и не было")),
+                }
+            }
             Some("show") => Ok("Текущее состояние показано выше.".to_string()),
             Some(other) => Err(format!(
                 "неизвестное действие «{other}» — task start/join/set/show/advance/step/expect/pause/resume/\
-                 approve/reject/finish"
+                 approve/reject/finish/invariant/forbid/allow/require-approval/unrequire-approval"
             )),
             None => Err(
-                "укажите действие: task start/join/set/show/advance/step/expect/pause/resume/approve/reject/finish"
+                "укажите действие: task start/join/set/show/advance/step/expect/pause/resume/approve/reject/\
+                 finish/invariant/forbid/allow/require-approval/unrequire-approval"
                     .to_string(),
             ),
         },
@@ -2086,7 +2192,23 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             }
             None => Err("укажите профиль: profile <профиль|none> или profile new <имя>".to_string()),
         },
-        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile")),
+        Some("invariants") => match tokens.get(1).copied() {
+            Some("new") => {
+                let id = tokens.get(2).copied().ok_or("укажите id: invariants new <id>")?;
+                llm_core::invariants::create(id, &llm_core::invariants::template(id))
+                    .map_err(|err| err.to_string())?;
+                Ok(format!("Инвариант «{id}» создан — отредактируйте файл, чтобы описать правило."))
+            }
+            Some("remove") => {
+                let id = tokens.get(2).copied().ok_or("укажите id: invariants remove <id>")?;
+                match llm_core::invariants::remove(id).map_err(|err| err.to_string())? {
+                    true => Ok(format!("Инвариант «{id}» удалён — его действие снято для всех агентов.")),
+                    false => Err(format!("инварианта «{id}» нет в каталоге")),
+                }
+            }
+            _ => Err("укажите действие: invariants new <id> или invariants remove <id>".to_string()),
+        },
+        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile/invariants")),
         None => Ok(String::new()),
     }
 }

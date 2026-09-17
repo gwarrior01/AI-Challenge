@@ -19,6 +19,9 @@ pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskSta
 pub mod profile;
 pub use profile::{list_profiles, DEFAULT_PROFILE, NONE_PROFILE};
 
+pub mod invariants;
+pub use invariants::Invariant;
+
 pub mod pricing;
 pub use pricing::Pricing;
 
