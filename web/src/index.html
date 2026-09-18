@@ -3674,7 +3674,11 @@ function renderTaskBar(task) {
 
   // Переход, предложенный моделью вызовом инструмента move_stage и ждущий
   // approve/reject человеком (см. llm_core::memory::TaskState::pending_stage).
-  if (task.pending_stage) {
+  // Пока агент отвечает, панель не показываем: модель предлагает переход в
+  // первом же круге вызова инструментов, а сам ответ (план, итог) пишет
+  // следующим — иначе просьба утвердить появлялась бы раньше того, что
+  // утверждать. Панель появляется вместе с ответом.
+  if (task.pending_stage && agentTaskWorkingFor !== currentAgentChatName) {
     agentTaskPendingBlockEl.hidden = false;
     syncRejectButton();
     agentTaskPendingLineEl.textContent =
@@ -4688,7 +4692,8 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
     clearInterval(taskPoll);
     agentTaskWorkingFor = null;
     if (currentAgentChatName === name) {
-      renderTaskWorking(currentTaskSnapshot);
+      // Ответ уже в чате — теперь можно показать и предложенный переход.
+      renderTaskBar(currentTaskSnapshot);
       agentChatSendBtn.disabled = false;
       agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
       agentChatInputEl.focus();

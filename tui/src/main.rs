@@ -1749,15 +1749,18 @@ fn task_stage_spans(task: Option<&llm_core::TaskState>, working: bool) -> Vec<Sp
     };
     let mut spans =
         vec![Span::raw("  ·  этап: "), Span::styled(task.stage.as_str().to_uppercase(), stage_style)];
+    // Пока агент отвечает, «ждёт утверждения» не показываем: модель
+    // предлагает переход раньше, чем дописывает сам ответ (план, итог), —
+    // просьба утвердить появлялась бы раньше того, что утверждать.
     if task.paused {
         spans.push(Span::styled(" ⏸ пауза", Style::default().fg(Color::Yellow)));
+    } else if working {
+        spans.push(Span::styled(" — агент работает…", Style::default().fg(Color::DarkGray)));
     } else if let Some(pending) = task.pending_stage {
         spans.push(Span::styled(
             format!(" ⏳ ждёт утверждения → {pending}"),
             Style::default().fg(Color::Yellow),
         ));
-    } else if working {
-        spans.push(Span::styled(" — агент работает…", Style::default().fg(Color::DarkGray)));
     }
     spans
 }
