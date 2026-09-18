@@ -14,7 +14,10 @@ pub mod context;
 pub use context::ContextStrategy;
 
 pub mod memory;
-pub use memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState};
+pub use memory::{
+    LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState, TransitionActor, TransitionOutcome,
+    TransitionRecord,
+};
 
 pub mod profile;
 pub use profile::{list_profiles, DEFAULT_PROFILE, NONE_PROFILE};
@@ -327,6 +330,25 @@ impl LlmClient {
             model,
             context_window_override,
         })
+    }
+
+    /// Клиент для тестов, не зависящий от переменных окружения. Адрес
+    /// заведомо недоступен — тесты не должны ходить в сеть.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::for_tests_at("http://127.0.0.1:9")
+    }
+
+    /// Клиент для тестов, обращающийся к фиктивному серверу по `base_url`.
+    #[cfg(test)]
+    pub(crate) fn for_tests_at(base_url: &str) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.to_string(),
+            api_key: "test".to_string(),
+            model: "test-model".to_string(),
+            context_window_override: None,
+        }
     }
 
     /// Название используемой модели.

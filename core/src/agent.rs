@@ -76,7 +76,10 @@
 //! противоречить, но не отменяют его. Задачные — часть блока задачи
 //! ([`crate::memory::format_task_block`]), видны только пока задача активна.
 
-use crate::memory::{LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState};
+use crate::memory::{
+    LongTermItem, LongTermMemory, SharedTaskSummary, Stage, TaskState, TransitionActor, TransitionOutcome,
+    TransitionRecord,
+};
 use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClient, Usage};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
@@ -95,6 +98,21 @@ pub const MAIN_BRANCH: &str = "main";
 /// модели на вызовах инструментов автомата задачи, а не архитектурное
 /// ограничение самого автомата.
 const MAX_TOOL_ROUNDS: usize = 6;
+
+/// Как часто [`Agent::handle_request`] проверяет, не поставили ли задачу на
+/// паузу, пока ждёт ответа LLM.
+const PAUSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Ответ человеку вместо ответа модели, прерванного паузой (см. [`AgentReply::interrupted`]).
+const INTERRUPTED_BY_PAUSE: &str = "⏸ Задача поставлена на паузу.";
+
+/// Предлагать ли модели инструменты автомата (`move_stage`/`update_step`):
+/// только пока есть активная задача, она не на паузе, не конечная и не ждёт
+/// утверждения человеком уже предложенного перехода — во всех этих случаях
+/// модель и так не должна двигать автомат (см. [`Agent::handle_request`]).
+fn task_tools_offered(task: Option<&TaskState>) -> bool {
+    task.map(|t| !t.paused && t.stage != Stage::Done && t.pending_stage.is_none()).unwrap_or(false)
+}
 
 /// Складывает метрики токенов/стоимости двух обменов — используется, чтобы
 /// показать пользователю честную сумму по всем кругам вызова инструментов
@@ -327,6 +345,11 @@ pub struct AgentReply {
     /// стоимость всего диалога (а не только этого обмена), пересчитывают её
     /// сами по сохранённым в истории метрикам токенов.
     pub cost: Option<AgentCost>,
+    /// `true`, если задачу поставили на паузу, пока шёл запрос к LLM: запрос
+    /// оборван, ответ модели отброшен и не сохранён в историю, а `text` —
+    /// пояснение для человека. Сам запрос запомнен в задаче и уйдёт заново
+    /// при возобновлении (см. [`Agent::task_resume`]).
+    pub interrupted: bool,
 }
 
 /// Стоимость одного обмена, разложенная на входную и выходную часть — так
@@ -673,17 +696,14 @@ impl Agent {
         }
         if let Some(current) = self.db.agent_task_name(&self.name)? {
             bail!(
-                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её \
-                 (agent task {} finish), прежде чем начинать новую",
-                self.name,
+                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её, прежде чем \
+                 начинать новую",
                 self.name
             );
         }
         if self.db.shared_task_exists(name)? {
             bail!(
-                "задача «{name}» уже существует — чтобы присоединиться к ней, используйте \
-                 «agent task {} join {name}» вместо start",
-                self.name
+                "задача «{name}» уже существует — присоединитесь к ней вместо создания новой"
             );
         }
         self.db.create_shared_task(name, goal)?;
@@ -703,16 +723,14 @@ impl Agent {
         }
         if let Some(current) = self.db.agent_task_name(&self.name)? {
             bail!(
-                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её \
-                 (agent task {} finish), прежде чем присоединяться к другой",
-                self.name,
+                "у агента «{}» уже есть активная задача «{current}» — сначала завершите её, прежде чем \
+                 присоединяться к другой",
                 self.name
             );
         }
         if !self.db.shared_task_exists(name)? {
             bail!(
-                "задача «{name}» не найдена — чтобы создать её, используйте «agent task {} start {name}»",
-                self.name
+                "задача «{name}» не найдена — сначала создайте её"
             );
         }
         self.db.set_agent_task(&self.name, name)?;
@@ -729,10 +747,8 @@ impl Agent {
         }
         let task_name = self.db.agent_task_name(&self.name)?.ok_or_else(|| {
             anyhow!(
-                "у агента «{}» нет активной задачи — сначала «agent task {} start <название>» \
-                 или «agent task {} join <название>»",
-                self.name,
-                self.name,
+                "у агента «{}» нет активной задачи — сначала создайте задачу или присоединитесь \
+                 к существующей",
                 self.name
             )
         })?;
@@ -806,10 +822,8 @@ impl Agent {
     fn current_task_name(&self) -> Result<String> {
         self.db.agent_task_name(&self.name)?.ok_or_else(|| {
             anyhow!(
-                "у агента «{}» нет активной задачи — сначала «agent task {} start <название>» \
-                 или «agent task {} join <название>»",
-                self.name,
-                self.name,
+                "у агента «{}» нет активной задачи — сначала создайте задачу или присоединитесь \
+                 к существующей",
                 self.name
             )
         })
@@ -827,42 +841,75 @@ impl Agent {
         let current = self.db.load_shared_task(&task_name)?.ok_or_else(|| {
             anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)")
         })?;
-        if current.paused {
-            bail!(
-                "задача «{task_name}» на паузе — сначала «agent task {} resume», прежде чем переходить \
-                 на другой этап",
-                self.name
-            );
-        }
-        if current.stage != stage {
+        let changes_stage = current.stage != stage;
+        let refusal = if current.paused {
+            Some(format!(
+                "задача «{task_name}» на паузе — сначала возобновите её, прежде чем переходить на другой этап"
+            ))
+        } else if changes_stage && !current.stage.allowed_next().contains(&stage) {
             let allowed = current.stage.allowed_next();
-            if !allowed.contains(&stage) {
-                let options = if allowed.is_empty() {
-                    "нет — это конечный этап".to_string()
-                } else {
-                    allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                };
-                bail!(
-                    "нельзя перейти из этапа «{}» сразу в «{stage}» — допустимые следующие этапы: {options}",
-                    current.stage
-                );
-            }
-            // Абсолютный запрет инвариантом ЭТОЙ задачи (см.
-            // TaskState::blocked_transitions) — в отличие от гейтов согласия
-            // ниже, действует одинаково и на ручной переход человеком, и на
-            // переход, предложенный моделью (см. tool_move_stage): снять его
-            // может только человек, а не сам этот вызов.
-            if current.transition_blocked(current.stage, stage) {
-                bail!(
-                    "переход «{}» -> «{stage}» запрещён инвариантом задачи «{task_name}» (не временное \
-                     ограничение, а прямой запрет) — снять его: «agent task {} allow {} {stage}»",
+            let options = if allowed.is_empty() {
+                "нет — это конечный этап".to_string()
+            } else {
+                allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            };
+            Some(format!(
+                "нельзя перейти из этапа «{}» сразу в «{stage}» — допустимые следующие этапы: {options}",
+                current.stage
+            ))
+        // Абсолютный запрет инвариантом ЭТОЙ задачи (см.
+        // TaskState::blocked_transitions) — в отличие от гейтов согласия,
+        // действует одинаково и на ручной переход человеком, и на переход,
+        // предложенный моделью (см. tool_move_stage): снять его может только
+        // человек, а не сам этот вызов.
+        } else if changes_stage && current.transition_blocked(current.stage, stage) {
+            Some(format!(
+                "переход «{}» -> «{stage}» запрещён инвариантом задачи «{task_name}» (не временное \
+                 ограничение, а прямой запрет) — сначала снимите запрет на этот переход",
+                current.stage
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            if changes_stage {
+                self.db.log_transition(
+                    &task_name,
                     current.stage,
-                    self.name,
-                    current.stage
-                );
+                    stage,
+                    TransitionActor::Human,
+                    TransitionOutcome::Refused,
+                    &reason,
+                )?;
             }
+            bail!(reason);
         }
         self.db.save_task_stage(&task_name, stage, step, expected_action)?;
+        if !changes_stage {
+            return Ok(());
+        }
+        self.db.log_transition(
+            &task_name,
+            current.stage,
+            stage,
+            TransitionActor::Human,
+            TransitionOutcome::Applied,
+            "ручной переход",
+        )?;
+        // Ручной переход — решение человека, и оно заменяет ждущее утверждения
+        // предложение модели: сделанное с прежнего этапа, оно устарело, а его
+        // поздний approve увёл бы задачу туда, откуда её уже провели дальше.
+        if let Some(pending) = current.pending_stage {
+            self.db.clear_task_pending(&task_name)?;
+            self.db.log_transition(
+                &task_name,
+                current.stage,
+                pending,
+                TransitionActor::Human,
+                TransitionOutcome::Rejected,
+                &format!("предложение снято: человек сам перевёл задачу в «{stage}»"),
+            )?;
+        }
         Ok(())
     }
 
@@ -929,18 +976,47 @@ impl Agent {
     /// Снимает паузу — задача продолжается с того же этапа/шага/ожидаемого
     /// действия, на которых была приостановлена: ничего из этого не терялось
     /// (хранилось в БД, не в памяти процесса), поэтому агенту не нужно заново
-    /// объяснять контекст — он снова придёт в каждом запросе автоматически.
-    pub fn task_resume(&self) -> Result<()> {
+    /// объяснять контекст — он снова придёт в каждом запросе автоматически,
+    /// вместе с итогами пройденных этапов (`TaskState::stage_path`).
+    ///
+    /// Возвращает служебное продолжение, которое интерфейс сразу отправляет
+    /// агенту через [`Agent::continue_task`] (в чате его не видно): ответить на
+    /// запрос, ответ на который оборвала пауза ([`TaskState::interrupted_prompt`],
+    /// сам запрос уже в истории), иначе — продолжить незавершённый этап
+    /// ([`crate::memory::resume_followup`]);
+    /// `None` — если задача не была на паузе или агенту сейчас нечего делать
+    /// самому (задача завершена или ждёт решения человека по переходу).
+    pub fn task_resume(&self) -> Result<Option<String>> {
         let task_name = self.current_task_name()?;
+        let current = self
+            .db
+            .load_shared_task(&task_name)?
+            .ok_or_else(|| anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)"))?;
+        if !current.paused {
+            return Ok(None);
+        }
         self.db.save_task_paused(&task_name, false)?;
-        Ok(())
+        // Ответ на запрос человека оборвала пауза — агент отвечает на него.
+        if let Some(prompt) = current.interrupted_prompt {
+            self.db.save_task_interrupted_prompt(&task_name, None)?;
+            return Ok(Some(crate::memory::interrupted_request_followup(&prompt)));
+        }
+        Ok(crate::memory::resume_followup(&current))
     }
 
     /// Применяет переход, который модель предложила вызовом `move_stage`, но
     /// который требовал утверждения человеком (см. [`Stage::requires_approval_to`],
     /// `TaskState::pending_stage`) — единственный способ провести такой переход.
-    /// Ошибка, если утверждать сейчас нечего.
-    pub fn task_approve(&self) -> Result<()> {
+    /// Ошибка, если утверждать сейчас нечего или задача на паузе — как и
+    /// [`Agent::task_advance`], утверждение сдвигает этап, а на паузе автомат
+    /// заморожен: сначала [`Agent::task_resume`] (предложение при этом не теряется).
+    /// Ошибка и тогда, когда после предложения переход запретили инвариантом
+    /// задачи ([`Agent::task_forbid_transition`]).
+    ///
+    /// Возвращает служебное продолжение ([`crate::memory::approval_followup`]),
+    /// которое интерфейс сразу отправляет агенту через [`Agent::continue_task`],
+    /// чтобы работа на новом этапе началась без ещё одного ручного сообщения.
+    pub fn task_approve(&self) -> Result<String> {
         let task_name = self.current_task_name()?;
         let current = self
             .db
@@ -949,31 +1025,91 @@ impl Agent {
         let Some(pending) = current.pending_stage else {
             bail!("у задачи «{task_name}» нет перехода, ожидающего утверждения");
         };
+        if current.paused {
+            let reason = format!(
+                "задача «{task_name}» на паузе — сначала возобновите её, прежде чем утверждать переход \
+                 (предложение сохранено и никуда не денется)"
+            );
+            self.db.log_transition(
+                &task_name,
+                current.stage,
+                pending,
+                TransitionActor::Human,
+                TransitionOutcome::Refused,
+                &reason,
+            )?;
+            bail!(reason);
+        }
+        // Предложение проверялось в момент вызова move_stage, но с тех пор человек
+        // мог запретить этот переход инвариантом задачи — утверждение не должно
+        // обходить такой запрет. Предложение при отказе не снимается: его можно
+        // отклонить (reject) или, сняв запрет, утвердить. (Этап же под
+        // предложением сменить нельзя — task_advance снимает предложение сам.)
+        if current.transition_blocked(current.stage, pending) {
+            let reason = format!(
+                "переход «{}» -> «{pending}» запрещён инвариантом задачи «{task_name}» — утвердить его нельзя; \
+                 отклоните предложение или сначала снимите запрет на этот переход",
+                current.stage
+            );
+            self.db.log_transition(
+                &task_name,
+                current.stage,
+                pending,
+                TransitionActor::Human,
+                TransitionOutcome::Refused,
+                &reason,
+            )?;
+            bail!(reason);
+        }
         self.db.save_task_stage(&task_name, pending, None, None)?;
         self.db.clear_task_pending(&task_name)?;
-        Ok(())
+        self.db.log_transition(
+            &task_name,
+            current.stage,
+            pending,
+            TransitionActor::Human,
+            TransitionOutcome::Approved,
+            current.pending_outcome.as_deref().unwrap_or(""),
+        )?;
+        Ok(crate::memory::approval_followup(current.stage, pending))
     }
 
     /// Отклоняет предложенный моделью переход — этап остаётся прежним,
-    /// `pending_stage`/`pending_outcome` снимаются, а `note` ложится в
-    /// «Ожидаемое действие», чтобы модель увидела причину отказа в следующем
-    /// запросе и могла предложить переход заново. Ошибка, если отклонять
-    /// сейчас нечего.
-    pub fn task_reject(&self, note: &str) -> Result<()> {
+    /// `pending_stage`/`pending_outcome` снимаются. Причина обязательна: это
+    /// единственное, из чего модель узнаёт, что исправлять, — она ложится в
+    /// журнал переходов, а блок статуса задачи (см.
+    /// [`crate::memory::format_task_block`]) показывает модели последнее
+    /// отклонение, пока она не предложит переход заново. В «Ожидаемое
+    /// действие» причина не пишется: после пересмотра она осталась бы там
+    /// устаревшей, а журнал хранит её и так.
+    ///
+    /// Возвращает сообщение агенту (см. [`crate::memory::rejection_followup`]),
+    /// которое интерфейс отправляет от имени человека сразу после отклонения,
+    /// чтобы этап был переработан без ещё одного ручного сообщения. Ошибка, если
+    /// отклонять сейчас нечего или причина пустая.
+    pub fn task_reject(&self, note: &str) -> Result<String> {
         let task_name = self.current_task_name()?;
         let current = self
             .db
             .load_shared_task(&task_name)?
             .ok_or_else(|| anyhow!("задача «{task_name}» не найдена (была удалена параллельно?)"))?;
-        if current.pending_stage.is_none() {
+        let Some(pending) = current.pending_stage else {
             bail!("у задачи «{task_name}» нет перехода, ожидающего утверждения");
+        };
+        let note = note.trim();
+        if note.is_empty() {
+            bail!("укажите причину отклонения — без неё агенту нечего исправлять");
         }
         self.db.clear_task_pending(&task_name)?;
-        let note = note.trim();
-        if !note.is_empty() {
-            self.db.save_task_stage(&task_name, current.stage, None, Some(note))?;
-        }
-        Ok(())
+        self.db.log_transition(
+            &task_name,
+            current.stage,
+            pending,
+            TransitionActor::Human,
+            TransitionOutcome::Rejected,
+            note,
+        )?;
+        Ok(crate::memory::rejection_followup(current.stage, pending, note))
     }
 
     /// Описания инструментов автомата задачи (function calling) — единственная
@@ -988,15 +1124,16 @@ impl Agent {
                 description:
                     "Предложить переход конечного автомата задачи на другой этап (planning/execution/\
                      validation/done). Программа сверяет переход с картой — легально только: planning->execution, \
-                     execution->validation, validation->execution (доработка), validation->done. НЕЛЬЗЯ прыгать \
+                     execution->validation, execution->planning (пересмотр плана), validation->execution \
+                     (доработка), validation->done. НЕЛЬЗЯ прыгать \
                      через этап (например, из planning сразу в done, минуя execution/validation) — такой вызов \
                      будет отклонён с объяснением, куда можно перейти прямо сейчас; если это случилось, вызови \
                      move_stage ЕЩЁ РАЗ с тем этапом, что назван в объяснении как легальный, а не бросай работу \
                      над задачей на середине. Переходы planning->execution и validation->done требуют \
                      подтверждения человека: вызов НЕ применит переход сразу, а поставит его в ожидание — после \
                      такого вызова остановись, сообщи человеку, что план/итог готов и ждёт его решения, и НЕ \
-                     продолжай работу дальше как будто переход уже произошёл. Переходы execution->validation и \
-                     validation->execution применяются сразу. КОНКРЕТНАЯ ЗАДАЧА может дополнительно (см. блок \
+                     продолжай работу дальше как будто переход уже произошёл. Переходы execution->validation, \
+                     execution->planning и validation->execution применяются сразу. КОНКРЕТНАЯ ЗАДАЧА может дополнительно (см. блок \
                      «Состояние задачи» в этом же запросе) запрещать отдельные переходы совсем (тогда вызов \
                      отклоняется — это инвариант, не обойти) или требовать подтверждения человека там, где по \
                      умолчанию оно не нужно (тогда вызов ставится в ожидание, как и planning->execution/validation->done)."
@@ -1083,6 +1220,27 @@ impl Agent {
             }
 
             if completion.tool_calls.is_empty() {
+                // Живой прогон показал: после отклонения модель переписывает
+                // план по замечанию, но может так и не вызвать move_stage —
+                // тогда человеку нечего утверждать, а модель просит
+                // «подтвердить». Один принудительный круг, где доступен
+                // только move_stage, доводит переработку до нового предложения.
+                if self.awaiting_reproposal() {
+                    wire.push(crate::RequestMessage::from(&ChatMessage::assistant(completion.content.clone())));
+                    wire.push(crate::RequestMessage::from(&ChatMessage::user(
+                        "[Автомат задачи] Ты переработал результат этапа по замечанию, но не предложил переход \
+                         заново — человеку нечего утверждать. Вызови move_stage: в outcome — кратко переработанный \
+                         результат и что изменено по замечанию.",
+                    )));
+                    let move_stage_only: Vec<_> =
+                        tools.iter().filter(|t| t.name == "move_stage").cloned().collect();
+                    let forced =
+                        self.client.chat_with_tools(model, &wire, &move_stage_only, true, options).await?;
+                    usage_total = sum_usage(usage_total, forced.usage);
+                    for call in &forced.tool_calls {
+                        self.execute_task_tool(call);
+                    }
+                }
                 return Ok(crate::ChatCompletion {
                     content: visible_parts.join("\n\n"),
                     usage: usage_total,
@@ -1113,6 +1271,15 @@ impl Agent {
             usage: usage_total,
             tool_calls: Vec::new(),
             ..completion
+        })
+    }
+
+    /// `true`, если человек отклонил переход с текущего этапа, а модель ещё не
+    /// предложила его заново (см. [`crate::memory::active_rejection`]) — и
+    /// автомат сейчас позволяет ей это сделать.
+    fn awaiting_reproposal(&self) -> bool {
+        self.task_state().is_some_and(|task| {
+            task_tools_offered(Some(&task)) && crate::memory::active_rejection(&task).is_some()
         })
     }
 
@@ -1153,15 +1320,22 @@ impl Agent {
             Ok(None) => return format!("задачи «{task_name}» больше нет — вызов не применён"),
             Err(err) => return format!("не удалось прочитать задачу: {err:#}"),
         };
-        if current.paused {
-            return "задача на паузе — вызовы инструментов сейчас не обрабатываются".to_string();
-        }
-        if let Some(pending) = current.pending_stage {
-            return format!("уже ждёт утверждения перехода в «{pending}» — дождись решения человека");
-        }
-        if current.stage == stage || !current.stage.allowed_next().contains(&stage) {
-            let allowed = current.stage.allowed_next();
-            return if allowed.is_empty() {
+        // Журнал — лучшая попытка: результат вызова модели не должен теряться
+        // из-за сбоя записи, как и с историей диалога в handle_request.
+        let log = |outcome_kind: TransitionOutcome, reason: &str| {
+            if let Err(err) =
+                self.db.log_transition(&task_name, current.stage, stage, TransitionActor::Model, outcome_kind, reason)
+            {
+                eprintln!("не удалось записать переход в журнал задачи: {err:#}");
+            }
+        };
+        let allowed = current.stage.allowed_next();
+        let refusal = if current.paused {
+            Some("задача на паузе — вызовы инструментов сейчас не обрабатываются".to_string())
+        } else if let Some(pending) = current.pending_stage {
+            Some(format!("уже ждёт утверждения перехода в «{pending}» — дождись решения человека"))
+        } else if current.stage == stage || !allowed.contains(&stage) {
+            Some(if allowed.is_empty() {
                 format!("нет такого перехода: этап «{}» конечный", current.stage)
             } else {
                 format!(
@@ -1169,37 +1343,80 @@ impl Agent {
                     current.stage,
                     allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                 )
-            };
-        }
+            })
         // Абсолютный запрет инвариантом ЭТОЙ задачи (см.
         // TaskState::blocked_transitions) — в отличие от гейта согласия ниже,
         // модель не может провести этот переход НИКАК, даже поставив его в
         // ожидание: снять запрет может только человек (agent task ... allow).
-        if current.transition_blocked(current.stage, stage) {
-            return format!(
+        } else if current.transition_blocked(current.stage, stage) {
+            Some(format!(
                 "нет такого перехода: «{}» -> «{stage}» запрещён инвариантом ЭТОЙ задачи — это прямой \
-                 запрет, а не гейт согласия, снять его может только человек («agent task {} allow {} {stage}»)",
-                current.stage, self.name, current.stage
-            );
+                 запрет, а не гейт согласия, снять его может только человек",
+                current.stage
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            log(TransitionOutcome::Refused, &reason);
+            return reason;
         }
 
         if current.transition_requires_approval(current.stage, stage) {
             if let Err(err) = self.db.save_task_pending(&task_name, stage, &outcome) {
                 return format!("не удалось сохранить предложение перехода: {err:#}");
             }
+            log(TransitionOutcome::Proposed, &outcome);
             format!(
-                "Переход в «{stage}» предложен и ждёт подтверждения человека (команда «agent task {0} approve» \
-                 или «agent task {0} reject <причина>»). Остановись, сообщи об этом человеку и жди — не веди \
-                 себя так, будто переход уже произошёл.",
-                self.name
+                "Переход в «{stage}» предложен и ждёт подтверждения человека — он может утвердить переход или \
+                 отклонить его с причиной. Остановись, сообщи об этом человеку и жди — не веди себя так, будто \
+                 переход уже произошёл. {}",
+                crate::memory::APPROVAL_IS_NOT_A_CHAT_MESSAGE
             )
         } else {
             let previous = current.stage;
             if let Err(err) = self.db.save_task_stage(&task_name, stage, None, None) {
                 return format!("не удалось применить переход: {err:#}");
             }
+            log(TransitionOutcome::Applied, &outcome);
             format!("Переход применён: этап теперь «{stage}» (было «{previous}»). Итог: {outcome}")
         }
+    }
+
+    /// Если `prompt` просит перескочить обязательный этап (см.
+    /// [`crate::memory::skip_request_target`]), записывает отказ в журнал
+    /// переходов и возвращает текст ответа, который уйдёт пользователю вместо
+    /// ответа модели. На паузе не срабатывает — там модель и так ничего не
+    /// делает по задаче (см. [`crate::memory::format_task_block`]).
+    fn refuse_stage_skip(&self, task: &TaskState, prompt: &str) -> Option<String> {
+        if task.paused {
+            return None;
+        }
+        let target = crate::memory::skip_request_target(task.stage, prompt)?;
+        let reply = match task.stage {
+            Stage::Planning => "⛔ Этап планирования пропустить нельзя: реализация начинается только после \
+                 утверждённого плана (сейчас этап «planning»). Опишите требования или попросите предложить план — \
+                 когда я предложу переход в execution, утвердите его. Если план действительно не нужен, переведите \
+                 задачу в execution вручную."
+                .to_string(),
+            _ => format!(
+                "⛔ Завершить задачу без проверки нельзя: из «{}» путь только в validation, а в done — только \
+                 после проверки и подтверждения человеком. Когда реализация будет готова, я переведу задачу на \
+                 проверку.",
+                task.stage
+            ),
+        };
+        if let Err(err) = self.db.log_transition(
+            &task.name,
+            task.stage,
+            target,
+            TransitionActor::Human,
+            TransitionOutcome::Refused,
+            "просьба в сообщении перескочить этап — перехвачена до обращения к модели",
+        ) {
+            eprintln!("не удалось записать переход в журнал задачи: {err:#}");
+        }
+        Some(reply)
     }
 
     fn tool_update_step(&self, arguments: &str) -> String {
@@ -1348,6 +1565,22 @@ impl Agent {
     /// управления контекстом. Если агент остановлен, запрос отклоняется без
     /// обращения к сети.
     pub async fn handle_request(&self, prompt: &str) -> Result<AgentReply> {
+        self.exchange(prompt, true).await
+    }
+
+    /// Служебное продолжение работы по задаче — после утверждения перехода,
+    /// снятия паузы и т.п. (см. [`Agent::task_approve`], [`Agent::task_resume`]):
+    /// `instruction` уходит модели только в этом запросе и НЕ сохраняется в
+    /// историю диалога — человек его не писал, поэтому ни в чате, ни при
+    /// загрузке истории его не видно; сохраняется лишь ответ агента.
+    pub async fn continue_task(&self, instruction: &str) -> Result<AgentReply> {
+        self.exchange(instruction, false).await
+    }
+
+    /// Общий путь [`Agent::handle_request`] и [`Agent::continue_task`]:
+    /// `from_human` — реплику написал человек (сохраняется в историю и
+    /// проверяется на просьбу перескочить этап) или это служебное продолжение.
+    async fn exchange(&self, prompt: &str, from_human: bool) -> Result<AgentReply> {
         if !self.is_running() {
             bail!("агент «{}» остановлен — сначала запустите его", self.name);
         }
@@ -1416,10 +1649,15 @@ impl Agent {
         // конечная и не ждёт утверждения человеком уже предложенного перехода — во всех этих
         // случаях модель и так не должна двигать автомат, поэтому инструменты просто не даются
         // (см. документацию Stage::directive/format_stage_block, откуда модель узнаёт, почему).
-        let tools_active = active_task
+        let tools_active = task_tools_offered(active_task.as_ref());
+        // Просьба перескочить обязательный этап перехватывается ДО модели (см.
+        // crate::memory::skip_request_target): переход автомат не пропустит и
+        // так, но без этого модель могла бы послушаться и написать реализацию
+        // или финал прямо текстом ответа, оставив этап прежним.
+        let stage_skip_refusal = active_task
             .as_ref()
-            .map(|t| !t.paused && t.stage != Stage::Done && t.pending_stage.is_none())
-            .unwrap_or(false);
+            .filter(|_| from_human)
+            .and_then(|task| self.refuse_stage_skip(task, prompt));
 
         let window = config.window_size.unwrap_or_else(context::sliding_window_size);
         let window_raw = window * context::RAW_MESSAGES_PER_EXCHANGE;
@@ -1470,37 +1708,72 @@ impl Agent {
         };
 
         let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
-        let completion = if tools_active {
-            self.run_tool_loop(&model, &messages, &options).await?
+        // Пауза, поставленная ПОКА идёт этот запрос, обрывает его (см.
+        // unless_paused): ответ, полученный уже после паузы, не проверяется и
+        // не сохраняется — запрос уйдёт заново при возобновлении. Задача, уже
+        // стоявшая на паузе к началу запроса, не отслеживается: на паузе с
+        // агентом можно разговаривать, он лишь не двигает задачу.
+        let pause_watch = active_task.as_ref().filter(|t| !t.paused).map(|t| t.name.clone());
+        let completion = if let Some(refusal) = &stage_skip_refusal {
+            crate::ChatCompletion {
+                content: refusal.clone(),
+                usage: None,
+                request_json: String::new(),
+                response_json: String::new(),
+                tool_calls: Vec::new(),
+            }
         } else {
-            self.client.chat_with_model(&model, &messages, &options).await?
+            let exchange = async {
+                if tools_active {
+                    self.run_tool_loop(&model, &messages, &options).await
+                } else {
+                    self.client.chat_with_model(&model, &messages, &options).await
+                }
+            };
+            let completion = self.unless_paused(pause_watch.as_deref(), exchange).await?;
+            // Ответ мог прийти в те доли секунды между постановкой паузы и
+            // очередной её проверкой — тогда он тоже отбрасывается.
+            let paused_meanwhile = match &pause_watch {
+                Some(task_name) => self.db.task_paused(task_name).unwrap_or(false),
+                None => false,
+            };
+            match completion {
+                Some(completion) if !paused_meanwhile => completion,
+                _ => {
+                    // Реплика человека остаётся в истории (в чате она уже есть) и
+                    // запоминается в задаче: при возобновлении агент ответит на
+                    // неё (см. task_resume). Прерванное служебное продолжение не
+                    // запоминается — возобновление и так продолжит работу.
+                    if from_human {
+                        let task_name =
+                            pause_watch.as_deref().expect("прерывание возможно только при наблюдении");
+                        self.save_to_history(Some(&ChatMessage::user(prompt.to_string())), None);
+                        self.db.save_task_interrupted_prompt(task_name, Some(prompt))?;
+                    }
+                    return Ok(AgentReply {
+                        text: INTERRUPTED_BY_PAUSE.to_string(),
+                        usage: None,
+                        summarized: false,
+                        summary_covers: None,
+                        facts_updated: false,
+                        request_json: String::new(),
+                        response_json: String::new(),
+                        cost: None,
+                        interrupted: true,
+                    });
+                }
+            }
         };
 
         let user_message = ChatMessage::user(prompt.to_string());
         let assistant_message = ChatMessage::assistant(completion.content.clone());
-        let branch_name = {
-            let mut branches = self.branches.lock().expect("ветки агента отравлены паникой");
-            let current = branches.current.clone();
-            let history = branches.current_messages_mut();
-            history.push((user_message.clone(), None));
-            history.push((assistant_message.clone(), completion.usage));
-            current
-        };
-        // Лучшая попытка: ответ уже получен и не должен потеряться для
-        // пользователя из-за сбоя записи в БД — при ошибке лишь предупреждаем.
-        if let Err(err) = self.db.append_message(&self.name, &branch_name, &user_message, None) {
-            eprintln!("не удалось сохранить сообщение пользователя в БД: {err:#}");
-        }
-        // Метрики токенов приходят от API одной суммой на весь обмен (запрос +
-        // ответ), поэтому сохраняем их при сообщении ассистента — иначе они
-        // задвоились бы при подсчёте суммы по диалогу.
-        if let Err(err) = self.db.append_message(&self.name, &branch_name, &assistant_message, completion.usage)
-        {
-            eprintln!("не удалось сохранить ответ агента в БД: {err:#}");
-        }
+        self.save_to_history(from_human.then_some(&user_message), Some((&assistant_message, completion.usage)));
 
         let summary_covers = self.update_summary_if_needed(&config).await;
-        let facts_updated = if config.context_strategy == ContextStrategy::Facts {
+        let facts_updated = if config.context_strategy == ContextStrategy::Facts
+            && stage_skip_refusal.is_none()
+            && from_human
+        {
             self.update_facts_after_message(&config, &user_message, &assistant_message).await
         } else {
             false
@@ -1538,7 +1811,68 @@ impl Agent {
             request_json: completion.request_json,
             response_json: completion.response_json,
             cost,
+            interrupted: false,
         })
+    }
+
+    /// Дописывает реплику человека и/или ответ агента в активную ветку — и в
+    /// память, и в БД. Лучшая попытка: ответ уже получен и не должен потеряться
+    /// для пользователя из-за сбоя записи в БД — при ошибке лишь предупреждаем.
+    /// Метрики токенов приходят от API одной суммой на весь обмен (запрос +
+    /// ответ), поэтому хранятся при ответе агента — иначе они задвоились бы
+    /// при подсчёте суммы по диалогу.
+    fn save_to_history(&self, user: Option<&ChatMessage>, assistant: Option<(&ChatMessage, Option<Usage>)>) {
+        let branch_name = {
+            let mut branches = self.branches.lock().expect("ветки агента отравлены паникой");
+            let current = branches.current.clone();
+            let history = branches.current_messages_mut();
+            if let Some(user) = user {
+                history.push((user.clone(), None));
+            }
+            if let Some((assistant, usage)) = assistant {
+                history.push((assistant.clone(), usage));
+            }
+            current
+        };
+        if let Some(user) = user {
+            if let Err(err) = self.db.append_message(&self.name, &branch_name, user, None) {
+                eprintln!("не удалось сохранить сообщение пользователя в БД: {err:#}");
+            }
+        }
+        if let Some((assistant, usage)) = assistant {
+            if let Err(err) = self.db.append_message(&self.name, &branch_name, assistant, usage) {
+                eprintln!("не удалось сохранить ответ агента в БД: {err:#}");
+            }
+        }
+    }
+
+    /// Выполняет `exchange` (обмен с LLM), пока задача `task_name` не на
+    /// паузе: как только её ставят на паузу, future обмена отбрасывается —
+    /// HTTP-запрос к LLM обрывается, а инструменты, которые модель могла бы
+    /// вызвать дальше, не выполняются. `Ok(None)` — обмен прерван паузой.
+    /// Вызовы инструментов, успевшие выполниться ДО паузы, остаются в силе:
+    /// между ожиданиями ответа модели код синхронный, прервать его посередине
+    /// нельзя. Без `task_name` просто ждёт обмен.
+    async fn unless_paused<T>(
+        &self,
+        task_name: Option<&str>,
+        exchange: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<Option<T>> {
+        let Some(task_name) = task_name else {
+            return exchange.await.map(Some);
+        };
+        let paused = async {
+            loop {
+                tokio::time::sleep(PAUSE_POLL_INTERVAL).await;
+                if self.db.task_paused(task_name).unwrap_or(false) {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            result = exchange => result.map(Some),
+            () = paused => Ok(None),
+        }
     }
 
     /// Пересчитывает сводку истории активной ветки, если активна стратегия
@@ -1696,7 +2030,8 @@ impl Db {
                  expected_action TEXT,
                  paused          INTEGER NOT NULL DEFAULT 0,
                  pending_stage   TEXT,
-                 pending_outcome TEXT
+                 pending_outcome TEXT,
+                 interrupted_prompt TEXT
              );
              CREATE TABLE IF NOT EXISTS shared_task_data (
                  task_name TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
@@ -1716,6 +2051,16 @@ impl Db {
                  to_stage   TEXT NOT NULL,
                  kind       TEXT NOT NULL,
                  PRIMARY KEY (task_name, from_stage, to_stage, kind)
+             );
+             CREATE TABLE IF NOT EXISTS shared_task_transitions (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_name  TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE,
+                 from_stage TEXT NOT NULL,
+                 to_stage   TEXT NOT NULL,
+                 actor      TEXT NOT NULL,
+                 outcome    TEXT NOT NULL,
+                 reason     TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              );
              CREATE TABLE IF NOT EXISTS agent_current_task (
                  agent_name TEXT PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
@@ -1797,6 +2142,9 @@ impl Db {
         }
         if !existing.iter().any(|c| c == "pending_outcome") {
             conn.execute("ALTER TABLE shared_tasks ADD COLUMN pending_outcome TEXT", [])?;
+        }
+        if !existing.iter().any(|c| c == "interrupted_prompt") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN interrupted_prompt TEXT", [])?;
         }
         Ok(())
     }
@@ -2004,23 +2352,49 @@ impl Db {
     /// одинаково всем агентам, которые к ней присоединены. `None`, если задачи
     /// с таким именем не существует.
     fn load_shared_task(&self, task_name: &str) -> Result<Option<TaskState>> {
-        type SharedTaskRow =
-            (Option<String>, String, Option<String>, Option<String>, bool, Option<String>, Option<String>);
+        type SharedTaskRow = (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let conn = self.conn();
         let row: Option<SharedTaskRow> = match conn.query_row(
-            "SELECT goal, stage, current_step, expected_action, paused, pending_stage, pending_outcome \
-             FROM shared_tasks WHERE name = ?1",
+            "SELECT goal, stage, current_step, expected_action, paused, pending_stage, pending_outcome, \
+             interrupted_prompt FROM shared_tasks WHERE name = ?1",
             [task_name],
             |row| {
                 let paused: i64 = row.get(4)?;
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, paused != 0, row.get(5)?, row.get(6)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    paused != 0,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
             },
         ) {
             Ok(row) => Some(row),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(err) => return Err(err.into()),
         };
-        let Some((goal, stage_raw, current_step, expected_action, paused, pending_stage_raw, pending_outcome)) = row
+        let Some((
+            goal,
+            stage_raw,
+            current_step,
+            expected_action,
+            paused,
+            pending_stage_raw,
+            pending_outcome,
+            interrupted_prompt,
+        )) = row
         else {
             return Ok(None);
         };
@@ -2062,6 +2436,47 @@ impl Db {
                 other => bail!("неизвестный тип правила перехода «{other}» в БД для задачи «{task_name}»"),
             };
         }
+        type TransitionRow = (String, String, String, String, String, String);
+        let parse_record = |(from, to, actor, outcome, reason, at): TransitionRow| -> Result<TransitionRecord> {
+            Ok(TransitionRecord {
+                from: from.parse()?,
+                to: to.parse()?,
+                actor: actor.parse()?,
+                outcome: outcome.parse()?,
+                reason,
+                at,
+            })
+        };
+        let mut log_stmt = conn.prepare(
+            "SELECT from_stage, to_stage, actor, outcome, reason, created_at FROM shared_task_transitions \
+             WHERE task_name = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let log_rows: Vec<TransitionRow> = log_stmt
+            .query_map(rusqlite::params![task_name, crate::memory::TRANSITION_LOG_LIMIT as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let transitions = log_rows
+            .into_iter()
+            .rev()
+            .map(parse_record)
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("некорректная запись журнала переходов задачи «{task_name}»"))?;
+        let mut accepted_stmt = conn.prepare(
+            "SELECT from_stage, to_stage, actor, outcome, reason, created_at FROM shared_task_transitions \
+             WHERE task_name = ?1 AND outcome IN ('applied', 'approved') ORDER BY id",
+        )?;
+        let accepted_rows: Vec<TransitionRow> = accepted_stmt
+            .query_map([task_name], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let accepted = accepted_rows
+            .into_iter()
+            .map(parse_record)
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("некорректная запись журнала переходов задачи «{task_name}»"))?;
+        let stage_path = crate::memory::stage_path(&accepted, stage);
         Ok(Some(TaskState {
             name: task_name.to_string(),
             goal,
@@ -2075,7 +2490,28 @@ impl Db {
             invariants,
             blocked_transitions,
             extra_approval_transitions,
+            transitions,
+            stage_path,
+            interrupted_prompt,
         }))
+    }
+
+    /// Дописывает запись в журнал переходов задачи (см. [`TaskState::transitions`]).
+    fn log_transition(
+        &self,
+        task_name: &str,
+        from: Stage,
+        to: Stage,
+        actor: TransitionActor,
+        outcome: TransitionOutcome,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO shared_task_transitions (task_name, from_stage, to_stage, actor, outcome, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![task_name, from.as_str(), to.as_str(), actor.as_str(), outcome.as_str(), reason.trim()],
+        )?;
+        Ok(())
     }
 
     /// Обновляет состояние конечного автомата задачи (этап/шаг/ожидаемое
@@ -2110,6 +2546,18 @@ impl Db {
     }
 
     /// Ставит/снимает паузу задачи — независимо от этапа (см. документацию [`TaskState`]).
+    /// Стоит ли задача на паузе — лёгкий запрос для частой проверки во время
+    /// ожидания ответа LLM (см. `Agent::unless_paused`). `false`, если задачи нет.
+    fn task_paused(&self, task_name: &str) -> Result<bool> {
+        match self.conn().query_row("SELECT paused FROM shared_tasks WHERE name = ?1", [task_name], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(paused) => Ok(paused != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn save_task_paused(&self, task_name: &str, paused: bool) -> Result<()> {
         self.conn().execute(
             "UPDATE shared_tasks SET paused = ?2 WHERE name = ?1",
@@ -2133,6 +2581,16 @@ impl Db {
     /// и при отклонении ([`crate::agent::Agent::task_reject`]), и после
     /// применения ([`crate::agent::Agent::task_approve`]), и когда человек сам
     /// ставит другой этап (см. `Agent::task_advance`).
+    /// Запоминает (`Some`) или снимает (`None`) запрос, ответ на который
+    /// прервала пауза (см. [`TaskState::interrupted_prompt`]).
+    fn save_task_interrupted_prompt(&self, task_name: &str, prompt: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE shared_tasks SET interrupted_prompt = ?2 WHERE name = ?1",
+            rusqlite::params![task_name, prompt],
+        )?;
+        Ok(())
+    }
+
     fn clear_task_pending(&self, task_name: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE shared_tasks SET pending_stage = NULL, pending_outcome = NULL WHERE name = ?1",
@@ -2459,5 +2917,873 @@ impl AgentManager {
         agent.stop();
         self.db.set_running(name, false)?;
         Ok(agent.info())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Проверки конечного автомата задачи: недопустимые переходы (ручные и
+    //! предложенные моделью через `move_stage`), реакция на них, гейты
+    //! подтверждения человеком и продолжение после паузы — в том числе после
+    //! перезапуска приложения (новый `AgentManager` над тем же файлом БД).
+
+    use super::*;
+    use crate::{ToolCallFunction, ToolCallWire};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Временный файл БД, удаляемый по завершении теста.
+    struct TempStore(PathBuf);
+
+    impl TempStore {
+        fn new() -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            Self(std::env::temp_dir().join(format!("llm-core-test-{}-{n}.db", std::process::id())))
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn open_agent(store: &TempStore) -> (AgentManager, Arc<Agent>) {
+        let manager = AgentManager::new(LlmClient::for_tests(), store.0.clone()).unwrap();
+        if manager.get("tester").is_none() {
+            manager.create(AgentConfig::new("tester")).unwrap();
+        }
+        let agent = manager.get("tester").unwrap();
+        (manager, agent)
+    }
+
+    /// Агент с только что начатой задачей (этап `planning`).
+    fn agent_with_task(store: &TempStore) -> (AgentManager, Arc<Agent>) {
+        let (manager, agent) = open_agent(store);
+        agent.task_start("demo", Some("написать отчёт")).unwrap();
+        (manager, agent)
+    }
+
+    /// Вызов инструмента так, как его сделала бы модель.
+    fn call_tool(agent: &Agent, name: &str, arguments: serde_json::Value) -> String {
+        agent.execute_task_tool(&ToolCallWire {
+            id: "call-1".to_string(),
+            kind: "function".to_string(),
+            function: ToolCallFunction { name: name.to_string(), arguments: arguments.to_string() },
+        })
+    }
+
+    fn move_stage(agent: &Agent, stage: &str) -> String {
+        call_tool(agent, "move_stage", serde_json::json!({ "stage": stage, "outcome": "итог этапа" }))
+    }
+
+    fn task(agent: &Agent) -> TaskState {
+        agent.task_state().expect("агент должен быть присоединён к задаче")
+    }
+
+    // --- Недопустимые переходы ---
+
+    #[test]
+    fn manual_advance_cannot_skip_stages() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        for target in [Stage::Validation, Stage::Done] {
+            let err = agent.task_advance(target, None, None).unwrap_err().to_string();
+            assert!(err.contains("допустимые следующие этапы: execution"), "{err}");
+        }
+        assert_eq!(task(&agent).stage, Stage::Planning);
+
+        agent.task_advance(Stage::Execution, None, None).unwrap();
+        let err = agent.task_advance(Stage::Done, None, None).unwrap_err().to_string();
+        assert!(err.contains("допустимые следующие этапы: validation"), "{err}");
+        assert_eq!(task(&agent).stage, Stage::Execution);
+    }
+
+    #[test]
+    fn done_is_terminal() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        for stage in [Stage::Execution, Stage::Validation, Stage::Done] {
+            agent.task_advance(stage, None, None).unwrap();
+        }
+
+        let err = agent.task_advance(Stage::Execution, None, None).unwrap_err().to_string();
+        assert!(err.contains("конечный этап"), "{err}");
+        let reply = move_stage(&agent, "execution");
+        assert!(reply.contains("этап «done» конечный"), "{reply}");
+        assert_eq!(task(&agent).stage, Stage::Done);
+        assert!(!task_tools_offered(Some(&task(&agent))));
+    }
+
+    #[test]
+    fn model_cannot_start_implementation_before_plan() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        for target in ["validation", "done"] {
+            let reply = move_stage(&agent, target);
+            assert!(reply.contains("нет такого перехода: из «planning» можно в execution"), "{reply}");
+        }
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, None);
+    }
+
+    #[test]
+    fn model_cannot_finish_without_validation() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        agent.task_advance(Stage::Execution, None, None).unwrap();
+
+        let reply = move_stage(&agent, "done");
+        assert!(reply.contains("нет такого перехода: из «execution» можно в validation"), "{reply}");
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Execution);
+        assert_eq!(state.pending_stage, None);
+    }
+
+    #[test]
+    fn model_gets_explanation_for_malformed_calls() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        let reply = move_stage(&agent, "deploy");
+        assert!(reply.contains("неизвестный этап «deploy»"), "{reply}");
+        let reply = call_tool(&agent, "move_stage", serde_json::json!({ "stage": "execution", "outcome": "  " }));
+        assert!(reply.contains("outcome не может быть пустым"), "{reply}");
+        let reply = call_tool(&agent, "move_stage", serde_json::json!("execution"));
+        assert!(reply.contains("ожидался JSON-объект"), "{reply}");
+        let reply = call_tool(&agent, "jump_to_done", serde_json::json!({}));
+        assert!(reply.contains("нет такого инструмента"), "{reply}");
+
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, None);
+    }
+
+    #[test]
+    fn task_invariant_blocks_otherwise_legal_transition() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        agent.task_advance(Stage::Execution, None, None).unwrap();
+        agent.task_advance(Stage::Validation, None, None).unwrap();
+        agent.task_forbid_transition(Stage::Validation, Stage::Execution).unwrap();
+
+        let reply = move_stage(&agent, "execution");
+        assert!(reply.contains("запрещён инвариантом"), "{reply}");
+        assert!(agent.task_advance(Stage::Execution, None, None).is_err());
+        assert_eq!(task(&agent).stage, Stage::Validation);
+
+        assert!(agent.task_allow_transition(Stage::Validation, Stage::Execution).unwrap());
+        assert!(move_stage(&agent, "execution").contains("Переход применён"));
+        assert_eq!(task(&agent).stage, Stage::Execution);
+    }
+
+    #[test]
+    fn replanning_from_execution_needs_new_approval() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+        agent.task_approve().unwrap();
+
+        // План оказался негодным — откат в planning применяется сразу…
+        assert!(move_stage(&agent, "planning").contains("Переход применён"));
+        assert_eq!(task(&agent).stage, Stage::Planning);
+        // …а обратно в execution — снова только через утверждение.
+        assert!(move_stage(&agent, "execution").contains("ждёт подтверждения"));
+        assert_eq!(task(&agent).stage, Stage::Planning);
+    }
+
+    // --- Журнал переходов ---
+
+    #[test]
+    fn journal_records_every_attempt() {
+        use crate::memory::{TransitionActor as A, TransitionOutcome as O};
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        move_stage(&agent, "done"); // запрещено картой
+        move_stage(&agent, "execution"); // ждёт утверждения
+        agent.task_reject("добавь сроки").unwrap();
+        move_stage(&agent, "execution");
+        agent.task_approve().unwrap();
+        let _ = agent.task_advance(Stage::Done, None, None); // ручной прыжок — тоже отказ
+        move_stage(&agent, "validation"); // применяется сразу
+
+        let log: Vec<_> = task(&agent).transitions.iter().map(|r| (r.from, r.to, r.actor, r.outcome)).collect();
+        assert_eq!(
+            log,
+            vec![
+                (Stage::Planning, Stage::Done, A::Model, O::Refused),
+                (Stage::Planning, Stage::Execution, A::Model, O::Proposed),
+                (Stage::Planning, Stage::Execution, A::Human, O::Rejected),
+                (Stage::Planning, Stage::Execution, A::Model, O::Proposed),
+                (Stage::Planning, Stage::Execution, A::Human, O::Approved),
+                (Stage::Execution, Stage::Done, A::Human, O::Refused),
+                (Stage::Execution, Stage::Validation, A::Model, O::Applied),
+            ]
+        );
+        let records = task(&agent).transitions;
+        assert!(records[0].reason.contains("нет такого перехода"), "{}", records[0].reason);
+        assert_eq!(records[2].reason, "добавь сроки");
+        assert!(records[0].to_string().starts_with("✖ planning -> done [model, refused]"), "{}", records[0]);
+    }
+
+    #[test]
+    fn journal_survives_restart_and_is_capped() {
+        let store = TempStore::new();
+        {
+            let (_m, agent) = agent_with_task(&store);
+            for _ in 0..crate::memory::TRANSITION_LOG_LIMIT + 5 {
+                move_stage(&agent, "done");
+            }
+            move_stage(&agent, "execution");
+        }
+        let (_m, agent) = open_agent(&store);
+        let log = task(&agent).transitions;
+        assert_eq!(log.len(), crate::memory::TRANSITION_LOG_LIMIT);
+        assert_eq!(log.last().unwrap().to, Stage::Execution, "новейшая запись — последней");
+    }
+
+    /// Тексты ядра читают в TUI, вебе и CLI, а часть из них — модель, которая
+    /// пересказывает их человеку, поэтому в них не должно быть команд
+    /// конкретного интерфейса.
+    #[test]
+    fn messages_do_not_mention_interface_commands() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        let mut texts = vec![
+            agent.task_start("другая", None).unwrap_err().to_string(),
+            agent.task_join("нет-такой").unwrap_err().to_string(),
+            move_stage(&agent, "execution"),
+            crate::memory::format_task_block(&task(&agent)),
+        ];
+        agent.task_pause().unwrap();
+        texts.push(agent.task_approve().unwrap_err().to_string());
+        texts.push(agent.task_advance(Stage::Execution, None, None).unwrap_err().to_string());
+        texts.push(crate::memory::format_task_block(&task(&agent)));
+        agent.task_resume().unwrap();
+        agent.task_forbid_transition(Stage::Planning, Stage::Execution).unwrap();
+        texts.push(agent.task_approve().unwrap_err().to_string());
+        texts.push(agent.task_reject("").unwrap_err().to_string());
+        texts.push(agent.task_reject("нужно разбить на шаги").unwrap());
+        texts.push(crate::memory::format_task_block(&task(&agent)));
+        texts.push(move_stage(&agent, "execution"));
+        texts.push(agent.refuse_stage_skip(&task(&agent), "пропусти планирование").unwrap());
+        agent.task_finish().unwrap();
+        texts.push(agent.task_advance(Stage::Execution, None, None).unwrap_err().to_string());
+
+        for text in texts {
+            assert!(!text.contains("agent task") && !text.contains("agent remember"), "{text}");
+        }
+    }
+
+    // --- Просьба пропустить этап в сообщении ---
+
+    #[tokio::test]
+    async fn request_to_skip_planning_is_answered_without_model() {
+        let store = TempStore::new();
+        let (manager, agent) = agent_with_task(&store);
+        manager.start("tester").unwrap();
+
+        // LlmClient::for_tests смотрит на недоступный адрес — дойди запрос до
+        // модели, handle_request вернул бы ошибку сети.
+        let reply = agent.handle_request("Пропусти планирование, сразу пиши код").await.unwrap();
+        assert!(reply.text.contains("Этап планирования пропустить нельзя"), "{}", reply.text);
+        assert!(reply.usage.is_none());
+
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, None);
+        let last = state.transitions.last().unwrap();
+        assert_eq!((last.from, last.to), (Stage::Planning, Stage::Execution));
+        assert_eq!(last.outcome, crate::memory::TransitionOutcome::Refused);
+
+        // Обмен остаётся в истории — модель увидит его в следующем запросе.
+        let history = agent.history();
+        assert_eq!(history.len(), 2);
+        assert!(history[1].content.contains("⛔"));
+    }
+
+    #[tokio::test]
+    async fn request_to_skip_validation_is_answered_without_model() {
+        let store = TempStore::new();
+        let (manager, agent) = agent_with_task(&store);
+        manager.start("tester").unwrap();
+        agent.task_advance(Stage::Execution, None, None).unwrap();
+
+        let reply = agent.handle_request("пропусти проверку и сразу завершай").await.unwrap();
+        assert!(reply.text.contains("без проверки нельзя"), "{}", reply.text);
+        assert_eq!(task(&agent).stage, Stage::Execution);
+        assert_eq!(task(&agent).transitions.last().unwrap().to, Stage::Done);
+    }
+
+    /// Фиктивный OpenAI-совместимый сервер: на каждый запрос к
+    /// `/chat/completions` отдаёт следующее из `replies` (тело `message`,
+    /// см. также [`delayed`]) и запоминает тела запросов. Возвращает base_url
+    /// и журнал запросов.
+    async fn mock_llm(
+        replies: Vec<serde_json::Value>,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            for mut message in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Читаем заголовки, затем тело ровно по Content-Length.
+                let body_start = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&raw[..body_start]).to_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while raw.len() < body_start + length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                seen.lock().unwrap().push(serde_json::from_slice(&raw[body_start..body_start + length]).unwrap());
+                if let Some(ms) = message.get("__delay_ms").and_then(|v| v.as_u64()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    message = message["__message"].clone();
+                }
+                let body = serde_json::json!({ "choices": [{ "message": message }] }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                // Клиент мог уже оборвать запрос (пауза) — это не ошибка сервера.
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base_url, requests)
+    }
+
+    /// Ответ фиктивного сервера, отданный через `ms` миллисекунд.
+    fn delayed(ms: u64, message: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "__delay_ms": ms, "__message": message })
+    }
+
+    /// Агент с задачей на этапе execution (план утверждён) поверх фиктивного LLM.
+    fn executing_agent(store: &TempStore, base_url: &str) -> (AgentManager, Arc<Agent>) {
+        let manager = AgentManager::new(LlmClient::for_tests_at(base_url), store.0.clone()).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("demo", None).unwrap();
+        move_stage(&agent, "execution");
+        agent.task_approve().unwrap();
+        (manager, agent)
+    }
+
+    #[tokio::test]
+    async fn pause_during_request_discards_reply_and_resends_prompt_on_resume() {
+        let (base_url, requests) = mock_llm(vec![
+            delayed(2000, serde_json::json!({ "content": "ОТВЕТ, ПОЛУЧЕННЫЙ ПОСЛЕ ПАУЗЫ" })),
+            tool_call("update_step", serde_json::json!({ "step": "раздел 2" })),
+            serde_json::json!({ "content": "Раздел 2 готов." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let (_m, agent) = executing_agent(&store, &base_url);
+
+        let started = std::time::Instant::now();
+        let request = tokio::spawn({
+            let agent = agent.clone();
+            async move { agent.handle_request("напиши раздел 2").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        agent.task_pause().unwrap();
+        let reply = request.await.unwrap().unwrap();
+
+        assert!(reply.interrupted);
+        assert_eq!(reply.text, "⏸ Задача поставлена на паузу.");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500), "запрос оборван, а не дождались ответа");
+        // Реплика человека осталась (в чате она уже есть), отброшенный ответ — нет.
+        let history = agent.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "напиши раздел 2");
+        assert_eq!(task(&agent).interrupted_prompt.as_deref(), Some("напиши раздел 2"));
+
+        // «Возобновить» — служебное продолжение: ответить на прерванный запрос.
+        let followup = agent.task_resume().unwrap().unwrap();
+        assert!(followup.contains("«напиши раздел 2»"), "{followup}");
+        assert_eq!(task(&agent).interrupted_prompt, None);
+        let reply = agent.continue_task(&followup).await.unwrap();
+        assert!(!reply.interrupted);
+        assert_eq!(reply.text, "Раздел 2 готов.");
+
+        // В истории — запрос человека и ответ; ни служебного продолжения, ни
+        // отброшенного ответа.
+        let history = agent.history();
+        let contents: Vec<_> = history.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+        assert_eq!(contents, [("user", "напиши раздел 2"), ("assistant", "Раздел 2 готов.")]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        // Модель видит и сам запрос в истории, и указание ответить на него.
+        let resumed = requests[1].to_string();
+        assert!(resumed.contains("напиши раздел 2") && resumed.contains("Задача возобновлена"), "{resumed}");
+    }
+
+    #[tokio::test]
+    async fn approval_continues_without_showing_a_message() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("update_step", serde_json::json!({ "step": "пишу черновик" })),
+            serde_json::json!({ "content": "Черновик письма: …" }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = AgentManager::new(LlmClient::for_tests_at(&base_url), store.0.clone()).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("demo", None).unwrap();
+        move_stage(&agent, "execution");
+
+        let followup = agent.task_approve().unwrap();
+        assert!(followup.contains("утвердил переход «planning -> execution»"), "{followup}");
+        let reply = agent.continue_task(&followup).await.unwrap();
+        assert_eq!(reply.text, "Черновик письма: …");
+
+        // Служебное продолжение ушло модели, но в историю попал только ответ.
+        assert!(requests.lock().unwrap()[0].to_string().contains("утвердил переход"));
+        let history = agent.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn tool_calls_after_pause_are_not_applied() {
+        let (base_url, _requests) = mock_llm(vec![
+            // До паузы: шаг обновлён — это остаётся в силе.
+            tool_call("update_step", serde_json::json!({ "step": "черновик готов" })),
+            // После паузы: переход на проверку не должен примениться.
+            delayed(
+                2000,
+                tool_call("move_stage", serde_json::json!({ "stage": "validation", "outcome": "готово" })),
+            ),
+        ])
+        .await;
+        let store = TempStore::new();
+        let (_m, agent) = executing_agent(&store, &base_url);
+
+        let request = tokio::spawn({
+            let agent = agent.clone();
+            async move { agent.handle_request("доделай черновик").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        agent.task_pause().unwrap();
+        assert!(request.await.unwrap().unwrap().interrupted);
+
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Execution, "ответ после паузы не применён");
+        assert_eq!(state.current_step.as_deref(), Some("черновик готов"), "сделанное до паузы осталось");
+    }
+
+    #[tokio::test]
+    async fn request_made_while_already_paused_is_answered_normally() {
+        let (base_url, requests) = mock_llm(vec![serde_json::json!({ "content": "Жду возобновления." })]).await;
+        let store = TempStore::new();
+        let (_m, agent) = executing_agent(&store, &base_url);
+        agent.task_pause().unwrap();
+
+        let reply = agent.handle_request("на чём остановились?").await.unwrap();
+        assert!(!reply.interrupted);
+        assert_eq!(reply.text, "Жду возобновления.");
+        assert_eq!(task(&agent).interrupted_prompt, None);
+        assert!(requests.lock().unwrap()[0].get("tools").is_none(), "на паузе инструменты не предлагаются");
+    }
+
+    fn tool_call(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": { "name": name, "arguments": arguments.to_string() }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn reworked_plan_is_always_resubmitted_for_approval() {
+        let (base_url, requests) = mock_llm(vec![
+            // Модель по замечанию обновляет шаг…
+            tool_call("update_step", serde_json::json!({ "step": "план переработан" })),
+            // …показывает новый план текстом, но move_stage не вызывает.
+            serde_json::json!({ "content": "Новый план: 1) сбор 2) сравнение QoQ 3) прогноз" }),
+            // Принудительный круг: предложение переработанного плана.
+            tool_call(
+                "move_stage",
+                serde_json::json!({ "stage": "execution", "outcome": "добавлены QoQ и прогноз" }),
+            ),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = AgentManager::new(LlmClient::for_tests_at(&base_url), store.0.clone()).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("demo", None).unwrap();
+        move_stage(&agent, "execution");
+        let followup = agent.task_reject("нет сравнения с прошлым кварталом и прогноза").unwrap();
+
+        let reply = agent.handle_request(&followup).await.unwrap();
+        assert!(reply.text.contains("Новый план"), "{}", reply.text);
+
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, Some(Stage::Execution), "переработанный план ждёт утверждения");
+        assert_eq!(state.pending_outcome.as_deref(), Some("добавлены QoQ и прогноз"));
+        assert!(crate::memory::active_rejection(&state).is_none());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        // Причина отклонения была в контексте модели с первого же запроса.
+        assert!(requests[0].to_string().contains("нет сравнения с прошлым кварталом и прогноза"));
+        // В принудительном круге модели доступен только move_stage, и вызвать его обязательно.
+        let forced_tools: Vec<_> =
+            requests[2]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].clone()).collect();
+        assert_eq!(forced_tools, vec![serde_json::json!("move_stage")]);
+        assert_eq!(requests[2]["tool_choice"], "required");
+    }
+
+    #[tokio::test]
+    async fn resume_sends_agent_back_to_unfinished_stage_with_collected_results() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("update_step", serde_json::json!({ "step": "раздел 3: прогноз" })),
+            serde_json::json!({ "content": "Продолжаю: раздел 3, прогноз на следующий квартал." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = AgentManager::new(LlmClient::for_tests_at(&base_url), store.0.clone()).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("demo", Some("квартальный отчёт")).unwrap();
+        call_tool(
+            &agent,
+            "move_stage",
+            serde_json::json!({ "stage": "execution", "outcome": "ПЛАН: сбор, сравнение QoQ, прогноз" }),
+        );
+        agent.task_approve().unwrap();
+        call_tool(&agent, "update_step", serde_json::json!({ "step": "раздел 2 из 3 готов" }));
+        agent.task_pause().unwrap();
+
+        // Кнопка «Возобновить»: интерфейс сразу отправляет followup агенту.
+        let followup = agent.task_resume().unwrap().unwrap();
+        let reply = agent.handle_request(&followup).await.unwrap();
+        assert!(reply.text.contains("раздел 3"), "{}", reply.text);
+
+        let first = requests.lock().unwrap()[0].to_string();
+        assert!(first.contains("Задача возобновлена после паузы"), "{first}");
+        assert!(first.contains("Сейчас этап EXECUTION"), "директива незавершённого этапа: {first}");
+        assert!(first.contains("ПЛАН: сбор, сравнение QoQ, прогноз"), "итог planning уходит модели: {first}");
+        assert!(first.contains("раздел 2 из 3 готов"), "текущий шаг уходит модели: {first}");
+        assert!(!first.contains("НА ПАУЗЕ"));
+        assert!(first.contains("\"tools\""), "после паузы инструменты автомата снова доступны");
+        assert_eq!(task(&agent).stage, Stage::Execution);
+    }
+
+    #[tokio::test]
+    async fn no_forced_round_when_model_resubmits_itself() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("move_stage", serde_json::json!({ "stage": "execution", "outcome": "план v2" })),
+            serde_json::json!({ "content": "План v2 ждёт утверждения." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = AgentManager::new(LlmClient::for_tests_at(&base_url), store.0.clone()).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("demo", None).unwrap();
+        move_stage(&agent, "execution");
+        let followup = agent.task_reject("мало деталей").unwrap();
+
+        agent.handle_request(&followup).await.unwrap();
+        assert_eq!(task(&agent).pending_outcome.as_deref(), Some("план v2"));
+        assert_eq!(requests.lock().unwrap().len(), 2, "лишнего круга нет");
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_still_goes_to_model() {
+        let store = TempStore::new();
+        let (manager, agent) = agent_with_task(&store);
+        manager.start("tester").unwrap();
+
+        // Не перехвачено — значит, дошло до (недоступной) модели.
+        assert!(agent.handle_request("Какие требования к отчёту?").await.is_err());
+    }
+
+    // --- Гейты подтверждения человеком ---
+
+    #[test]
+    fn plan_approval_gates_execution() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        let reply = move_stage(&agent, "execution");
+        assert!(reply.contains("ждёт подтверждения человека"), "{reply}");
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning, "переход не должен примениться без утверждения");
+        assert_eq!(state.pending_stage, Some(Stage::Execution));
+        assert_eq!(state.pending_outcome.as_deref(), Some("итог этапа"));
+        assert!(!task_tools_offered(Some(&state)), "пока ждём решения, инструменты не предлагаются");
+
+        let reply = move_stage(&agent, "execution");
+        assert!(reply.contains("уже ждёт утверждения"), "{reply}");
+
+        agent.task_approve().unwrap();
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Execution);
+        assert_eq!(state.pending_stage, None);
+        assert_eq!(state.pending_outcome, None);
+        assert!(task_tools_offered(Some(&state)));
+        assert!(agent.task_approve().is_err(), "утверждать больше нечего");
+    }
+
+    #[test]
+    fn rejected_plan_stays_in_planning_with_reason() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+
+        agent.task_reject("добавь критерии готовности").unwrap();
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, None);
+        assert_eq!(state.expected_action, None, "причина — в журнале и блоке отклонения, не в ожидаемом действии");
+        assert_eq!(state.transitions.last().unwrap().reason, "добавь критерии готовности");
+        assert!(agent.task_reject("ещё раз").is_err(), "отклонять больше нечего");
+
+        // Модель может доработать план и предложить переход заново.
+        assert!(move_stage(&agent, "execution").contains("ждёт подтверждения"));
+    }
+
+    #[test]
+    fn reject_requires_reason() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+
+        for note in ["", "   "] {
+            let err = agent.task_reject(note).unwrap_err().to_string();
+            assert!(err.contains("укажите причину отклонения"), "{err}");
+        }
+        let state = task(&agent);
+        assert_eq!(state.pending_stage, Some(Stage::Execution), "без причины предложение остаётся");
+        assert_eq!(state.transitions.last().unwrap().outcome, crate::memory::TransitionOutcome::Proposed);
+    }
+
+    #[test]
+    fn rejected_plan_is_reworked_with_the_reason() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+
+        // Сообщение, которое интерфейс сразу отправляет агенту от имени человека.
+        let followup = agent.task_reject("нет оценки сроков по шагам").unwrap();
+        assert!(followup.contains("нет оценки сроков по шагам"), "{followup}");
+        assert!(followup.contains("Переработай план"), "{followup}");
+
+        // Причина видна модели в статусе задачи — и без этого сообщения (CLI).
+        let block = crate::memory::format_task_block(&task(&agent));
+        assert!(block.contains("ОТКЛОНИЛ предложенный переход «planning -> execution»"), "{block}");
+        assert!(block.contains("Причина: нет оценки сроков по шагам"), "{block}");
+        assert!(block.contains("Сейчас этап PLANNING"), "директива этапа остаётся: {block}");
+
+        // Отказ автомата не отменяет напоминание — модель ещё не ответила на замечание…
+        move_stage(&agent, "done");
+        assert!(crate::memory::format_task_block(&task(&agent)).contains("ОТКЛОНИЛ"));
+        // …а новое предложение плана — отменяет.
+        move_stage(&agent, "execution");
+        assert!(!crate::memory::format_task_block(&task(&agent)).contains("ОТКЛОНИЛ"));
+    }
+
+    #[test]
+    fn rejected_result_followup_points_back_to_rework() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        for stage in [Stage::Execution, Stage::Validation] {
+            agent.task_advance(stage, None, None).unwrap();
+        }
+        move_stage(&agent, "done");
+
+        let followup = agent.task_reject("не проверены граничные случаи").unwrap();
+        assert!(followup.contains("Итог проверки не принят"), "{followup}");
+        assert_eq!(task(&agent).stage, Stage::Validation);
+    }
+
+    #[test]
+    fn full_cycle_driven_by_model_with_rework() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+
+        move_stage(&agent, "execution");
+        agent.task_approve().unwrap();
+
+        // execution -> validation и откат validation -> execution — без ворот.
+        assert!(move_stage(&agent, "validation").contains("Переход применён"));
+        assert!(move_stage(&agent, "execution").contains("Переход применён"));
+        assert!(move_stage(&agent, "validation").contains("Переход применён"));
+        assert_eq!(task(&agent).stage, Stage::Validation);
+
+        // validation -> done — только с подтверждением.
+        assert!(move_stage(&agent, "done").contains("ждёт подтверждения"));
+        assert_eq!(task(&agent).stage, Stage::Validation);
+        agent.task_approve().unwrap();
+        assert_eq!(task(&agent).stage, Stage::Done);
+    }
+
+    // --- Пауза и продолжение ---
+
+    #[test]
+    fn pause_freezes_the_state_machine() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        agent.task_advance(Stage::Execution, Some("шаг 1"), None).unwrap();
+        agent.task_pause().unwrap();
+
+        let state = task(&agent);
+        assert!(!task_tools_offered(Some(&state)));
+        assert!(move_stage(&agent, "validation").contains("на паузе"));
+        let reply = call_tool(&agent, "update_step", serde_json::json!({ "step": "шаг 2" }));
+        assert!(reply.contains("на паузе"), "{reply}");
+        let err = agent.task_advance(Stage::Validation, None, None).unwrap_err().to_string();
+        assert!(err.contains("на паузе"), "{err}");
+
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Execution);
+        assert_eq!(state.current_step.as_deref(), Some("шаг 1"));
+    }
+
+    #[test]
+    fn approve_is_refused_while_paused() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+        agent.task_pause().unwrap();
+
+        let err = agent.task_approve().unwrap_err().to_string();
+        assert!(err.contains("на паузе"), "{err}");
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Planning);
+        assert_eq!(state.pending_stage, Some(Stage::Execution), "предложение переживает паузу");
+
+        agent.task_resume().unwrap();
+        agent.task_approve().unwrap();
+        assert_eq!(task(&agent).stage, Stage::Execution);
+    }
+
+    #[test]
+    fn approve_is_refused_when_transition_forbidden_after_proposal() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        for stage in [Stage::Execution, Stage::Validation] {
+            agent.task_advance(stage, None, None).unwrap();
+        }
+        assert!(move_stage(&agent, "done").contains("ждёт подтверждения"));
+        agent.task_forbid_transition(Stage::Validation, Stage::Done).unwrap();
+
+        let err = agent.task_approve().unwrap_err().to_string();
+        assert!(err.contains("запрещён инвариантом"), "{err}");
+        let state = task(&agent);
+        assert_eq!(state.stage, Stage::Validation);
+        assert_eq!(state.pending_stage, Some(Stage::Done), "предложение остаётся до решения человека");
+
+        // Снять запрет — и то же предложение утверждается.
+        agent.task_allow_transition(Stage::Validation, Stage::Done).unwrap();
+        agent.task_approve().unwrap();
+        assert_eq!(task(&agent).stage, Stage::Done);
+    }
+
+    #[test]
+    fn manual_advance_supersedes_pending_proposal() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        assert!(move_stage(&agent, "execution").contains("ждёт подтверждения"));
+
+        // Человек, не дожидаясь approve, сам провёл задачу дальше —
+        // предложение модели (сделанное из planning) больше не актуально.
+        agent.task_advance(Stage::Execution, None, None).unwrap();
+        let state = task(&agent);
+        assert_eq!(state.pending_stage, None);
+        assert_eq!(state.pending_outcome, None);
+        assert!(task_tools_offered(Some(&state)));
+
+        agent.task_advance(Stage::Validation, None, None).unwrap();
+        let err = agent.task_approve().unwrap_err().to_string();
+        assert!(err.contains("нет перехода, ожидающего утверждения"), "{err}");
+        assert_eq!(task(&agent).stage, Stage::Validation, "approve не должен откатывать этап назад");
+    }
+
+    #[test]
+    fn step_update_keeps_pending_proposal() {
+        let store = TempStore::new();
+        let (_m, agent) = agent_with_task(&store);
+        move_stage(&agent, "execution");
+
+        // Правка шага без смены этапа предложение не снимает.
+        agent.task_step("уточнил критерии").unwrap();
+        agent.task_advance(Stage::Planning, Some("план v2"), None).unwrap();
+        assert_eq!(task(&agent).pending_stage, Some(Stage::Execution));
+        agent.task_approve().unwrap();
+        assert_eq!(task(&agent).stage, Stage::Execution);
+    }
+
+    #[test]
+    fn resume_continues_from_same_point_after_restart() {
+        let store = TempStore::new();
+        {
+            let (_m, agent) = agent_with_task(&store);
+            move_stage(&agent, "execution");
+            agent.task_approve().unwrap();
+            call_tool(
+                &agent,
+                "update_step",
+                serde_json::json!({ "step": "раздел 2 из 3", "expected_action": "дописать выводы" }),
+            );
+            agent.task_pause().unwrap();
+        }
+
+        // «Перезапуск приложения» — новый реестр агентов над тем же файлом БД.
+        let (_m, agent) = open_agent(&store);
+        let state = task(&agent);
+        assert!(state.paused);
+        assert_eq!(state.stage, Stage::Execution);
+        assert_eq!(state.current_step.as_deref(), Some("раздел 2 из 3"));
+        assert_eq!(state.expected_action.as_deref(), Some("дописать выводы"));
+        assert!(crate::memory::format_task_block(&state).contains("ЗАДАЧА НА ПАУЗЕ"));
+
+        let followup = agent.task_resume().unwrap().expect("агент должен продолжить сам");
+        assert!(followup.contains("незавершённого этапа «execution»"), "{followup}");
+        assert!(followup.contains("раздел 2 из 3"), "{followup}");
+        assert_eq!(agent.task_resume().unwrap(), None, "повторное возобновление ничего не запускает");
+        let state = task(&agent);
+        assert!(!state.paused);
+        assert_eq!(state.stage, Stage::Execution);
+        // Утверждённый план — в статусе задачи, а не только в истории диалога.
+        assert_eq!(state.stage_path.len(), 1);
+        assert!(crate::memory::format_task_block(&state).contains("Итоги пройденных этапов"));
+        assert_eq!(state.current_step.as_deref(), Some("раздел 2 из 3"));
+        assert_eq!(state.expected_action.as_deref(), Some("дописать выводы"));
+        assert!(task_tools_offered(Some(&state)));
+
+        // Автомат продолжает работать по тем же правилам, что и до паузы.
+        assert!(move_stage(&agent, "done").contains("нет такого перехода"));
+        assert!(move_stage(&agent, "validation").contains("Переход применён"));
     }
 }

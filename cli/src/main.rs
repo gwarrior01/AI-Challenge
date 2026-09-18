@@ -515,10 +515,15 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 }
                 Some("resume") => {
                     agent.task_resume()?;
-                    println!("Задача возобновлена — этап/шаг/ожидаемое действие не менялись.");
+                    println!(
+                        "Задача возобновлена — этап/шаг/ожидаемое действие не менялись; агент продолжит \
+                         с незавершённого этапа со следующим сообщением."
+                    );
                     Ok(())
                 }
                 Some("approve") => {
+                    // Продолжение агенту CLI не отправляет — агент продолжит со
+                    // следующим сообщением, новый этап он и так увидит.
                     agent.task_approve()?;
                     println!("Предложенный моделью переход применён.");
                     Ok(())
@@ -526,7 +531,10 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 Some("reject") => {
                     let note = args.get(3..).map(|s| s.join(" ")).unwrap_or_default();
                     agent.task_reject(&note)?;
-                    println!("Предложенный моделью переход отклонён — этап не изменился.");
+                    println!(
+                        "Предложенный моделью переход отклонён — этап не изменился. Причина попадёт агенту \
+                         в контекст со следующим сообщением."
+                    );
                     Ok(())
                 }
                 Some("finish") => match agent.task_finish()? {
@@ -862,6 +870,12 @@ fn print_task(task: &llm_core::TaskState) {
         let items: Vec<String> =
             task.extra_approval_transitions.iter().map(|(f, t)| format!("{f}->{t}")).collect();
         println!("🔒 Дополнительно требует подтверждения (для переходов модели): {}", items.join(", "));
+    }
+    if !task.transitions.is_empty() {
+        println!("Журнал переходов:");
+        for record in &task.transitions {
+            println!("  {record}");
+        }
     }
     if !task.invariants.is_empty() {
         println!("Инварианты этой задачи:");
