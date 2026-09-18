@@ -436,6 +436,10 @@ struct DrawState<'a> {
     wizard: Option<&'a CreateWizard>,
     agent_chat_name: Option<&'a str>,
     agent_chat_running: bool,
+    /// Задача агента, чей диалог открыт, — читается заново на каждой
+    /// перерисовке, поэтому смена этапа посреди ответа (move_stage) видна
+    /// в шапке сразу, а не после ответа.
+    agent_task: Option<llm_core::TaskState>,
     /// Число записей в истории диалога открытого агента (см. [`Agent::history`])
     /// — показывается в кратком виде на экране памяти ([`Screen::AgentMemory`])
     /// как обзор краткосрочной памяти; `None` вне экранов чата/памяти агента.
@@ -672,6 +676,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
         // на каждой перерисовке зря.
         let screen_shared_tasks =
             if matches!(screen, Screen::AgentMemory) { agent_manager.list_tasks() } else { Vec::new() };
+        let screen_agent_task = match &screen {
+            Screen::AgentChat => {
+                agent_chat_name.as_ref().and_then(|n| agent_manager.get(n)).and_then(|a| a.task_state())
+            }
+            _ => None,
+        };
 
         let draw_state = DrawState {
             screen,
@@ -695,6 +705,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             wizard: wizard.as_ref(),
             agent_chat_name: agent_chat_name.as_deref(),
             agent_chat_running,
+            agent_task: screen_agent_task,
             agent_history_len: screen_agent_history_len,
             memory_status: memory_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
             shared_tasks: &screen_shared_tasks,
@@ -978,21 +989,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     if let Some(name) = agent_chat_name.clone() {
                                         if let Some(agent) = agent_manager.get(&name) {
                                             input.clear();
-                                            agent_histories.entry(name.clone()).or_default().push(HistoryItem {
-                                                role: Role::User,
-                                                text: prompt.clone(),
-                                                debug: None,
-                                                tokens: None,
-                                                cost: None,
-                                                cost_approx: false,
-                                            });
                                             waiting = true;
                                             waiting_agent = Some(name.clone());
-                                            let tx = tx.clone();
-                                            tokio::spawn(async move {
-                                                let response = agent.handle_request(&prompt).await;
-                                                let _ = tx.send(AppEvent::AgentResponse { name, result: response });
-                                            });
+                                            send_to_agent(agent, name, prompt, true, &mut agent_histories, &tx);
                                         }
                                     }
                                 }
@@ -1020,6 +1019,62 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     }
                                     if let Some(name) = agent_chat_name.clone() {
                                         if let Some(agent) = agent_manager.get(&name) {
+                                            // task reject/resume/approve — не просто команды памяти: после
+                                            // них агент сразу продолжает работу (перерабатывает отклонённый
+                                            // этап, продолжает после паузы, начинает утверждённый этап),
+                                            // поэтому переключаемся в диалог, где виден его ответ. Причина
+                                            // отклонения видна в чате как реплика человека; продолжения после
+                                            // resume/approve служебные — в чате их нет.
+                                            let tokens: Vec<&str> = raw.split_whitespace().collect();
+                                            let continuation = match tokens.as_slice() {
+                                                ["task", "reject", note @ ..] => Some(
+                                                    agent.task_reject(&note.join(" ")).map(|f| Some((f, true))),
+                                                ),
+                                                ["task", "resume"] => {
+                                                    Some(agent.task_resume().map(|f| f.map(|f| (f, false))))
+                                                }
+                                                ["task", "approve"] => {
+                                                    Some(agent.task_approve().map(|f| Some((f, false))))
+                                                }
+                                                _ => None,
+                                            };
+                                            if let Some(result) = continuation {
+                                                match result {
+                                                    Ok(Some((followup, from_human))) if !waiting => {
+                                                        memory_status = None;
+                                                        screen = Screen::AgentChat;
+                                                        follow_bottom = true;
+                                                        waiting = true;
+                                                        waiting_agent = Some(name.clone());
+                                                        send_to_agent(
+                                                            agent,
+                                                            name,
+                                                            followup,
+                                                            from_human,
+                                                            &mut agent_histories,
+                                                            &tx,
+                                                        );
+                                                    }
+                                                    Ok(Some(_)) => {
+                                                        memory_status = Some((
+                                                            "Готово. Агент сейчас отвечает на другой запрос — всё нужное \
+                                                             уже в контексте задачи, он учтёт это в следующем ответе."
+                                                                .to_string(),
+                                                            false,
+                                                        ));
+                                                    }
+                                                    Ok(None) => {
+                                                        memory_status = Some((
+                                                            "Готово. Агенту сейчас нечего продолжать самому: задача не была \
+                                                             на паузе, завершена или ждёт вашего решения по переходу."
+                                                                .to_string(),
+                                                            false,
+                                                        ));
+                                                    }
+                                                    Err(err) => memory_status = Some((err.to_string(), true)),
+                                                }
+                                                continue;
+                                            }
                                             memory_status = Some(match run_memory_command(&agent, &raw) {
                                                 Ok(text) => (text, false),
                                                 Err(text) => (text, true),
@@ -1091,6 +1146,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                     AppEvent::AgentResponse { name, result } => {
                         let entry = agent_histories.entry(name.clone()).or_default();
                         match result {
+                            // Пауза, поставленная во время ответа, оборвала его — вместо
+                            // ответа пометка; запрос уйдёт заново после task resume.
+                            Ok(reply) if reply.interrupted => {
+                                entry.push(HistoryItem {
+                                    role: Role::System,
+                                    text: reply.text,
+                                    debug: None,
+                                    tokens: None,
+                                    cost: None,
+                                    cost_approx: false,
+                                });
+                            }
                             Ok(reply) => {
                                 let response_tokens = reply.usage.map(|u| u.completion_tokens);
                                 let response_cost = reply.cost.map(|c| c.output);
@@ -1668,12 +1735,40 @@ fn agent_strategy_spans(info: &AgentInfo) -> Option<Vec<Span<'static>>> {
     None
 }
 
+/// Этап задачи для шапки диалога агента: бейдж этапа, пометки паузы и
+/// ожидания утверждения, «работает…» пока идёт ответ; без задачи — подсказка,
+/// как её завести.
+fn task_stage_spans(task: Option<&llm_core::TaskState>, working: bool) -> Vec<Span<'static>> {
+    let Some(task) = task else {
+        return vec![Span::styled("  ·  задачи нет (F3: task start)", Style::default().fg(Color::DarkGray))];
+    };
+    let stage_style = if task.paused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    };
+    let mut spans =
+        vec![Span::raw("  ·  этап: "), Span::styled(task.stage.as_str().to_uppercase(), stage_style)];
+    if task.paused {
+        spans.push(Span::styled(" ⏸ пауза", Style::default().fg(Color::Yellow)));
+    } else if let Some(pending) = task.pending_stage {
+        spans.push(Span::styled(
+            format!(" ⏳ ждёт утверждения → {pending}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if working {
+        spans.push(Span::styled(" — агент работает…", Style::default().fg(Color::DarkGray)));
+    }
+    spans
+}
+
 fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let area = frame.area();
     let chunks = layout_chunks_with_input_height(area, INPUT_HEIGHT_AGENT_CHAT);
     let name = state.agent_chat_name.unwrap_or("?");
 
-    let header = Paragraph::new(Line::from(vec![
+    let this_agent_waiting = state.waiting && state.waiting_agent == Some(name);
+    let mut header_spans = vec![
         Span::styled(
             "✦ Challenger",
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -1681,8 +1776,10 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::raw("  ·  агент: "),
         Span::styled(name, Style::default().fg(Color::Cyan)),
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
-        Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память"),
-    ]))
+    ];
+    header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память"));
+    let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -1690,7 +1787,6 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     );
     frame.render_widget(header, chunks[0]);
 
-    let this_agent_waiting = state.waiting && state.waiting_agent == Some(name);
     let chat_title = if this_agent_waiting {
         format!(" Диалог {} ", SPINNER_FRAMES[state.spinner_frame])
     } else {
@@ -1894,6 +1990,24 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
                     hint_style,
                 )));
             }
+            if !task.transitions.is_empty() {
+                // Панель тесная — только последние записи журнала.
+                const SHOWN: usize = 5;
+                let skipped = task.transitions.len().saturating_sub(SHOWN);
+                lines.push(Line::from(if skipped > 0 {
+                    format!("  журнал переходов (последние {SHOWN} из {}):", task.transitions.len())
+                } else {
+                    "  журнал переходов:".to_string()
+                }));
+                for record in &task.transitions[skipped..] {
+                    let color = match record.outcome {
+                        llm_core::TransitionOutcome::Applied | llm_core::TransitionOutcome::Approved => Color::Green,
+                        llm_core::TransitionOutcome::Proposed => Color::Yellow,
+                        llm_core::TransitionOutcome::Rejected | llm_core::TransitionOutcome::Refused => Color::Red,
+                    };
+                    lines.push(Line::from(Span::styled(format!("    {record}"), Style::default().fg(color))));
+                }
+            }
             if !task.invariants.is_empty() {
                 lines.push(Line::from("  инварианты этой задачи:"));
                 for (id, text) in &task.invariants {
@@ -1998,6 +2112,37 @@ fn parse_tui_transition_pair(tokens: &[&str], action: &str) -> Result<(llm_core:
     Ok((from, to))
 }
 
+/// Отправляет сообщение агенту так же, как Enter в его диалоге: реплика
+/// человека сразу появляется в истории, ответ приходит событием
+/// [`AppEvent::AgentResponse`]. `from_human = false` — служебное продолжение
+/// (после resume/approve, см. `Agent::continue_task`): в диалоге его нет.
+/// Флаги ожидания выставляет вызывающая сторона.
+fn send_to_agent(
+    agent: std::sync::Arc<llm_core::Agent>,
+    name: String,
+    prompt: String,
+    from_human: bool,
+    histories: &mut HashMap<String, Vec<HistoryItem>>,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    if from_human {
+        histories.entry(name.clone()).or_default().push(HistoryItem {
+            role: Role::User,
+            text: prompt.clone(),
+            debug: None,
+            tokens: None,
+            cost: None,
+            cost_approx: false,
+        });
+    }
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let response =
+            if from_human { agent.handle_request(&prompt).await } else { agent.continue_task(&prompt).await };
+        let _ = tx.send(AppEvent::AgentResponse { name, result: response });
+    });
+}
+
 fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, String> {
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     match tokens.first().copied() {
@@ -2100,19 +2245,6 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             Some("pause") => {
                 agent.task_pause().map_err(|err| err.to_string())?;
                 Ok("Задача поставлена на паузу.".to_string())
-            }
-            Some("resume") => {
-                agent.task_resume().map_err(|err| err.to_string())?;
-                Ok("Задача возобновлена — контекст не потерян.".to_string())
-            }
-            Some("approve") => {
-                agent.task_approve().map_err(|err| err.to_string())?;
-                Ok("Предложенный моделью переход применён.".to_string())
-            }
-            Some("reject") => {
-                let note = tokens.get(2..).map(|s| s.join(" ")).unwrap_or_default();
-                agent.task_reject(&note).map_err(|err| err.to_string())?;
-                Ok("Предложенный моделью переход отклонён — этап не изменился.".to_string())
             }
             Some("finish") => match agent.task_finish() {
                 Ok(Some(task)) => {

@@ -258,6 +258,12 @@
     border-color: var(--accent);
   }
 
+  .settings-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    border-color: var(--border);
+  }
+
   .settings-btn .dot {
     width: 6px;
     height: 6px;
@@ -1410,7 +1416,8 @@
     align-self: flex-start;
   }
 
-  .agent-message.compression {
+  .agent-message.compression,
+  .agent-message.notice {
     align-self: center;
     background: transparent;
     border: 1px dashed var(--border);
@@ -1620,6 +1627,14 @@
     color: var(--accent, #6366f1);
   }
 
+  .task-working {
+    color: var(--muted);
+  }
+
+  .task-working[hidden] {
+    display: none;
+  }
+
   .stage-badge.paused {
     background: rgba(234, 179, 8, 0.18);
     color: #ca8a04;
@@ -1641,6 +1656,38 @@
   .task-stage-bar[hidden] {
     display: none;
   }
+
+  /* Журнал переходов автомата (TaskState::transitions) — свёрнут по умолчанию,
+     чтобы полоска этапа оставалась одной строкой. */
+  .task-journal {
+    flex: 1 1 100%;
+    color: var(--muted);
+  }
+
+  .task-journal[hidden] {
+    display: none;
+  }
+
+  .task-journal summary {
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .task-journal ol {
+    margin: 6px 0 2px;
+    padding-left: 20px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+
+  .task-journal li {
+    margin: 2px 0;
+    overflow-wrap: anywhere;
+  }
+
+  .task-journal .ok { color: var(--ok); }
+  .task-journal .wait { color: var(--warn); }
+  .task-journal .bad { color: var(--error); }
 
   /* Низ диалога, рядом с полем ввода — пауза/возобновление и утверждение
      предложенного моделью перехода, без переключения на отдельную вкладку. */
@@ -2013,7 +2060,12 @@
        завершает текущую, чтобы следующий вопрос завёл новую. -->
   <div class="task-stage-bar" id="agent-task-stage-bar" hidden>
     <span class="stage-badge" id="agent-task-stage-badge"></span>
+    <span class="task-working" id="agent-task-working" hidden></span>
     <button type="button" class="settings-btn" id="agent-task-new-btn">🏁 Новая задача</button>
+    <details class="task-journal" id="agent-task-journal" hidden>
+      <summary id="agent-task-journal-summary"></summary>
+      <ol id="agent-task-journal-list"></ol>
+    </details>
   </div>
   <!-- Долговременная память (решения/знания, см. llm_core::memory) — заполняется
        только явно, кнопкой ниже, независимо от того, какая стратегия
@@ -2071,8 +2123,9 @@
       <div class="task-pending-alert" id="agent-task-pending-block" hidden>
         <span id="agent-task-pending-line"></span>
         <button type="button" class="settings-btn" id="agent-task-approve-btn">✔ Утвердить</button>
-        <input type="text" id="agent-task-reject-note" placeholder="причина отклонения (необязательно)">
-        <button type="button" class="settings-btn" id="agent-task-reject-btn">✕ Отклонить</button>
+        <input type="text" id="agent-task-reject-note" placeholder="что не так — обязательно для отклонения" required>
+        <button type="button" class="settings-btn" id="agent-task-reject-btn" disabled
+                title="Сначала укажите, что не так">✕ Отклонить</button>
       </div>
       <button type="button" class="settings-btn" id="agent-task-pause-btn">⏸ Пауза</button>
       <button type="button" class="settings-btn" id="agent-task-resume-btn">▶ Возобновить</button>
@@ -3393,6 +3446,14 @@ const agentRememberBtnEl = document.getElementById('agent-remember-btn');
 const agentTaskStageBarEl = document.getElementById('agent-task-stage-bar');
 const agentTaskStageBadgeEl = document.getElementById('agent-task-stage-badge');
 const agentTaskNewBtnEl = document.getElementById('agent-task-new-btn');
+const agentTaskWorkingEl = document.getElementById('agent-task-working');
+// Имя агента, чей ответ сейчас ожидается (см. sendAgentChatMessage), и
+// последнее отрисованное состояние задачи — для подписи у бейджа этапа.
+let agentTaskWorkingFor = null;
+let currentTaskSnapshot = null;
+const agentTaskJournalEl = document.getElementById('agent-task-journal');
+const agentTaskJournalSummaryEl = document.getElementById('agent-task-journal-summary');
+const agentTaskJournalListEl = document.getElementById('agent-task-journal-list');
 const agentTaskActionBarEl = document.getElementById('agent-task-action-bar');
 const agentTaskPendingBlockEl = document.getElementById('agent-task-pending-block');
 const agentTaskPendingLineEl = document.getElementById('agent-task-pending-line');
@@ -3599,12 +3660,14 @@ function renderMemoryPanel(info) {
 // Задача заводится автоматически первым вопросом агенту (ensure_task на
 // бэкенде) — до первого сообщения task === null, полоски скрыты.
 function renderTaskBar(task) {
+  currentTaskSnapshot = task;
   agentTaskStageBarEl.hidden = !task;
   agentTaskActionBarEl.hidden = !task;
   if (!task) return;
 
   agentTaskStageBadgeEl.textContent = task.paused ? `${task.stage} ⏸` : task.stage;
   agentTaskStageBadgeEl.classList.toggle('paused', !!task.paused);
+  renderTaskWorking(task);
 
   agentTaskPauseBtnEl.hidden = !!task.paused;
   agentTaskResumeBtnEl.hidden = !task.paused;
@@ -3613,12 +3676,46 @@ function renderTaskBar(task) {
   // approve/reject человеком (см. llm_core::memory::TaskState::pending_stage).
   if (task.pending_stage) {
     agentTaskPendingBlockEl.hidden = false;
+    syncRejectButton();
     agentTaskPendingLineEl.textContent =
       `⏳ Предложен переход в «${task.pending_stage}» (итог: ${task.pending_outcome || '—'})`;
   } else {
     agentTaskPendingBlockEl.hidden = true;
     agentTaskPendingLineEl.textContent = '';
   }
+
+  renderTaskJournal(task.transitions || []);
+}
+
+// Журнал переходов (см. llm_core::memory::TransitionRecord): каждая попытка
+// сменить этап — применённая, предложенная, утверждённая, отклонённая или
+// отвергнутая автоматом, — от старых к новым.
+const TRANSITION_ACTOR_LABELS = { model: 'модель', human: 'человек' };
+const TRANSITION_OUTCOME_VIEW = {
+  applied: ['✔', 'применён', 'ok'],
+  approved: ['✔', 'утверждён', 'ok'],
+  proposed: ['⏳', 'ждёт утверждения', 'wait'],
+  rejected: ['✖', 'отклонён', 'bad'],
+  refused: ['✖', 'запрещён', 'bad'],
+};
+
+function renderTaskJournal(records) {
+  agentTaskJournalEl.hidden = records.length === 0;
+  const refused = records.filter((r) => r.outcome === 'refused').length;
+  agentTaskJournalSummaryEl.textContent =
+    `Журнал переходов: ${records.length}` + (refused ? ` (запрещено: ${refused})` : '');
+  agentTaskJournalListEl.replaceChildren(
+    ...records.map((r) => {
+      const [mark, label, cls] = TRANSITION_OUTCOME_VIEW[r.outcome] || ['•', r.outcome, ''];
+      const li = document.createElement('li');
+      const head = document.createElement('span');
+      head.className = cls;
+      head.textContent = `${mark} ${r.from} → ${r.to} · ${label}`;
+      li.append(head, ` · ${TRANSITION_ACTOR_LABELS[r.actor] || r.actor}`);
+      if (r.reason) li.append(`: ${r.reason}`);
+      return li;
+    }),
+  );
 }
 
 async function postAgentMemory(name, path, body) {
@@ -3746,11 +3843,15 @@ agentTaskResumeBtnEl.addEventListener('click', async () => {
   }
   renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
+  // Агент сразу продолжает с незавершённого этапа (или отвечает на запрос,
+  // прерванный паузой) — служебным продолжением, которого в чате не видно;
+  // followup пуст, если ему сейчас нечего делать самому.
+  if (data.followup) await sendAgentChatMessage(data.followup, { continuation: true });
 });
 
 agentTaskApproveBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
-  if (!name) return;
+  if (!name || agentTaskWorkingFor === name) return;
   agentTaskErrorEl.hidden = true;
   const data = await postAgentMemory(name, 'task/approve', {});
   if (data.error) {
@@ -3759,26 +3860,49 @@ agentTaskApproveBtnEl.addEventListener('click', async () => {
   }
   renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
-  // Переход утверждён — модель уже видит новый этап (он читается из БД при
-  // каждом запросе), но без этого обмена она заговорит только на СЛЕДУЮЩЕЕ
-  // сообщение человека. Отправляем продолжение сами, чтобы после approve не
-  // нужно было вручную набирать что-то вроде "продолжай".
-  await sendAgentChatMessage('Продолжай.');
+  // Переход утверждён — без этого обмена модель заговорит только на СЛЕДУЮЩЕЕ
+  // сообщение человека. Отправляем служебное продолжение сами: в чате его не
+  // видно, появляется только ответ агента.
+  if (data.followup) await sendAgentChatMessage(data.followup, { continuation: true });
+});
+
+// Отклонить без причины нельзя: агенту нечего было бы исправлять (бэкенд
+// такой запрос тоже отвергнет — см. Agent::task_reject).
+function syncRejectButton() {
+  agentTaskRejectBtnEl.disabled =
+    agentTaskRejectNoteEl.value.trim() === '' || agentTaskWorkingFor === currentAgentChatName;
+}
+
+agentTaskRejectNoteEl.addEventListener('input', syncRejectButton);
+agentTaskRejectNoteEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !agentTaskRejectBtnEl.disabled) {
+    event.preventDefault();
+    agentTaskRejectBtnEl.click();
+  }
 });
 
 agentTaskRejectBtnEl.addEventListener('click', async () => {
   const name = currentAgentChatName;
-  if (!name) return;
+  if (!name || agentTaskWorkingFor === name) return;
   agentTaskErrorEl.hidden = true;
   const note = agentTaskRejectNoteEl.value.trim();
+  if (!note) {
+    showTaskError('Укажите, что не так, — без причины агенту нечего исправлять.');
+    agentTaskRejectNoteEl.focus();
+    return;
+  }
   const data = await postAgentMemory(name, 'task/reject', { note });
   if (data.error) {
     showTaskError(data.error);
     return;
   }
   agentTaskRejectNoteEl.value = '';
+  syncRejectButton();
   renderTaskBar(data.agent ? data.agent.task : null);
   await refreshAfterMemoryAction(name);
+  // Как и после approve — продолжаем сами: агент получает замечание и сразу
+  // перерабатывает этап (план), не дожидаясь, пока человек напишет «переделай».
+  if (data.followup) await sendAgentChatMessage(data.followup);
 });
 
 // "Новая задача" — завершает текущую (для всех, если бы у неё были другие
@@ -4153,6 +4277,12 @@ function renderAgentMessage(msg) {
     row.textContent = '🗜️ ' + msg.text;
     return row;
   }
+  // Служебная пометка о задаче (например, «⏸ Задача поставлена на паузу.») —
+  // тот же неброский вид, что у сжатия контекста, но без его значка.
+  if (msg.role === 'notice') {
+    row.textContent = msg.text;
+    return row;
+  }
   const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
   // Markdown — только для user/assistant (сути диалога), как и в addRow
   // простого чата: "Ошибка: ..." — техническое сообщение, не ответ модели,
@@ -4440,7 +4570,9 @@ agentChatToggleBtn.addEventListener('click', async () => {
 // функцию, аргументом придёт объект события, а не текст; тогда используем
 // поле ввода, как при обычном вызове без промпта, вместо отправки события
 // как есть (оно бы не прошло как JSON-строка на бэкенде).
-async function sendAgentChatMessage(promptOverride) {
+// `continuation` — служебное продолжение (после «Возобновить»/«Утвердить»):
+// реплики человека в чате не появляется, и сервер не сохраняет её в историю.
+async function sendAgentChatMessage(promptOverride, { continuation = false } = {}) {
   const name = currentAgentChatName;
   if (!name) return;
   const hasOverride = typeof promptOverride === 'string';
@@ -4449,28 +4581,47 @@ async function sendAgentChatMessage(promptOverride) {
   if (!hasOverride) agentChatInputEl.value = '';
   agentChatSendBtn.disabled = true;
 
-  const userMsg = { role: 'user', text: prompt };
-  agentChats[name].push(userMsg);
-  const userRow = renderAgentMessage(userMsg);
-  agentChatMainEl.appendChild(userRow);
-  agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+  // Задача заводится ДО обращения к модели (а не внутри /ask), чтобы этап
+  // «planning» появился в чате сразу, пока модель ещё думает над ответом.
+  const ensured = await postAgentMemory(name, 'task/ensure', {}).catch(() => null);
+  if (ensured && ensured.agent && currentAgentChatName === name) renderTaskBar(ensured.agent.task);
 
+  const userMsg = { role: 'user', text: prompt };
+  let userRow = null;
+  if (!continuation) {
+    agentChats[name].push(userMsg);
+    userRow = renderAgentMessage(userMsg);
+    agentChatMainEl.appendChild(userRow);
+    agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+  }
+
+  // Пока агент отвечает — «работает над этапом …» у бейджа и опрос состояния
+  // задачи: смена этапа посреди ответа (move_stage) видна сразу, а не после него.
+  agentTaskWorkingFor = name;
+  if (currentAgentChatName === name) renderTaskWorking(currentTaskSnapshot);
+  const taskPoll = setInterval(() => refreshTaskWhileWorking(name), TASK_POLL_MS);
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}/ask`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, continuation }),
     });
     const data = await res.json();
+    // Пауза, поставленная во время ответа, обрывает его: показываем пометку
+    // вместо ответа — запрос уйдёт заново после «Возобновить».
     const msg = data.error
       ? { role: 'error', text: data.error }
-      : { role: 'assistant', text: data.answer, requestJson: data.requestJson, responseJson: data.responseJson };
+      : data.interrupted
+        ? { role: 'notice', text: data.answer }
+        : { role: 'assistant', text: data.answer, requestJson: data.requestJson, responseJson: data.responseJson };
     if (!data.error && data.usage) {
       userMsg.requestTokens = data.usage.prompt_tokens;
       userMsg.requestUsage = data.usage;
       msg.responseTokens = data.usage.completion_tokens;
       msg.usage = data.usage;
-      if (currentAgentChatName === name) setAgentMessageTokens(userRow, 'user', userMsg.requestTokens, data.usage);
+      if (currentAgentChatName === name && userRow) {
+        setAgentMessageTokens(userRow, 'user', userMsg.requestTokens, data.usage);
+      }
     }
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
@@ -4534,11 +4685,37 @@ async function sendAgentChatMessage(promptOverride) {
       agentChatMainEl.appendChild(renderAgentMessage(msg));
     }
   } finally {
+    clearInterval(taskPoll);
+    agentTaskWorkingFor = null;
     if (currentAgentChatName === name) {
+      renderTaskWorking(currentTaskSnapshot);
       agentChatSendBtn.disabled = false;
       agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
       agentChatInputEl.focus();
     }
+  }
+}
+
+const TASK_POLL_MS = 1500;
+
+function renderTaskWorking(task) {
+  const working = !!task && agentTaskWorkingFor === currentAgentChatName && !task.paused;
+  agentTaskWorkingEl.hidden = !working;
+  agentTaskWorkingEl.textContent = working ? `⏳ агент работает над этапом ${task.stage}…` : '';
+  // Решать по предложенному переходу — только когда ответ дописан: иначе
+  // продолжение после approve/reject ушло бы параллельно с незаконченным ответом.
+  agentTaskApproveBtnEl.disabled = agentTaskWorkingFor === currentAgentChatName;
+  syncRejectButton();
+}
+
+async function refreshTaskWhileWorking(name) {
+  if (currentAgentChatName !== name) return;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/task`);
+    const data = await res.json();
+    if (!data.error && currentAgentChatName === name && agentTaskWorkingFor === name) renderTaskBar(data.task || null);
+  } catch (e) {
+    // Опрос — лишь подсказка: итог всё равно придёт с ответом /ask.
   }
 }
 

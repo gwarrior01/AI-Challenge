@@ -97,6 +97,10 @@ fn default_strategy_str() -> String {
 #[derive(Deserialize)]
 struct AgentAskRequest {
     prompt: String,
+    /// Служебное продолжение (после «Возобновить»/«Утвердить»), а не реплика
+    /// человека: уходит модели, но не сохраняется в историю — см. Agent::continue_task.
+    #[serde(default)]
+    continuation: bool,
 }
 
 #[derive(Deserialize)]
@@ -605,6 +609,26 @@ async fn task_expect_agent(
     }
 }
 
+/// Заводит задачу агенту, если её ещё нет (см. ensure_task), — фронтенд
+/// вызывает это ДО отправки сообщения, чтобы этап «planning» появился в чате
+/// сразу, а не только когда модель ответит.
+async fn task_ensure_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    ensure_task(&agent, &name);
+    Json(serde_json::json!({ "agent": agent.info() }))
+}
+
+/// Текущее состояние задачи агента — фронтенд опрашивает его, пока агент
+/// отвечает, чтобы смена этапа посреди ответа (move_stage) была видна сразу.
+async fn task_state_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    Json(serde_json::json!({ "task": agent.task_state() }))
+}
+
 /// Ставит задачу на паузу — на любом этапе, независимо от него.
 async fn task_pause_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
     let Some(agent) = state.agents.get(&name) else {
@@ -624,7 +648,9 @@ async fn task_resume_agent(State(state): State<AppState>, Path(name): Path<Strin
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     match agent.task_resume() {
-        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        // followup — сообщение агенту, которое фронтенд сразу отправляет, чтобы
+        // работа продолжилась с незавершённого этапа (см. Agent::task_resume).
+        Ok(followup) => Json(serde_json::json!({ "agent": agent.info(), "followup": followup })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -637,7 +663,9 @@ async fn task_approve_agent(State(state): State<AppState>, Path(name): Path<Stri
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     match agent.task_approve() {
-        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        // followup — служебное продолжение, которое фронтенд сразу отправляет
+        // агенту как continuation (в чате не видно), см. Agent::task_approve.
+        Ok(followup) => Json(serde_json::json!({ "agent": agent.info(), "followup": followup })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -658,7 +686,9 @@ async fn task_reject_agent(
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     match agent.task_reject(&req.note) {
-        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        // followup — сообщение агенту, которое фронтенд сразу отправляет, чтобы
+        // этап был переработан с учётом причины (см. Agent::task_reject).
+        Ok(followup) => Json(serde_json::json!({ "agent": agent.info(), "followup": followup })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
 }
@@ -835,7 +865,12 @@ async fn ask_agent(
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
     ensure_task(&agent, &name);
-    match agent.handle_request(&req.prompt).await {
+    let result = if req.continuation {
+        agent.continue_task(&req.prompt).await
+    } else {
+        agent.handle_request(&req.prompt).await
+    };
+    match result {
         Ok(reply) => {
             // Свежий статус стратегии ПОСЛЕ этого обмена (и возможного пересчёта
             // сводки/фактов выше) — интерфейс показывает по нему прогресс до
@@ -843,6 +878,9 @@ async fn ask_agent(
             let info = agent.info();
             Json(serde_json::json!({
                 "answer": reply.text,
+                // Ответ оборван паузой задачи — answer тогда пояснение, а не ответ
+                // модели; запрос уйдёт заново при возобновлении (см. AgentReply::interrupted).
+                "interrupted": reply.interrupted,
                 "usage": reply.usage,
                 "context_window": agent.context_window(),
                 "summarized": reply.summarized,
@@ -976,6 +1014,8 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/switch", post(switch_branch))
         .route("/api/agents/:name/remember", post(remember_agent))
         .route("/api/agents/:name/forget", post(forget_agent))
+        .route("/api/agents/:name/task", axum::routing::get(task_state_agent))
+        .route("/api/agents/:name/task/ensure", post(task_ensure_agent))
         .route("/api/agents/:name/task/start", post(task_start_agent))
         .route("/api/agents/:name/task/join", post(task_join_agent))
         .route("/api/agents/:name/task/set", post(task_set_agent))
