@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub use agent::{
     Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
-    FactsInfo, ProfileStatus, SlidingWindowInfo,
+    FactsInfo, ProfileStatus, SlidingWindowInfo, ToolCallRecord,
 };
 
 pub mod context;
@@ -24,6 +24,9 @@ pub use profile::{list_profiles, DEFAULT_PROFILE, NONE_PROFILE};
 
 pub mod invariants;
 pub use invariants::Invariant;
+
+pub mod mcp;
+pub use mcp::{McpManager, McpServerInfo, McpStatus, McpToolInfo};
 
 pub mod pricing;
 pub use pricing::Pricing;
@@ -74,12 +77,12 @@ struct ChatRequest<'a> {
 
 /// Описание одного инструмента (function calling, формат OpenAI-совместимого
 /// API) — то, что модель может вызвать вместо (или вместе с) текстового
-/// ответа. Единственный сегодняшний потребитель — конечный автомат задачи
-/// (см. [`crate::agent::Agent::handle_request`] и `task_machine` в `agent.rs`):
-/// инструменты предлагаются модели, только пока активна задача и не на паузе,
-/// а их описания — это и есть инструкция модели об автомате (см. документацию
-/// там), поэтому здесь сознательно нет отдельного текстового промпта "как
-/// пользоваться инструментами".
+/// ответа. Два источника: конечный автомат задачи (см.
+/// [`crate::agent::Agent::handle_request`]) — его инструменты предлагаются
+/// модели, только пока активна задача и не на паузе, — и MCP-серверы (см.
+/// [`crate::mcp`]), чьи инструменты предлагаются в каждом запросе. Описания
+/// инструментов — это и есть инструкция модели, поэтому здесь сознательно нет
+/// отдельного текстового промпта "как пользоваться инструментами".
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDefinition {
     pub name: String,

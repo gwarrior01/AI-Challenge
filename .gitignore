@@ -7,3 +7,4 @@ agents.db
 agents.db-journal
 agents.db-wal
 agents.db-shm
+mcp.json

@@ -50,6 +50,17 @@
 //!   llm-cli agent invariants show <id>             -- показать текст одного инварианта
 //!   llm-cli agent invariants create <id>           -- создать новый инвариант (пустой шаблон) на диске
 //!   llm-cli agent invariants remove <id>           -- удалить инвариант (единственный способ его снять)
+//!   llm-cli mcp [list]                             -- подключиться к MCP-серверам и вывести их инструменты
+//!   llm-cli mcp tools <сервер>                     -- инструменты одного сервера с параметрами
+//!   llm-cli mcp enable|disable <сервер>            -- включить/выключить сервер (флаг пишется в mcp.json)
+//!   llm-cli mcp call <сервер> <инструмент> [JSON]  -- вызвать инструмент напрямую, без модели
+//!
+//! ## MCP (см. llm_core::mcp)
+//!   Серверы описываются в `mcp.json` (путь переопределяется `LLM_MCP_CONFIG`) в
+//!   формате `mcpServers` Claude Desktop: `command`/`args`/`env` — локальный сервер
+//!   через stdio, `url`/`headers` — удалённый по Streamable HTTP, `enabled: false` —
+//!   сервер остаётся в конфигурации, но не подключается. Инструменты подключённых
+//!   серверов предлагаются модели в каждом запросе к агенту; вызовы печатаются в чате.
 //!
 //! ## Инварианты (см. llm_core::invariants)
 //!   Три источника, каждый со своим масштабом действия:
@@ -141,6 +152,10 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("agent") {
         return run_agent_cli(&args[1..]).await;
     }
+    // MCP-команды не обращаются к LLM — им не нужны LLM_API_URL/LLM_API_KEY.
+    if args.first().map(String::as_str) == Some("mcp") {
+        return run_mcp_cli(&args[1..]).await;
+    }
 
     let client = LlmClient::from_env()?;
 
@@ -194,6 +209,126 @@ fn format_usage(usage: &llm_core::Usage) -> String {
         "[токены: запрос {} + ответ {} = всего {}]",
         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
     )
+}
+
+/// Разбирает и выполняет подкоманды `llm-cli mcp ...`.
+async fn run_mcp_cli(args: &[String]) -> Result<()> {
+    let mcp = llm_core::McpManager::from_env();
+    if let Some(err) = mcp.config_error() {
+        bail!("{err}");
+    }
+    match args.first().map(String::as_str) {
+        None | Some("list") => {
+            if mcp.servers().is_empty() {
+                println!("В {} нет ни одного MCP-сервера.", mcp.config_path().display());
+                return Ok(());
+            }
+            println!("Подключение к MCP-серверам из {}…\n", mcp.config_path().display());
+            mcp.connect_all().await;
+            for server in mcp.servers() {
+                print_mcp_server(&server);
+                for tool in &server.tools {
+                    let description = tool.description.as_deref().unwrap_or("");
+                    let first_line = description.lines().next().unwrap_or("");
+                    println!("    • {} — {first_line}", tool.name);
+                }
+                println!();
+            }
+            Ok(())
+        }
+        Some("tools") => {
+            let name = args.get(1).ok_or_else(|| anyhow!("укажите сервер: llm-cli mcp tools <сервер>"))?;
+            let server = mcp.server(name).ok_or_else(|| anyhow!("MCP-сервер «{name}» не найден"))?;
+            if !server.enabled {
+                bail!("MCP-сервер «{name}» выключен — включите: llm-cli mcp enable {name}");
+            }
+            mcp.connect(name).await;
+            let server = mcp.server(name).expect("сервер только что был");
+            print_mcp_server(&server);
+            for tool in &server.tools {
+                println!("\n  {}{}", tool.name, tool.title.as_ref().map(|t| format!(" ({t})")).unwrap_or_default());
+                if let Some(description) = &tool.description {
+                    for line in description.lines() {
+                        println!("    {line}");
+                    }
+                }
+                println!("    параметры: {}", tool.params_summary());
+            }
+            Ok(())
+        }
+        Some(action @ ("enable" | "disable")) => {
+            let name = args.get(1).ok_or_else(|| anyhow!("укажите сервер: llm-cli mcp {action} <сервер>"))?;
+            let enabled = action == "enable";
+            mcp.set_enabled(name, enabled).await?;
+            let server = mcp.server(name).expect("сервер только что был");
+            print_mcp_server(&server);
+            Ok(())
+        }
+        Some("call") => {
+            let (Some(server), Some(tool)) = (args.get(1), args.get(2)) else {
+                bail!("использование: llm-cli mcp call <сервер> <инструмент> [JSON-доводы]");
+            };
+            let arguments = args.get(3).map(String::as_str).unwrap_or("{}");
+            mcp.connect(server).await;
+            if let Some(llm_core::McpStatus::Failed { error }) = mcp.server(server).map(|s| s.status) {
+                bail!("не удалось подключиться к «{server}»: {error}");
+            }
+            let result = mcp
+                .call_tool(server, tool, arguments)
+                .await
+                .ok_or_else(|| anyhow!("у сервера «{server}» нет инструмента «{tool}» (или сервер выключен)"))?;
+            if result.is_error {
+                println!("[ошибка инструмента]");
+            }
+            println!("{}", result.text);
+            Ok(())
+        }
+        Some(other) => bail!("неизвестная команда `mcp {other}` — есть list, tools, enable, disable, call"),
+    }
+}
+
+fn print_mcp_server(server: &llm_core::McpServerInfo) {
+    let version = server.server_version.as_ref().map(|v| format!(" · {v}")).unwrap_or_default();
+    let tools = if server.status == llm_core::McpStatus::Connected {
+        format!(" · инструментов: {}", server.tools.len())
+    } else {
+        String::new()
+    };
+    println!("{} [{}]{version}{tools}", server.name, server.status.label());
+    println!("  {}", server.transport);
+    if let Some(description) = &server.description {
+        println!("  {description}");
+    }
+    if let llm_core::McpStatus::Failed { error } = &server.status {
+        for line in error.lines() {
+            println!("  ! {line}");
+        }
+    }
+}
+
+/// Перед чатом с агентом подключается к MCP-серверам (их инструменты агент
+/// предлагает модели) и печатает, что получилось.
+async fn connect_mcp_for_chat(manager: &AgentManager) {
+    let mcp = manager.mcp();
+    if let Some(err) = mcp.config_error() {
+        eprintln!("MCP: {err}");
+        return;
+    }
+    if mcp.servers().iter().all(|s| !s.enabled) {
+        return;
+    }
+    mcp.connect_all().await;
+    for server in mcp.servers().iter().filter(|s| s.enabled) {
+        match &server.status {
+            llm_core::McpStatus::Connected => {
+                println!("MCP «{}»: подключён, инструментов: {}", server.name, server.tools.len())
+            }
+            llm_core::McpStatus::Failed { error } => {
+                println!("MCP «{}»: ошибка — {}", server.name, error.lines().next().unwrap_or(""))
+            }
+            other => println!("MCP «{}»: {}", server.name, other.label()),
+        }
+    }
 }
 
 /// Разбирает и выполняет подкоманды `llm-cli agent ...`.
@@ -256,6 +391,7 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent start <имя>"))?;
             manager.start(&name)?;
             let agent = manager.get(&name).expect("агент только что запущен");
+            connect_mcp_for_chat(&manager).await;
             println!("Агент «{name}» запущен. Введите запрос, `stop` или Ctrl+D — остановить и выйти.\n");
             print_restored_history(&agent);
             run_agent_chat(&manager, agent).await
@@ -1091,6 +1227,10 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
 
         match agent.handle_request(prompt).await {
             Ok(reply) => {
+                for call in &reply.tool_calls {
+                    let mark = if call.is_error { "⚠" } else { "🔧" };
+                    println!("[{mark} {} → {}]", call.headline(120), call.result_preview(200));
+                }
                 println!("{}", reply.text);
                 if let Some(usage) = reply.usage {
                     session_tokens += usage.total_tokens as u64;

@@ -350,6 +350,59 @@ pub struct AgentReply {
     /// пояснение для человека. Сам запрос запомнен в задаче и уйдёт заново
     /// при возобновлении (см. [`Agent::task_resume`]).
     pub interrupted: bool,
+    /// Инструменты, которые модель вызвала в рамках этого обмена, по порядку —
+    /// и MCP-серверов (см. [`crate::mcp`]), и встроенные инструменты автомата
+    /// задачи. Как и `cost`, не персистится: интерфейсы показывают эти вызовы
+    /// рядом с ответом, пока открыт диалог.
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+/// Один вызов инструмента моделью за обмен — для показа в интерфейсах.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// MCP-сервер, которому ушёл вызов; `None` — встроенный инструмент
+    /// автомата задачи (`move_stage`/`update_step`).
+    pub server: Option<String>,
+    /// Имя инструмента — у MCP-инструментов исходное, как его назвал сервер
+    /// (без префикса `mcp__<сервер>__`, см. [`crate::mcp::qualified_tool_name`]).
+    pub tool: String,
+    /// Доводы вызова — сырой JSON-текст, как его прислала модель.
+    pub arguments: String,
+    /// Результат, который ушёл модели.
+    pub result: String,
+    /// Вызов завершился ошибкой (MCP-сервер вернул `isError`, вызов не удался,
+    /// или инструмент неизвестен).
+    pub is_error: bool,
+}
+
+impl ToolCallRecord {
+    /// Однострочное описание вызова для чата: `сервер · инструмент(доводы)`,
+    /// доводы укорочены до `max_args` символов.
+    pub fn headline(&self, max_args: usize) -> String {
+        let args = self.arguments.trim();
+        let args = if args.is_empty() || args == "{}" {
+            String::new()
+        } else if args.chars().count() > max_args {
+            args.chars().take(max_args).collect::<String>() + "…"
+        } else {
+            args.to_string()
+        };
+        match &self.server {
+            Some(server) => format!("{server} · {}({args})", self.tool),
+            None => format!("автомат задачи · {}({args})", self.tool),
+        }
+    }
+
+    /// Результат одной строкой (переводы строк и повторные пробелы схлопнуты),
+    /// укороченный до `max` символов — полный результат ушёл модели.
+    pub fn result_preview(&self, max: usize) -> String {
+        let flat = self.result.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() > max {
+            flat.chars().take(max).collect::<String>() + "…"
+        } else {
+            flat
+        }
+    }
 }
 
 /// Стоимость одного обмена, разложенная на входную и выходную часть — так
@@ -447,6 +500,9 @@ pub struct Agent {
     // crate::memory (module doc), Agent::long_term_memory и Agent::task_state,
     // которые читают их из БД заново при каждом обращении.
     db: Arc<Db>,
+    /// MCP-серверы (см. [`crate::mcp`]) — общие для всех агентов: инструменты
+    /// всех подключённых сейчас серверов предлагаются модели в каждом запросе.
+    mcp: Arc<crate::mcp::McpManager>,
 }
 
 impl Agent {
@@ -454,6 +510,7 @@ impl Agent {
         config: AgentConfig,
         client: LlmClient,
         db: Arc<Db>,
+        mcp: Arc<crate::mcp::McpManager>,
         branches: Branches,
         summary: CompressionState,
         facts: FactsState,
@@ -468,6 +525,7 @@ impl Agent {
             summary: Mutex::new(summary),
             facts: Mutex::new(facts),
             db,
+            mcp,
         }
     }
 
@@ -1198,10 +1256,14 @@ impl Agent {
         model: &str,
         messages: &[ChatMessage],
         options: &ChatOptions,
-    ) -> Result<crate::ChatCompletion> {
-        let tools = Self::task_tool_definitions();
+        task_tools: bool,
+        mcp_tools: Vec<crate::ToolDefinition>,
+    ) -> Result<(crate::ChatCompletion, Vec<ToolCallRecord>)> {
+        let mut tools = if task_tools { Self::task_tool_definitions() } else { Vec::new() };
+        tools.extend(mcp_tools);
         let mut wire: Vec<crate::RequestMessage> = messages.iter().map(crate::RequestMessage::from).collect();
         let mut usage_total: Option<Usage> = None;
+        let mut records: Vec<ToolCallRecord> = Vec::new();
         // Модель нередко пишет содержательный текст (например, сам черновик)
         // В ТОМ ЖЕ круге, где вызывает инструмент — например, если предложенный
         // переход отклонён программой, следующий круг ссылается на этот текст
@@ -1212,7 +1274,10 @@ impl Agent {
         let mut visible_parts: Vec<String> = Vec::new();
 
         for round in 0..MAX_TOOL_ROUNDS {
-            let require_tool_call = round == 0;
+            // Принуждение к вызову нужно только автомату задачи (см. документацию
+            // выше): без задачи, с одними MCP-инструментами, модель сама решает,
+            // нужен ли ей инструмент для ответа.
+            let require_tool_call = round == 0 && task_tools;
             let completion = self.client.chat_with_tools(model, &wire, &tools, require_tool_call, options).await?;
             usage_total = sum_usage(usage_total, completion.usage);
             if !completion.content.trim().is_empty() {
@@ -1225,7 +1290,7 @@ impl Agent {
                 // тогда человеку нечего утверждать, а модель просит
                 // «подтвердить». Один принудительный круг, где доступен
                 // только move_stage, доводит переработку до нового предложения.
-                if self.awaiting_reproposal() {
+                if task_tools && self.awaiting_reproposal() {
                     wire.push(crate::RequestMessage::from(&ChatMessage::assistant(completion.content.clone())));
                     wire.push(crate::RequestMessage::from(&ChatMessage::user(
                         "[Автомат задачи] Ты переработал результат этапа по замечанию, но не предложил переход \
@@ -1238,15 +1303,16 @@ impl Agent {
                         self.client.chat_with_tools(model, &wire, &move_stage_only, true, options).await?;
                     usage_total = sum_usage(usage_total, forced.usage);
                     for call in &forced.tool_calls {
-                        self.execute_task_tool(call);
+                        records.push(self.execute_tool(call).await);
                     }
                 }
-                return Ok(crate::ChatCompletion {
+                let completion = crate::ChatCompletion {
                     content: visible_parts.join("\n\n"),
                     usage: usage_total,
                     tool_calls: Vec::new(),
                     ..completion
-                });
+                };
+                return Ok((completion, records));
             }
 
             wire.push(crate::RequestMessage::assistant_tool_calls(
@@ -1254,8 +1320,9 @@ impl Agent {
                 completion.tool_calls.clone(),
             ));
             for call in &completion.tool_calls {
-                let result_text = self.execute_task_tool(call);
-                wire.push(crate::RequestMessage::tool_result(call.id.clone(), result_text));
+                let record = self.execute_tool(call).await;
+                wire.push(crate::RequestMessage::tool_result(call.id.clone(), record.result.clone()));
+                records.push(record);
             }
         }
 
@@ -1266,12 +1333,37 @@ impl Agent {
         if !completion.content.trim().is_empty() {
             visible_parts.push(completion.content.clone());
         }
-        Ok(crate::ChatCompletion {
+        let completion = crate::ChatCompletion {
             content: visible_parts.join("\n\n"),
             usage: usage_total,
             tool_calls: Vec::new(),
             ..completion
-        })
+        };
+        Ok((completion, records))
+    }
+
+    /// Выполняет один вызов инструмента моделью: инструмент MCP-сервера уходит
+    /// на свой сервер (см. [`crate::mcp::McpManager::call`]), остальное —
+    /// встроенные инструменты автомата задачи.
+    async fn execute_tool(&self, call: &crate::ToolCallWire) -> ToolCallRecord {
+        let arguments = call.function.arguments.clone();
+        if let Some(result) = self.mcp.call(&call.function.name, &arguments).await {
+            return ToolCallRecord {
+                server: Some(result.server),
+                tool: result.tool,
+                arguments,
+                result: result.text,
+                is_error: result.is_error,
+            };
+        }
+        let is_known = matches!(call.function.name.as_str(), "move_stage" | "update_step");
+        ToolCallRecord {
+            server: None,
+            tool: call.function.name.clone(),
+            result: self.execute_task_tool(call),
+            arguments,
+            is_error: !is_known,
+        }
     }
 
     /// `true`, если человек отклонил переход с текущего этапа, а модель ещё не
@@ -1649,7 +1741,11 @@ impl Agent {
         // конечная и не ждёт утверждения человеком уже предложенного перехода — во всех этих
         // случаях модель и так не должна двигать автомат, поэтому инструменты просто не даются
         // (см. документацию Stage::directive/format_stage_block, откуда модель узнаёт, почему).
-        let tools_active = task_tools_offered(active_task.as_ref());
+        let task_tools = task_tools_offered(active_task.as_ref());
+        // Инструменты подключённых MCP-серверов (см. crate::mcp) предлагаются в
+        // каждом запросе, независимо от задачи — список читается заново, т.к.
+        // серверы могли только что подключиться/отключиться.
+        let mcp_tools = self.mcp.tool_definitions();
         // Просьба перескочить обязательный этап перехватывается ДО модели (см.
         // crate::memory::skip_request_target): переход автомат не пропустит и
         // так, но без этого модель могла бы послушаться и написать реализацию
@@ -1714,20 +1810,21 @@ impl Agent {
         // стоявшая на паузе к началу запроса, не отслеживается: на паузе с
         // агентом можно разговаривать, он лишь не двигает задачу.
         let pause_watch = active_task.as_ref().filter(|t| !t.paused).map(|t| t.name.clone());
-        let completion = if let Some(refusal) = &stage_skip_refusal {
-            crate::ChatCompletion {
+        let (completion, tool_calls) = if let Some(refusal) = &stage_skip_refusal {
+            let completion = crate::ChatCompletion {
                 content: refusal.clone(),
                 usage: None,
                 request_json: String::new(),
                 response_json: String::new(),
                 tool_calls: Vec::new(),
-            }
+            };
+            (completion, Vec::new())
         } else {
             let exchange = async {
-                if tools_active {
-                    self.run_tool_loop(&model, &messages, &options).await
+                if task_tools || !mcp_tools.is_empty() {
+                    self.run_tool_loop(&model, &messages, &options, task_tools, mcp_tools).await
                 } else {
-                    self.client.chat_with_model(&model, &messages, &options).await
+                    self.client.chat_with_model(&model, &messages, &options).await.map(|c| (c, Vec::new()))
                 }
             };
             let completion = self.unless_paused(pause_watch.as_deref(), exchange).await?;
@@ -1760,6 +1857,7 @@ impl Agent {
                         response_json: String::new(),
                         cost: None,
                         interrupted: true,
+                        tool_calls: Vec::new(),
                     });
                 }
             }
@@ -1812,6 +1910,7 @@ impl Agent {
             response_json: completion.response_json,
             cost,
             interrupted: false,
+            tool_calls,
         })
     }
 
@@ -2807,22 +2906,42 @@ impl Db {
 pub struct AgentManager {
     client: LlmClient,
     db: Arc<Db>,
+    mcp: Arc<crate::mcp::McpManager>,
     agents: RwLock<HashMap<String, Arc<Agent>>>,
 }
 
 impl AgentManager {
+    /// Реестр без MCP-серверов — см. [`AgentManager::with_mcp`].
     pub fn new(client: LlmClient, store_path: impl Into<PathBuf>) -> Result<Self> {
+        Self::with_mcp(client, store_path, Arc::new(crate::mcp::McpManager::empty()))
+    }
+
+    /// Реестр, агенты которого предлагают модели инструменты MCP-серверов
+    /// `mcp` (см. [`crate::mcp`]). Подключаться к серверам — забота
+    /// вызывающего ([`crate::mcp::McpManager::connect_all`]): интерфейс сам
+    /// решает, ждать подключения или вести его в фоне.
+    pub fn with_mcp(
+        client: LlmClient,
+        store_path: impl Into<PathBuf>,
+        mcp: Arc<crate::mcp::McpManager>,
+    ) -> Result<Self> {
         let db = Arc::new(Db::open(&store_path.into())?);
-        let manager = Self { client, db, agents: RwLock::new(HashMap::new()) };
+        let manager = Self { client, db, mcp, agents: RwLock::new(HashMap::new()) };
         manager.load()?;
         Ok(manager)
     }
 
     /// Путь к файлу БД берётся из AGENTS_STORE_PATH, по умолчанию — `agents.db`
-    /// в текущей рабочей директории.
+    /// в текущей рабочей директории; MCP-серверы — из файла
+    /// [`crate::mcp::config_path`] (ещё не подключены).
     pub fn from_env(client: LlmClient) -> Result<Self> {
         let path = std::env::var("AGENTS_STORE_PATH").unwrap_or_else(|_| "agents.db".to_string());
-        Self::new(client, path)
+        Self::with_mcp(client, path, Arc::new(crate::mcp::McpManager::from_env()))
+    }
+
+    /// Реестр MCP-серверов, общий для всех агентов.
+    pub fn mcp(&self) -> Arc<crate::mcp::McpManager> {
+        self.mcp.clone()
     }
 
     fn load(&self) -> Result<()> {
@@ -2832,7 +2951,15 @@ impl AgentManager {
             let branches = self.db.load_branches(&config.name)?;
             let summary = self.db.load_summary(&config.name)?;
             let facts = self.db.load_facts(&config.name)?;
-            let agent = Agent::new(config, self.client.clone(), self.db.clone(), branches, summary, facts);
+            let agent = Agent::new(
+                config,
+                self.client.clone(),
+                self.db.clone(),
+                self.mcp.clone(),
+                branches,
+                summary,
+                facts,
+            );
             if running {
                 agent.start();
             }
@@ -2868,6 +2995,7 @@ impl AgentManager {
             config,
             self.client.clone(),
             self.db.clone(),
+            self.mcp.clone(),
             Branches::default(),
             CompressionState::default(),
             FactsState::default(),
@@ -3785,5 +3913,68 @@ mod tests {
         // Автомат продолжает работать по тем же правилам, что и до паузы.
         assert!(move_stage(&agent, "done").contains("нет такого перехода"));
         assert!(move_stage(&agent, "validation").contains("Переход применён"));
+    }
+
+    #[tokio::test]
+    async fn model_calls_mcp_tool_and_sees_its_result() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("mcp__calc__add", serde_json::json!({ "a": 2, "b": 40 })),
+            serde_json::json!({ "content": "Получилось 42." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let mcp = Arc::new(crate::mcp::McpManager::empty());
+        mcp.attach_for_tests("calc", crate::mcp::test_support::spawn_calculator()).await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(&base_url), store.0.clone(), mcp).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+
+        let reply = agent.handle_request("сколько будет 2 + 40?").await.unwrap();
+        assert_eq!(reply.text, "Получилось 42.");
+        assert_eq!(reply.tool_calls.len(), 1);
+        let call = &reply.tool_calls[0];
+        assert_eq!((call.server.as_deref(), call.tool.as_str(), call.result.as_str()), (Some("calc"), "add", "42"));
+        assert!(!call.is_error);
+        assert_eq!(call.headline(80), r#"calc · add({"a":2,"b":40})"#);
+
+        let requests = requests.lock().unwrap();
+        // Без задачи — только MCP-инструменты и без принуждения к вызову.
+        let offered: Vec<&str> =
+            requests[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(offered, ["mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(requests[0]["tool_choice"], "auto");
+        // Результат вызова ушёл модели во втором круге.
+        let tool_message = requests[1]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(tool_message["role"], "tool");
+        assert_eq!(tool_message["content"], "42");
+        // В историю попадают только реплики человека и итоговый ответ.
+        assert_eq!(agent.history().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_are_offered_alongside_task_tools() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("mcp__calc__fail", serde_json::json!({ "a": 1, "b": 1 })),
+            serde_json::json!({ "content": "Инструмент сломался." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let mcp = Arc::new(crate::mcp::McpManager::empty());
+        mcp.attach_for_tests("calc", crate::mcp::test_support::spawn_calculator()).await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(&base_url), store.0.clone(), mcp).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("задача", None).unwrap();
+
+        let reply = agent.handle_request("составь план").await.unwrap();
+        assert!(reply.tool_calls[0].is_error);
+
+        let requests = requests.lock().unwrap();
+        let offered: Vec<&str> =
+            requests[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(offered, ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(requests[0]["tool_choice"], "required");
     }
 }
