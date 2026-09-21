@@ -5,8 +5,22 @@ edition = "2021"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Официальный Rust SDK для Model Context Protocol — клиентская часть: stdio
+# (дочерний процесс) и Streamable HTTP.
+rmcp = { version = "3.4", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+http = "1"
+futures-util = "0.3"
+
+[dev-dependencies]
+# MCP-сервер в том же процессе для тестов клиента (см. mcp::test_support).
+rmcp = { version = "3.4", default-features = false, features = ["client", "server", "transport-async-rw"] }

@@ -179,6 +179,36 @@ If neither is available (no `usage.cost` from the provider and no rates configur
 
 Each interface shows it two ways: **per-message**, split the same way tokens already are (input cost under the user's message, output cost under the assistant's reply — when the provider sends `usage.cost` without a prompt/completion breakdown, the whole amount is attributed to the output side rather than split arbitrarily), and as a **running total for the whole dialogue** — not just the messages sent in the current process/tab, but the entire persisted conversation with that agent, so reopening a chat after a restart shows what it has cost so far, not $0.00 (and, since real cost is persisted, a dialogue that mixed a provider with and without `usage.cost` over its lifetime totals both correctly, marking `≈` only if at least one contributing message was an estimate). In the CLI (gated by `--show-tokens`, same as the token summary) it's a `[💰 запрос: $X · весь диалог: $Y]` line after each reply; in the TUI it's appended to the same per-message token line and to the context-fill status line (`💰 $Y`); in the web UI it's appended to each message's token caption and shown as its own `💰 $Y` badge next to the context-window ring in the agent chat header.
 
+### MCP: external tools for agents
+
+The app is an **MCP client** built on the official Rust SDK ([`rmcp`](https://crates.io/crates/rmcp)): it connects to [Model Context Protocol](https://modelcontextprotocol.io) servers, lists their tools, and offers every tool of every connected server to named agents via function calling (`core/src/mcp.rs`).
+
+Servers are configured in `mcp.json` in the working directory (override with `LLM_MCP_CONFIG`), in the same `mcpServers` format Claude Desktop/Cursor use. Copy the shipped example to start: `cp mcp.example.json mcp.json` (`mcp.json` itself is git-ignored — it is local config).
+
+```json
+{
+  "mcpServers": {
+    "everything": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"] },
+    "javadocs":   { "url": "https://www.javadocs.dev/mcp" },
+    "github":     { "url": "https://api.githubcopilot.com/mcp/", "enabled": false,
+                    "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } }
+  }
+}
+```
+
+- `command` + `args` (+ `env`, `cwd`) — a local server spawned as a child process, spoken to over stdio (its stderr is captured, and the last lines are shown if it fails to start);
+- `url` (+ `headers`) — a remote server over Streamable HTTP;
+- `enabled: false` (or Cline-style `disabled: true`) — the server **stays in the config but is not connected**, and agents don't see its tools. Every interface can flip this flag; the change is written back into `mcp.json` (other fields and key order are preserved), so it survives restarts;
+- `${VAR}` in `args`, `env`, `url` and `headers` is substituted from the environment, so tokens stay in `.env`, not in the config file. A missing variable is reported as that server's connection error.
+
+Tools are offered to the model as `mcp__<server>__<tool>` so they can't clash with each other or with the task state machine's `move_stage`/`update_step`. They are offered on every agent request, with `tool_choice: "auto"` (the model decides; the forced first tool call only applies when a task is active, see above). Results are truncated to 20 000 characters before going back to the model. Each call the model makes is returned in `AgentReply::tool_calls` and shown in the chat right before the agent's reply: server · tool(arguments) → short result. In the web UI the row expands to show the full arguments and result. Like per-request cost, these rows are not persisted: reopening a chat after a restart shows only the dialogue itself.
+
+Where to see it:
+
+- **CLI** — `llm-cli mcp` connects to all enabled servers and prints their tools; `llm-cli mcp tools <server>` prints one server's tools with parameters; `llm-cli mcp enable|disable <server>`; `llm-cli mcp call <server> <tool> '{"a":1}'` calls a tool directly, no model involved. None of these need `LLM_API_*`. `agent start` connects before the chat and prints `[🔧 server · tool(args) → result]` lines.
+- **TUI** — **F4** from any screen opens the MCP screen: servers with status on the left, the selected server's tools (description, parameters) on the right; Space/`e` enables/disables, `r` reconnects, `l` re-reads the config file. **Tab** moves focus to the tools: ↑/↓ picks one, **Enter** opens the bottom input with a JSON arguments template (required parameters with placeholders; a repeat call reuses the last arguments), **Enter** again calls the tool directly — no model involved — and the result appears right under it. Servers connect in the background at startup; the agent chat status line shows `🔌 MCP connected/enabled · N инстр.`, and tool calls appear as `Тул:` rows.
+- **Web** — the **MCP** tab shows the same: server list, statuses, tools with JSON Schemas, enable/disable/reconnect buttons, and "re-read config". Each tool has a **Вызвать** block: a JSON editor pre-filled with the arguments template, a call button (or Ctrl/Cmd+Enter), and the result with timing. Arguments and results survive re-renders while the tab is open. API: `GET /api/mcp`, `POST /api/mcp/:name/enable|disable|reconnect`, `POST /api/mcp/reload`, `POST /api/mcp/:name/tools/:tool` with `{"arguments": {...}}`.
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -205,6 +235,7 @@ Optional:
 - `AGENTS_STORE_PATH` — optional. Path to the SQLite file where named agents (see below) and their conversation history are persisted. Defaults to `agents.db` in the current working directory. The CLI, web UI, and TUI can share the same file — an agent added in one is visible in the others, and its dialogue survives restarting the process.
 - `LLM_PROFILES_DIR` — optional. Directory holding personalization profile markdown files (see "Personalization: profiles" above). Defaults to `profiles` in the current working directory (this repo ships `profiles/default.md`). Shared by the CLI, web UI, and TUI, same as `AGENTS_STORE_PATH` — a profile file added or edited there is picked up by every interface's next request, no restart needed.
 - `LLM_INVARIANTS_DIR` — optional. Directory holding invariant markdown files (see "Invariants: hard rules the assistant refuses to break" above). Defaults to `invariants` in the current working directory (this repo ships three filled-in examples). Same sharing/no-restart behavior as `LLM_PROFILES_DIR` — one set, used by every agent in every interface.
+- `LLM_MCP_CONFIG` — optional. Path to the MCP server config (see "MCP: external tools for agents" above). Defaults to `mcp.json` in the current working directory; a missing file just means no MCP servers.
 - `LLM_CONTEXT_WINDOW` — optional. Context window size in tokens, used only for the fill indicator described above (never enforced or sent to the API). There's no reliable way to query a model's real context limit from an OpenAI-compatible API, so set this explicitly to match your model/provider (e.g. `128000`). If unset, the indicator assumes a window of `262000` tokens.
 - `LLM_CONTEXT_SUMMARY_CHUNK` — optional. How many user messages to accumulate between summary recomputes when context management (summarization, see above) is turned on, for both named agents and the plain web chat. Read once per process and cached, like the other `LLM_*` variables — changing it requires a restart. If unset, empty, or not a positive integer, defaults to `10`.
 - `LLM_SLIDING_WINDOW_SIZE` — optional. How many of the most recent user messages (exchanges) named agents keep when their `context_strategy` is `sliding-window` or `facts` (see above) — an individual agent can override this via `--window-size`/the web UI's window-size field. Read once per process and cached; if unset, empty, or not a positive integer, defaults to `6`.
@@ -341,8 +372,9 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs)
-cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs)
+cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents and `mcp` subcommand for MCP servers
+mcp.example.json  — example MCP server config (copy to mcp.json)
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template

@@ -68,6 +68,22 @@
 //! `task forbid/allow/require-approval/unrequire-approval <из> <в>`, реально
 //! проверяемые кодом на переходах автомата, а не только текстом) показаны в
 //! секции "Рабочая — данные ОБЩЕЙ задачи" того же экрана.
+//!
+//! ## MCP (F4 с любого экрана)
+//!
+//! Экран MCP-серверов (см. llm_core::mcp) из файла `mcp.json` (или
+//! `LLM_MCP_CONFIG`): статус подключения каждого сервера и список его
+//! инструментов с описаниями и параметрами. Пробел/`e` включает или выключает
+//! выбранный сервер (флаг сохраняется в файле — выключенный сервер остаётся в
+//! конфигурации, но не подключается), `r` переподключает его, `l` перечитывает
+//! файл целиком. Tab переводит фокус на инструменты выбранного сервера:
+//! ↑/↓ — выбор инструмента, Enter — ввести доводы (JSON-объект, заготовка с
+//! обязательными параметрами подставляется сама) и ещё раз Enter — вызвать
+//! инструмент напрямую, без модели; результат виден под инструментом.
+//! К включённым серверам TUI подключается в фоне при запуске;
+//! инструменты подключённых серверов агенты предлагают модели в каждом
+//! запросе, а каждый вызов инструмента виден в диалоге строкой «Тул» перед
+//! ответом агента.
 
 use anyhow::Result;
 use crossterm::{
@@ -101,6 +117,10 @@ enum Role {
     /// AgentConfig::context_strategy) — отдельная от System роль, чтобы этот
     /// момент визуально выделялся среди обычных информационных сообщений.
     Compression,
+    /// Вызов инструмента моделью (MCP-сервера или автомата задачи) — см.
+    /// llm_core::ToolCallRecord; `ToolError` — вызов завершился ошибкой.
+    Tool,
+    ToolError,
 }
 
 struct HistoryItem {
@@ -190,6 +210,8 @@ enum Screen {
     /// совпадают с подкомандами `llm-cli agent remember/forget/task`, чтобы
     /// поведение не расходилось между интерфейсами (см. [`run_memory_command`]).
     AgentMemory,
+    /// MCP-серверы и их инструменты (F4 с любого экрана, F4/Esc — обратно).
+    Mcp,
 }
 
 /// Шаги мастера создания агента — по одному вопросу за раз в нижнем поле ввода.
@@ -401,6 +423,24 @@ enum AppEvent {
     /// вместе с ответом — см. обработчик события).
     DirectResponse { prompt: String, result: Result<ChatCompletion> },
     AgentResponse { name: String, result: Result<llm_core::AgentReply> },
+    /// Фоновое действие с MCP-серверами (подключение, включение/выключение)
+    /// завершилось — перерисовать экран; `message` — итог для строки статуса
+    /// экрана MCP (текст, признак ошибки).
+    McpUpdated { message: Option<(String, bool)> },
+    /// Ручной вызов инструмента с экрана MCP завершился.
+    McpCalled(McpCallView),
+}
+
+/// Ручной вызов инструмента с экрана MCP — показывается под этим инструментом.
+#[derive(Clone)]
+struct McpCallView {
+    server: String,
+    tool: String,
+    arguments: String,
+    /// `None`, пока вызов идёт.
+    result: Option<String>,
+    is_error: bool,
+    elapsed_ms: u128,
 }
 
 struct DrawState<'a> {
@@ -452,6 +492,23 @@ struct DrawState<'a> {
     /// только на экране памяти агента, чтобы показать, к каким задачам можно
     /// присоединиться командой `task join`; `&[]` на остальных экранах.
     shared_tasks: &'a [llm_core::SharedTaskSummary],
+    /// Снимок MCP-серверов (см. llm_core::mcp) — берётся на каждой перерисовке,
+    /// поэтому смена статуса подключения видна сразу.
+    mcp_servers: &'a [llm_core::McpServerInfo],
+    mcp_selected: usize,
+    /// Прокрутка списка инструментов выбранного сервера на экране MCP.
+    mcp_scroll: u16,
+    mcp_config_path: String,
+    mcp_config_error: Option<String>,
+    /// Итог последнего действия на экране MCP (текст, признак ошибки).
+    mcp_status: Option<(&'a str, bool)>,
+    /// Фокус на списке инструментов выбранного сервера (Tab), а не на серверах.
+    mcp_focus_tools: bool,
+    mcp_tool_selected: usize,
+    /// Вводятся доводы для вызова выбранного инструмента (нижнее поле ввода).
+    mcp_editing: bool,
+    /// Последний ручной вызов инструмента (идущий или завершённый).
+    mcp_call: Option<&'a McpCallView>,
 }
 
 /// Высота поля ввода по умолчанию (1 строка текста + рамка сверху/снизу).
@@ -518,7 +575,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut history: Vec<HistoryItem> = vec![HistoryItem {
         role: Role::System,
         text: "Challenger (TUI). Enter — отправить, Esc — выход, Tab — JSON запроса/ответа, \
-               F2 — управление агентами."
+               F2 — управление агентами, F4 — MCP-серверы."
             .to_string(),
         debug: None,
         tokens: None,
@@ -556,6 +613,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // перерисовку терминала, чтобы такой "хвост" не оставался виден.
     let mut previous_screen = screen;
     let agent_manager = AgentManager::from_env(client.clone())?;
+    // Реестр MCP-серверов общий с агентами: подключение идёт в фоне, чтобы
+    // медленный сервер (npx скачивает пакет) не задерживал запуск TUI, — по
+    // готовности приходит AppEvent::McpUpdated и экран перерисовывается.
+    let mcp = agent_manager.mcp();
+    let mut mcp_selected: usize = 0;
+    let mut mcp_scroll: u16 = 0;
+    let mut mcp_status: Option<(String, bool)> = None;
+    // Экран, на который вернуть по F4/Esc с экрана MCP.
+    let mut mcp_return = Screen::Chat;
+    let mut mcp_focus_tools = false;
+    let mut mcp_tool_selected: usize = 0;
+    let mut mcp_editing = false;
+    let mut mcp_call: Option<McpCallView> = None;
     let mut agents_selected: usize = 0;
     let mut confirm_delete: Option<String> = None;
     let mut wizard: Option<CreateWizard> = None;
@@ -571,6 +641,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut memory_status: Option<(String, bool)> = None;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    {
+        let mcp = mcp.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            mcp.connect_all().await;
+            let _ = tx.send(AppEvent::McpUpdated { message: None });
+        });
+    }
     let mut events = EventStream::new();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
 
@@ -683,6 +761,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             _ => None,
         };
 
+        let mcp_servers = mcp.servers();
+        if mcp_selected >= mcp_servers.len() {
+            mcp_selected = mcp_servers.len().saturating_sub(1);
+        }
+        let mcp_tools_count = mcp_servers.get(mcp_selected).map(|s| s.tools.len()).unwrap_or(0);
+        if mcp_tool_selected >= mcp_tools_count {
+            mcp_tool_selected = mcp_tools_count.saturating_sub(1);
+        }
+        if mcp_tools_count == 0 {
+            mcp_focus_tools = false;
+            mcp_editing = false;
+        }
         let draw_state = DrawState {
             screen,
             client: &client,
@@ -709,6 +799,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             agent_history_len: screen_agent_history_len,
             memory_status: memory_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
             shared_tasks: &screen_shared_tasks,
+            mcp_servers: &mcp_servers,
+            mcp_selected,
+            mcp_scroll,
+            mcp_config_path: mcp.config_path().display().to_string(),
+            mcp_config_error: mcp.config_error(),
+            mcp_status: mcp_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
+            mcp_focus_tools,
+            mcp_tool_selected,
+            mcp_editing,
+            mcp_call: mcp_call.as_ref(),
         };
         terminal.draw(|frame| draw(frame, &draw_state))?;
 
@@ -729,9 +829,28 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 Screen::AgentsList => Screen::Chat,
                                 Screen::AgentCreate => { wizard = None; Screen::AgentsList }
                                 Screen::AgentChat | Screen::AgentMemory => { agent_chat_name = None; Screen::AgentsList }
+                                Screen::Mcp => { mcp_editing = false; Screen::AgentsList }
                             };
                             input.clear();
                             confirm_delete = None;
+                            continue;
+                        }
+
+                        // F4 открывает экран MCP-серверов с любого экрана и возвращает
+                        // обратно — как и F2, даже пока агент отвечает.
+                        if key.code == KeyCode::F(4) {
+                            if screen == Screen::Mcp {
+                                screen = mcp_return;
+                                if mcp_editing {
+                                    mcp_editing = false;
+                                    input.clear();
+                                }
+                            } else {
+                                mcp_return = screen;
+                                screen = Screen::Mcp;
+                                mcp_status = None;
+                                mcp_scroll = 0;
+                            }
                             continue;
                         }
 
@@ -1088,6 +1207,135 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 }
                                 _ => {}
                             },
+                            // Ввод доводов для вызова инструмента: все клавиши идут в поле
+                            // ввода (иначе Пробел/e/r/l переключали бы серверы).
+                            Screen::Mcp if mcp_editing => match key.code {
+                                KeyCode::Esc => {
+                                    mcp_editing = false;
+                                    input.clear();
+                                }
+                                KeyCode::Enter => {
+                                    let tool = mcp_servers
+                                        .get(mcp_selected)
+                                        .and_then(|s| s.tools.get(mcp_tool_selected).map(|t| (s.name.clone(), t.name.clone())));
+                                    let running = mcp_call.as_ref().is_some_and(|c| c.result.is_none());
+                                    if let (Some((server, tool)), false) = (tool, running) {
+                                        let arguments = input.trim().to_string();
+                                        mcp_editing = false;
+                                        input.clear();
+                                        mcp_call = Some(McpCallView {
+                                            server: server.clone(),
+                                            tool: tool.clone(),
+                                            arguments: arguments.clone(),
+                                            result: None,
+                                            is_error: false,
+                                            elapsed_ms: 0,
+                                        });
+                                        let (mcp, tx) = (mcp.clone(), tx.clone());
+                                        tokio::spawn(async move {
+                                            let started = std::time::Instant::now();
+                                            let (result, is_error) = match mcp.call_tool(&server, &tool, &arguments).await {
+                                                Some(r) => (r.text, r.is_error),
+                                                None => (format!("у сервера «{server}» нет инструмента «{tool}» (или сервер не подключён)"), true),
+                                            };
+                                            let _ = tx.send(AppEvent::McpCalled(McpCallView {
+                                                server,
+                                                tool,
+                                                arguments,
+                                                result: Some(result),
+                                                is_error,
+                                                elapsed_ms: started.elapsed().as_millis(),
+                                            }));
+                                        });
+                                    }
+                                }
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            },
+                            Screen::Mcp if mcp_focus_tools => match key.code {
+                                KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => mcp_focus_tools = false,
+                                KeyCode::Up => mcp_tool_selected = mcp_tool_selected.saturating_sub(1),
+                                KeyCode::Down => {
+                                    if mcp_tool_selected + 1 < mcp_tools_count {
+                                        mcp_tool_selected += 1;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(tool) = mcp_servers.get(mcp_selected).and_then(|s| s.tools.get(mcp_tool_selected)) {
+                                        // Повторный вызов того же инструмента — с прежними доводами.
+                                        input = match &mcp_call {
+                                            Some(c) if c.tool == tool.name && mcp_servers[mcp_selected].name == c.server => c.arguments.clone(),
+                                            _ => tool.arguments_template().to_string(),
+                                        };
+                                        mcp_editing = true;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Screen::Mcp => match key.code {
+                                KeyCode::Esc => screen = mcp_return,
+                                KeyCode::Tab => {
+                                    if mcp_tools_count > 0 {
+                                        mcp_focus_tools = true;
+                                    }
+                                }
+                                KeyCode::Up => {
+                                    mcp_selected = mcp_selected.saturating_sub(1);
+                                    mcp_scroll = 0;
+                                    mcp_tool_selected = 0;
+                                }
+                                KeyCode::Down => {
+                                    if mcp_selected + 1 < mcp_servers.len() {
+                                        mcp_selected += 1;
+                                        mcp_scroll = 0;
+                                        mcp_tool_selected = 0;
+                                    }
+                                }
+                                KeyCode::PageUp => mcp_scroll = mcp_scroll.saturating_sub(PAGE_STEP),
+                                KeyCode::PageDown => mcp_scroll = mcp_scroll.saturating_add(PAGE_STEP),
+                                KeyCode::Char(' ') | KeyCode::Char('e') => {
+                                    if let Some(server) = mcp_servers.get(mcp_selected) {
+                                        let (name, enable) = (server.name.clone(), !server.enabled);
+                                        mcp_status = Some((
+                                            if enable { format!("Включаю «{name}»…") } else { format!("Выключаю «{name}»…") },
+                                            false,
+                                        ));
+                                        let (mcp, tx) = (mcp.clone(), tx.clone());
+                                        tokio::spawn(async move {
+                                            let message = match mcp.set_enabled(&name, enable).await {
+                                                Ok(()) if enable => (format!("«{name}» включён."), false),
+                                                Ok(()) => (format!("«{name}» выключен — остаётся в конфигурации."), false),
+                                                Err(err) => (format!("{err:#}"), true),
+                                            };
+                                            let _ = tx.send(AppEvent::McpUpdated { message: Some(message) });
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('r') => {
+                                    if let Some(server) = mcp_servers.get(mcp_selected).filter(|s| s.enabled) {
+                                        let name = server.name.clone();
+                                        mcp_status = Some((format!("Переподключаю «{name}»…"), false));
+                                        let (mcp, tx) = (mcp.clone(), tx.clone());
+                                        tokio::spawn(async move {
+                                            mcp.connect(&name).await;
+                                            let _ = tx.send(AppEvent::McpUpdated { message: None });
+                                        });
+                                    }
+                                }
+                                KeyCode::Char('l') => {
+                                    mcp_status = Some(("Перечитываю конфигурацию…".to_string(), false));
+                                    let (mcp, tx) = (mcp.clone(), tx.clone());
+                                    tokio::spawn(async move {
+                                        mcp.reload().await;
+                                        let message = ("Конфигурация перечитана.".to_string(), false);
+                                        let _ = tx.send(AppEvent::McpUpdated { message: Some(message) });
+                                    });
+                                }
+                                _ => {}
+                            },
                         }
                     }
                     // Вставленный текст приходит одним куском — просто дописываем его в
@@ -1096,6 +1344,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                     Some(Ok(Event::Paste(text))) => match screen {
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
                         Screen::AgentMemory => input.push_str(&text),
+                        Screen::Mcp if mcp_editing => input.push_str(&text),
                         Screen::AgentCreate if wizard.as_ref().is_some_and(|w| w.quick.is_some()) => {
                             input.push_str(&text);
                         }
@@ -1107,6 +1356,17 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             }
             Some(app_event) = rx.recv() => {
                 match app_event {
+                    // Не ответ на запрос — флаги ожидания ниже не трогаем.
+                    AppEvent::McpUpdated { message } => {
+                        if message.is_some() {
+                            mcp_status = message;
+                        }
+                        continue;
+                    }
+                    AppEvent::McpCalled(call) => {
+                        mcp_call = Some(call);
+                        continue;
+                    }
                     AppEvent::DirectResponse { prompt, result: Ok(completion) } => {
                         let response_tokens = completion.usage.map(|u| u.completion_tokens);
                         if let Some(usage) = completion.usage {
@@ -1184,6 +1444,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 let summarized = reply.summarized;
                                 let summary_covers = reply.summary_covers;
                                 let facts_updated = reply.facts_updated;
+                                // Вызовы инструментов — отдельными строками перед ответом,
+                                // в том порядке, в каком их делала модель.
+                                for call in &reply.tool_calls {
+                                    entry.push(HistoryItem {
+                                        role: if call.is_error { Role::ToolError } else { Role::Tool },
+                                        text: format!("{}\n→ {}", call.headline(160), call.result_preview(300)),
+                                        debug: None,
+                                        tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
+                                    });
+                                }
                                 entry.push(HistoryItem {
                                     role: Role::Assistant,
                                     text: reply.text,
@@ -1255,6 +1527,7 @@ fn draw(frame: &mut Frame, state: &DrawState) {
         Screen::AgentCreate => draw_agent_create(frame, state),
         Screen::AgentChat => draw_agent_chat(frame, state),
         Screen::AgentMemory => draw_agent_memory(frame, state),
+        Screen::Mcp => draw_mcp(frame, state),
     }
 }
 
@@ -1436,7 +1709,7 @@ fn draw_agents_list(frame: &mut Frame, state: &DrawState) {
             "✦ Challenger",
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  ·  Агенты  ·  F2/Esc — назад к чату"),
+        Span::raw("  ·  Агенты  ·  F2/Esc — назад к чату  ·  F4 — MCP"),
     ]))
     .block(
         Block::default()
@@ -1491,6 +1764,226 @@ fn draw_agents_list(frame: &mut Frame, state: &DrawState) {
 /// переносит) строки шире области — это делает невидимым «хвост» длинного
 /// или вставленного многострочного сообщения, из-за чего казалось, что текст
 /// вылезает за рамки поля и не даёт увидеть, что реально введено.
+/// Бейдж MCP для строки статуса чата с агентом: сколько инструментов
+/// подключённых серверов агент сейчас предлагает модели. Пусто, если в
+/// конфигурации нет включённых серверов.
+fn mcp_badge_spans(servers: &[llm_core::McpServerInfo]) -> Vec<Span<'static>> {
+    let enabled: Vec<_> = servers.iter().filter(|s| s.enabled).collect();
+    if enabled.is_empty() {
+        return Vec::new();
+    }
+    let connected = enabled.iter().filter(|s| s.status == llm_core::McpStatus::Connected).count();
+    let tools: usize = enabled.iter().map(|s| s.tools.len()).sum();
+    let color = if connected == enabled.len() { Color::Magenta } else { Color::Yellow };
+    vec![
+        Span::raw("  ·  🔌 "),
+        Span::styled(format!("MCP {connected}/{} · {tools} инстр.", enabled.len()), Style::default().fg(color)),
+    ]
+}
+
+fn mcp_status_color(status: &llm_core::McpStatus) -> Color {
+    match status {
+        llm_core::McpStatus::Connected => Color::Green,
+        llm_core::McpStatus::Connecting | llm_core::McpStatus::Idle => Color::Yellow,
+        llm_core::McpStatus::Failed { .. } => Color::Red,
+        llm_core::McpStatus::Disabled => Color::DarkGray,
+    }
+}
+
+/// Экран MCP-серверов (F4): слева список серверов со статусами, справа —
+/// выбранный сервер и его инструменты (описание + параметры).
+fn draw_mcp(frame: &mut Frame, state: &DrawState) {
+    let area = frame.area();
+    let chunks = layout_chunks(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✦ Challenger", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  MCP-серверы  ·  F4/Esc — назад"),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(header, chunks[0]);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(chunks[1]);
+
+    let mut list_lines: Vec<Line<'static>> = Vec::new();
+    if state.mcp_servers.is_empty() {
+        list_lines.push(Line::from(Span::styled(
+            "Серверов нет — добавьте их в файл конфигурации (см. mcp.example.json).",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, server) in state.mcp_servers.iter().enumerate() {
+        let selected = i == state.mcp_selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let name_style = if selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![
+            Span::raw(marker),
+            Span::styled(server.name.clone(), name_style),
+            Span::raw("  "),
+            Span::styled(server.status.label(), Style::default().fg(mcp_status_color(&server.status))),
+        ];
+        if server.status == llm_core::McpStatus::Connected {
+            spans.push(Span::styled(
+                format!(" · {} инстр.", server.tools.len()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        list_lines.push(Line::from(spans));
+    }
+    let list = Paragraph::new(list_lines)
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Серверы "));
+    frame.render_widget(list, columns[0]);
+
+    let detail_width = columns[1].width.saturating_sub(4).max(10) as usize;
+    let mut detail: Vec<Line<'static>> = Vec::new();
+    // Строка выбранного инструмента — к ней прокручивается список, пока фокус на инструментах.
+    let mut selected_line: Option<usize> = None;
+    let dim = Style::default().fg(Color::DarkGray);
+    let wrapped = |text: &str, indent: usize, style: Style| -> Vec<Line<'static>> {
+        textwrap::wrap(text, detail_width.saturating_sub(indent).max(10))
+            .into_iter()
+            .map(|part| Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(part.to_string(), style)]))
+            .collect()
+    };
+    if let Some(server) = state.mcp_servers.get(state.mcp_selected) {
+        detail.push(Line::from(vec![
+            Span::styled(server.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(server.status.label(), Style::default().fg(mcp_status_color(&server.status))),
+            Span::styled(server.server_version.as_ref().map(|v| format!("  ·  {v}")).unwrap_or_default(), dim),
+        ]));
+        detail.extend(wrapped(&server.transport, 0, dim));
+        if let Some(description) = &server.description {
+            detail.extend(wrapped(description, 0, Style::default()));
+        }
+        if let llm_core::McpStatus::Failed { error } = &server.status {
+            for line in error.lines() {
+                detail.extend(wrapped(line, 0, Style::default().fg(Color::Red)));
+            }
+        }
+        if !server.tools.is_empty() {
+            detail.push(Line::from(""));
+            detail.push(Line::from(Span::styled(
+                format!("Инструменты ({}):", server.tools.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
+        for (i, tool) in server.tools.iter().enumerate() {
+            let selected = state.mcp_focus_tools && i == state.mcp_tool_selected;
+            detail.push(Line::from(""));
+            if selected {
+                selected_line = Some(detail.len());
+            }
+            let name_style = if selected {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Magenta)
+            };
+            detail.push(Line::from(vec![
+                Span::styled(format!("{} {}", if selected { "▸" } else { "•" }, tool.name), name_style),
+                Span::styled(tool.title.as_ref().map(|t| format!("  ({t})")).unwrap_or_default(), dim),
+            ]));
+            if let Some(description) = &tool.description {
+                for line in description.lines().filter(|l| !l.trim().is_empty()) {
+                    detail.extend(wrapped(line.trim(), 2, Style::default()));
+                }
+            }
+            detail.extend(wrapped(&format!("параметры: {}", tool.params_summary()), 2, dim));
+            // Результат ручного вызова — прямо под тем инструментом, который вызывали.
+            if let Some(call) = state.mcp_call.filter(|c| c.server == server.name && c.tool == tool.name) {
+                detail.extend(wrapped(&format!("вызов: {}", call.arguments), 2, Style::default().fg(Color::Cyan)));
+                match &call.result {
+                    None => detail.extend(wrapped("⏳ выполняется…", 2, Style::default().fg(Color::Yellow))),
+                    Some(result) => {
+                        let (label, color) = if call.is_error { ("⚠ ошибка", Color::Red) } else { ("→ результат", Color::Green) };
+                        detail.extend(wrapped(&format!("{label} · {} мс:", call.elapsed_ms), 2, Style::default().fg(color)));
+                        let lines: Vec<&str> = result.lines().collect();
+                        for line in lines.iter().take(MCP_RESULT_MAX_LINES) {
+                            detail.extend(wrapped(line, 4, Style::default()));
+                        }
+                        if lines.len() > MCP_RESULT_MAX_LINES {
+                            detail.extend(wrapped(
+                                &format!("… ещё {} строк", lines.len() - MCP_RESULT_MAX_LINES),
+                                4,
+                                dim,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let max_scroll = (detail.len() as u16).saturating_sub(columns[1].height.saturating_sub(2));
+    let scroll = match selected_line {
+        Some(line) => (line as u16).saturating_sub(1),
+        None => state.mcp_scroll,
+    };
+    let (detail_title, detail_border) = if state.mcp_focus_tools {
+        (" Инструменты — ↑/↓ выбор, Enter вызвать, Tab/Esc к серверам ", Color::Cyan)
+    } else {
+        (" Сервер и инструменты — Tab к инструментам, PageUp/PageDown прокрутка ", Color::Reset)
+    };
+    let details = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(detail_border))
+                .title(detail_title),
+        )
+        .scroll((scroll.min(max_scroll), 0));
+    frame.render_widget(details, columns[1]);
+
+    let (status_line, status_color) = match state.mcp_status {
+        Some((text, true)) => (format!(" {text}"), Color::Red),
+        Some((text, false)) => (format!(" {text}"), Color::Yellow),
+        None if state.mcp_focus_tools => (
+            " ↑/↓ инструмент · Enter ввести доводы и вызвать · Tab/Esc к серверам · F4 назад ".to_string(),
+            Color::DarkGray,
+        ),
+        None => (
+            " ↑/↓ выбор · Tab инструменты · Пробел/e вкл/выкл · r переподключить · l перечитать файл · F4/Esc назад "
+                .to_string(),
+            Color::DarkGray,
+        ),
+    };
+    frame.render_widget(Paragraph::new(status_line).style(Style::default().fg(status_color)), chunks[2]);
+
+    let footer = match &state.mcp_config_error {
+        Some(err) => Paragraph::new(err.clone()).style(Style::default().fg(Color::Red)),
+        None => Paragraph::new(format!(
+            "{} — выключенный сервер (\"enabled\": false) остаётся в файле, но не подключается",
+            state.mcp_config_path
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+    };
+    if state.mcp_editing {
+        let tool = state
+            .mcp_servers
+            .get(state.mcp_selected)
+            .and_then(|s| s.tools.get(state.mcp_tool_selected))
+            .map(|t| t.name.as_str())
+            .unwrap_or("?");
+        let title = format!(" Доводы {tool} (JSON-объект) — Enter вызвать, Esc отмена ");
+        render_input_box(frame, chunks[3], state.input, title, Color::Cyan);
+    } else {
+        frame.render_widget(
+            footer.block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Конфигурация ")),
+            chunks[3],
+        );
+    }
+}
+
+/// Сколько строк результата ручного вызова показывать под инструментом.
+const MCP_RESULT_MAX_LINES: usize = 30;
+
 fn render_input_box(frame: &mut Frame, area: Rect, input: &str, title: String, border_color: Color) {
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
     let visible_height = area.height.saturating_sub(2);
@@ -1781,7 +2274,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
     ];
     header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
-    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память"));
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память  ·  F4 MCP"));
     let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
@@ -1840,6 +2333,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
                     Style::default().fg(Color::Yellow),
                 ));
             }
+            spans.extend(mcp_badge_spans(state.mcp_servers));
             Line::from(spans)
         }
         None => Line::from(" Расход токенов появится после первого ответа агента"),
@@ -2355,6 +2849,8 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
         Role::System => ("Инфо", Color::DarkGray),
         Role::Error => ("Ошибка", Color::Red),
         Role::Compression => ("Сжатие", Color::Yellow),
+        Role::Tool => ("Тул", Color::Magenta),
+        Role::ToolError => ("Тул ⚠", Color::Red),
     };
 
     let prefix_width = label.chars().count() + 2;

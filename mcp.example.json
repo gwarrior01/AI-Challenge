@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "everything": {
+      "description": "Демо-сервер MCP со всеми возможностями протокола (echo, add, …)",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    },
+    "javadocs": {
+      "description": "Документация Java-библиотек (удалённый сервер, Streamable HTTP)",
+      "url": "https://www.javadocs.dev/mcp"
+    },
+    "github": {
+      "description": "Пример выключенного сервера с токеном из окружения",
+      "enabled": false,
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+    }
+  }
+}

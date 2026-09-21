@@ -898,10 +898,87 @@ async fn ask_agent(
                 // внутри handle_request; веб-интерфейс показывает его прямо в чате
                 // (полоска вверху + панель у кнопки "Отправить"), не в панели памяти.
                 "task": info.task,
+                // Вызовы инструментов за этот обмен (MCP-серверов и автомата
+                // задачи) — чат показывает их перед ответом (см. AgentReply::tool_calls).
+                "tool_calls": reply.tool_calls,
             }))
         }
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
     }
+}
+
+/// MCP-серверы из файла конфигурации (см. llm_core::mcp) — статус
+/// подключения и инструменты каждого, для вкладки «MCP».
+async fn list_mcp(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(mcp_snapshot(&state))
+}
+
+fn mcp_snapshot(state: &AppState) -> serde_json::Value {
+    let mcp = state.agents.mcp();
+    serde_json::json!({
+        "servers": mcp.servers(),
+        "config_path": mcp.config_path().display().to_string(),
+        "config_error": mcp.config_error(),
+    })
+}
+
+/// Включает/выключает MCP-сервер: флаг пишется в файл конфигурации,
+/// выключенный сервер остаётся в нём, но не подключается. Отвечает после
+/// того, как подключение (при включении) завершилось.
+async fn set_mcp_enabled(
+    State(state): State<AppState>,
+    Path((name, action)): Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    let mcp = state.agents.mcp();
+    let result = match action.as_str() {
+        "enable" => mcp.set_enabled(&name, true).await,
+        "disable" => mcp.set_enabled(&name, false).await,
+        "reconnect" => {
+            mcp.connect(&name).await;
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!("неизвестное действие «{other}»")),
+    };
+    match result {
+        Ok(()) => Json(mcp_snapshot(&state)),
+        Err(err) => Json(serde_json::json!({ "error": format!("{err:#}") })),
+    }
+}
+
+#[derive(Deserialize)]
+struct McpCallRequest {
+    /// Доводы вызова — JSON-объект.
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+/// Ручной вызов инструмента MCP-сервера из вкладки «MCP» — без модели.
+async fn call_mcp_tool(
+    State(state): State<AppState>,
+    Path((name, tool)): Path<(String, String)>,
+    Json(req): Json<McpCallRequest>,
+) -> Json<serde_json::Value> {
+    let arguments = match req.arguments {
+        serde_json::Value::Null => "{}".to_string(),
+        value => value.to_string(),
+    };
+    let started = std::time::Instant::now();
+    match state.agents.mcp().call_tool(&name, &tool, &arguments).await {
+        Some(result) => Json(serde_json::json!({
+            "result": result.text,
+            "is_error": result.is_error,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })),
+        None => Json(serde_json::json!({
+            "error": format!("у сервера «{name}» нет инструмента «{tool}» (или сервер не подключён)")
+        })),
+    }
+}
+
+/// Перечитывает файл конфигурации MCP и заново подключается ко всем включённым серверам.
+async fn reload_mcp(State(state): State<AppState>) -> Json<serde_json::Value> {
+    state.agents.mcp().reload().await;
+    Json(mcp_snapshot(&state))
 }
 
 /// Веб-интерфейс ведёт задачу за пользователя, без ручного `agent task start`:
@@ -983,6 +1060,12 @@ async fn main() -> Result<()> {
         .replace("__SLIDING_WINDOW_SIZE__", &llm_core::context::sliding_window_size().to_string())
         .replace("__PRICING_JSON__", &pricing_json);
     let agents = Arc::new(AgentManager::from_env(client.clone())?);
+    // К MCP-серверам подключаемся в фоне: медленный сервер не задерживает
+    // запуск, а вкладка «MCP» показывает статус «подключение…», пока он идёт.
+    {
+        let mcp = agents.mcp();
+        tokio::spawn(async move { mcp.connect_all().await });
+    }
 
     let state = AppState {
         client: Arc::new(client),
@@ -1037,6 +1120,10 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/task/require-approval", post(task_require_approval_agent))
         .route("/api/agents/:name/task/unrequire-approval", post(task_unrequire_approval_agent))
         .route("/api/tasks", get(list_tasks))
+        .route("/api/mcp", get(list_mcp))
+        .route("/api/mcp/reload", post(reload_mcp))
+        .route("/api/mcp/:name/:action", post(set_mcp_enabled))
+        .route("/api/mcp/:name/tools/:tool", post(call_mcp_tool))
         .with_state(state);
 
     let port = std::env::var("PORT").ok().and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(8080);

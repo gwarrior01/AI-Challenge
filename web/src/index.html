@@ -1753,6 +1753,344 @@
   .agent-chat-footer textarea:disabled {
     opacity: 0.5;
   }
+
+  /* ---------- Вкладка «MCP» ---------- */
+
+  #view-mcp {
+    padding: 20px 24px;
+    gap: 16px;
+    overflow: hidden;
+  }
+
+  .mcp-toolbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .mcp-config {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--muted);
+    min-width: 0;
+  }
+
+  .mcp-config code {
+    color: var(--text);
+  }
+
+  .mcp-hint {
+    font-size: 12px;
+  }
+
+  .mcp-config-error {
+    color: var(--error);
+  }
+
+  .mcp-toolbar button,
+  .mcp-server-actions button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .mcp-toolbar button:hover,
+  .mcp-server-actions button:hover {
+    border-color: var(--accent);
+  }
+
+  .mcp-toolbar button:disabled,
+  .mcp-server-actions button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .mcp-layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(220px, 320px) 1fr;
+    gap: 16px;
+  }
+
+  @media (max-width: 720px) {
+    .mcp-layout {
+      grid-template-columns: 1fr;
+      overflow-y: auto;
+    }
+  }
+
+  .mcp-servers,
+  .mcp-detail {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .mcp-detail {
+    padding: 16px 20px;
+  }
+
+  .mcp-empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 8px;
+  }
+
+  .mcp-server-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .mcp-server-item:hover {
+    background: var(--panel-2);
+  }
+
+  .mcp-server-item.active {
+    background: var(--panel-2);
+    border-color: var(--accent);
+  }
+
+  .mcp-server-name {
+    font-weight: 600;
+    font-size: 14px;
+  }
+
+  .mcp-status {
+    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+  }
+
+  .mcp-status::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+
+  .mcp-status.connected::before { background: var(--ok); }
+  .mcp-status.connecting::before,
+  .mcp-status.idle::before { background: var(--warn); }
+  .mcp-status.failed::before { background: var(--error); }
+  .mcp-status.disabled { opacity: 0.7; }
+
+  .mcp-detail-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .mcp-detail-head h3 {
+    margin: 0 0 4px;
+    font-size: 18px;
+  }
+
+  .mcp-server-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .mcp-meta {
+    font-size: 12.5px;
+    color: var(--muted);
+    word-break: break-all;
+  }
+
+  .mcp-error {
+    margin: 10px 0;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 107, 107, 0.4);
+    color: var(--error);
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .mcp-tools-title {
+    margin: 18px 0 8px;
+    font-size: 14px;
+    color: var(--muted);
+  }
+
+  .mcp-tool {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+  }
+
+  .mcp-tool-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13.5px;
+    color: var(--accent);
+  }
+
+  .mcp-tool-desc {
+    font-size: 13px;
+    margin: 4px 0;
+    white-space: pre-wrap;
+  }
+
+  .mcp-tool-params {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .mcp-tool details {
+    margin-top: 6px;
+    font-size: 12px;
+  }
+
+  .mcp-tool pre,
+  .agent-message.tool pre {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: var(--bg);
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Ручной вызов инструмента на вкладке «MCP». */
+  .mcp-call {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .mcp-call textarea {
+    width: 100%;
+    min-height: 70px;
+    resize: vertical;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+  }
+
+  .mcp-call textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .mcp-call-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+
+  .mcp-call-actions button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 14px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .mcp-call-actions button.secondary {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .mcp-call-actions button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .mcp-call-note {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .mcp-call-note.error {
+    color: var(--error);
+  }
+
+  .mcp-call-result {
+    border: 1px solid rgba(74, 222, 128, 0.35);
+  }
+
+  .mcp-call-result.error {
+    border-color: rgba(255, 107, 107, 0.5);
+  }
+
+  /* Вызов инструмента моделью в чате агента — перед её ответом. */
+  .agent-chat-main .agent-message.tool,
+  .agent-message.tool {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px solid rgba(138, 92, 246, 0.45);
+    font-size: 12.5px;
+    padding: 6px 12px;
+    border-radius: 10px;
+  }
+
+  .agent-message.tool.error {
+    border-color: rgba(255, 107, 107, 0.5);
+  }
+
+  .agent-message.tool summary {
+    cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--accent-2);
+  }
+
+  .agent-message.tool.error summary {
+    color: var(--error);
+  }
+
+  .agent-message.tool .tool-preview {
+    display: block;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .agent-message.tool .tool-label {
+    display: block;
+    margin-top: 6px;
+    color: var(--muted);
+  }
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
@@ -1803,6 +2141,7 @@
   <button type="button" class="tab-btn" id="tab-challenge" data-view="view-challenge">Задача · 4 способа</button>
   <button type="button" class="tab-btn" id="tab-temperature" data-view="view-temperature">Температура</button>
   <button type="button" class="tab-btn" id="tab-agents" data-view="view-agents">Агенты</button>
+  <button type="button" class="tab-btn" id="tab-mcp" data-view="view-mcp">MCP</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -1929,6 +2268,21 @@
     <div class="temp-progress" id="temp-progress" hidden></div>
   </div>
   <div class="temp-results" id="temp-results"></div>
+</div>
+
+<div class="view" id="view-mcp" hidden>
+  <div class="mcp-toolbar">
+    <div class="mcp-config">
+      <span>Конфигурация: <code id="mcp-config-path">…</code></span>
+      <span class="mcp-hint">Выключенный сервер остаётся в файле (<code>"enabled": false</code>), но не подключается, и агенты не видят его инструменты.</span>
+      <span class="mcp-config-error" id="mcp-config-error" hidden></span>
+    </div>
+    <button type="button" id="mcp-reload" title="Перечитать файл и заново подключиться ко всем включённым серверам">↻ Перечитать конфигурацию</button>
+  </div>
+  <div class="mcp-layout">
+    <div class="mcp-servers" id="mcp-servers"></div>
+    <div class="mcp-detail" id="mcp-detail"></div>
+  </div>
 </div>
 
 <div class="view" id="view-agents" hidden>
@@ -4281,6 +4635,35 @@ function renderAgentMessage(msg) {
     row.textContent = '🗜️ ' + msg.text;
     return row;
   }
+  // Вызов инструмента моделью (MCP-сервера или автомата задачи): свёрнутая
+  // строка «сервер · инструмент(доводы)» с кратким результатом, по клику —
+  // доводы и результат целиком (то, что ушло модели).
+  if (msg.role === 'tool') {
+    const call = msg.call;
+    if (call.is_error) row.classList.add('error');
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    const args = (call.arguments || '').trim();
+    const shortArgs = args === '{}' ? '' : args.length > 120 ? args.slice(0, 120) + '…' : args;
+    summary.textContent = `${call.is_error ? '⚠' : '🔧'} ${call.server ? call.server : 'автомат задачи'} · ${call.tool}(${shortArgs})`;
+    const preview = document.createElement('span');
+    preview.className = 'tool-preview';
+    const flat = (call.result || '').replace(/\s+/g, ' ').trim();
+    preview.textContent = '→ ' + (flat.length > 200 ? flat.slice(0, 200) + '…' : flat);
+    const argsLabel = document.createElement('span');
+    argsLabel.className = 'tool-label';
+    argsLabel.textContent = 'Доводы:';
+    const argsPre = document.createElement('pre');
+    try { argsPre.textContent = JSON.stringify(JSON.parse(args || '{}'), null, 2); } catch (e) { argsPre.textContent = args; }
+    const resultLabel = document.createElement('span');
+    resultLabel.className = 'tool-label';
+    resultLabel.textContent = 'Результат:';
+    const resultPre = document.createElement('pre');
+    resultPre.textContent = call.result || '';
+    details.append(summary, argsLabel, argsPre, resultLabel, resultPre);
+    row.append(details, preview);
+    return row;
+  }
   // Служебная пометка о задаче (например, «⏸ Задача поставлена на паузу.») —
   // тот же неброский вид, что у сжатия контекста, но без его значка.
   if (msg.role === 'notice') {
@@ -4345,7 +4728,10 @@ function applyAgentTokenMeta(messages) {
     const msg = messages[i];
     if (msg.role !== 'assistant' || !msg.usage) continue;
     msg.responseTokens = msg.usage.completion_tokens;
-    const prev = messages[i - 1];
+    // Между репликой человека и ответом могут стоять вызовы инструментов.
+    let j = i - 1;
+    while (j >= 0 && messages[j].role === 'tool') j -= 1;
+    const prev = messages[j];
     if (prev && prev.role === 'user' && prev.requestTokens == null) {
       prev.requestTokens = msg.usage.prompt_tokens;
       prev.requestUsage = msg.usage;
@@ -4627,6 +5013,12 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
         setAgentMessageTokens(userRow, 'user', userMsg.requestTokens, data.usage);
       }
     }
+    // Вызовы инструментов — перед ответом, в том порядке, в каком их делала модель.
+    for (const call of (!data.error && data.tool_calls) || []) {
+      const toolMsg = { role: 'tool', call };
+      agentChats[name].push(toolMsg);
+      if (currentAgentChatName === name) agentChatMainEl.appendChild(renderAgentMessage(toolMsg));
+    }
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
       agentChatMainEl.appendChild(renderAgentMessage(msg));
@@ -4813,6 +5205,336 @@ document.getElementById('tab-agents').addEventListener('click', () => {
   fetchAgents();
   fetchProfiles();
 });
+/* ---------- Вкладка «MCP» ---------- */
+
+const mcpServersEl = document.getElementById('mcp-servers');
+const mcpDetailEl = document.getElementById('mcp-detail');
+const mcpConfigPathEl = document.getElementById('mcp-config-path');
+const mcpConfigErrorEl = document.getElementById('mcp-config-error');
+const mcpReloadBtn = document.getElementById('mcp-reload');
+let mcpData = { servers: [] };
+let mcpSelected = null;
+let mcpBusy = false;
+let mcpPollTimer = null;
+
+// Состояние ручных вызовов по ключу «сервер/инструмент»: текст доводов,
+// результат, открыт ли блок — переживает перерисовку вкладки (опрос статуса,
+// переключение серверов), иначе введённое терялось бы.
+const mcpCalls = {};
+
+// Заготовка доводов: обязательные параметры со значением по умолчанию из
+// схемы или заглушкой по типу (см. McpToolInfo::arguments_template в ядре).
+function mcpArgumentsTemplate(schema) {
+  const props = (schema && schema.properties) || {};
+  const out = {};
+  for (const name of (schema && schema.required) || []) {
+    const p = props[name] || {};
+    if ('default' in p) { out[name] = p.default; continue; }
+    out[name] = { number: 0, integer: 0, boolean: false, array: [], object: {} }[p.type] ?? '';
+  }
+  return out;
+}
+
+async function mcpCallTool(serverName, tool) {
+  const key = serverName + '/' + tool.name;
+  const state = mcpCalls[key];
+  let args;
+  try {
+    args = JSON.parse(state.args.trim() || '{}');
+    if (args === null || typeof args !== 'object' || Array.isArray(args)) throw new Error('нужен JSON-объект');
+  } catch (e) {
+    state.result = null;
+    state.note = 'Доводы — не JSON-объект: ' + e.message;
+    state.noteError = true;
+    renderMcp(mcpData);
+    return;
+  }
+  state.busy = true;
+  state.note = 'Вызов…';
+  state.noteError = false;
+  renderMcp(mcpData);
+  try {
+    const res = await fetch(
+      `/api/mcp/${encodeURIComponent(serverName)}/tools/${encodeURIComponent(tool.name)}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arguments: args }) },
+    );
+    const data = await res.json();
+    if (data.error) {
+      state.result = null;
+      state.note = data.error;
+      state.noteError = true;
+    } else {
+      state.result = data.result;
+      state.isError = data.is_error;
+      state.note = (data.is_error ? 'Инструмент вернул ошибку' : 'Готово') + ` · ${data.elapsed_ms} мс`;
+      state.noteError = data.is_error;
+    }
+  } catch (e) {
+    state.result = null;
+    state.note = 'Ошибка сети: ' + e;
+    state.noteError = true;
+  } finally {
+    state.busy = false;
+    renderMcp(mcpData);
+  }
+}
+
+function renderMcpCall(card, server, tool) {
+  const key = server.name + '/' + tool.name;
+  const state = mcpCalls[key] ||= {
+    args: JSON.stringify(mcpArgumentsTemplate(tool.input_schema), null, 2),
+    open: false,
+  };
+  const block = document.createElement('details');
+  block.className = 'mcp-call';
+  block.open = state.open;
+  block.addEventListener('toggle', () => { state.open = block.open; });
+  const summary = document.createElement('summary');
+  summary.textContent = 'Вызвать';
+  block.appendChild(summary);
+
+  const textarea = document.createElement('textarea');
+  textarea.value = state.args;
+  textarea.spellcheck = false;
+  textarea.addEventListener('input', () => { state.args = textarea.value; });
+  // Ctrl/Cmd+Enter — вызвать, не уходя с клавиатуры.
+  textarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !state.busy) {
+      e.preventDefault();
+      mcpCallTool(server.name, tool);
+    }
+  });
+  block.appendChild(textarea);
+
+  const actions = document.createElement('div');
+  actions.className = 'mcp-call-actions';
+  const run = document.createElement('button');
+  run.type = 'button';
+  run.textContent = state.busy ? 'Вызов…' : 'Вызвать';
+  run.disabled = state.busy || server.status.state !== 'connected';
+  run.addEventListener('click', () => mcpCallTool(server.name, tool));
+  const reset = document.createElement('button');
+  reset.type = 'button';
+  reset.className = 'secondary';
+  reset.textContent = 'Сбросить';
+  reset.disabled = state.busy;
+  reset.addEventListener('click', () => {
+    state.args = JSON.stringify(mcpArgumentsTemplate(tool.input_schema), null, 2);
+    renderMcp(mcpData);
+  });
+  actions.append(run, reset);
+  const note = document.createElement('span');
+  note.className = 'mcp-call-note' + (state.noteError ? ' error' : '');
+  note.textContent = state.note || 'Ctrl+Enter — вызвать. Доводы — JSON-объект по схеме выше.';
+  actions.appendChild(note);
+  block.appendChild(actions);
+
+  if (state.result != null) {
+    const pre = document.createElement('pre');
+    pre.className = 'mcp-call-result' + (state.isError ? ' error' : '');
+    pre.textContent = state.result;
+    block.appendChild(pre);
+  }
+  card.appendChild(block);
+}
+
+const MCP_STATUS_LABELS = {
+  disabled: 'выключен',
+  idle: 'не подключён',
+  connecting: 'подключение…',
+  connected: 'подключён',
+  failed: 'ошибка',
+};
+
+function mcpStatusEl(status) {
+  const el = document.createElement('span');
+  el.className = 'mcp-status ' + status.state;
+  el.textContent = MCP_STATUS_LABELS[status.state] || status.state;
+  return el;
+}
+
+function mcpParamsSummary(schema) {
+  const props = (schema && schema.properties) || {};
+  const required = (schema && schema.required) || [];
+  const names = Object.keys(props);
+  if (!names.length) return 'нет';
+  return names
+    .map((n) => `${n}: ${props[n].type || 'any'}${required.includes(n) ? '*' : ''}`)
+    .join(', ');
+}
+
+async function loadMcp() {
+  try {
+    const res = await fetch('/api/mcp');
+    renderMcp(await res.json());
+  } catch (e) { /* сервер недоступен — покажем прежний снимок */ }
+}
+
+async function mcpAction(url) {
+  mcpBusy = true;
+  renderMcp(mcpData);
+  try {
+    const res = await fetch(url, { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      mcpConfigErrorEl.hidden = false;
+      mcpConfigErrorEl.textContent = data.error;
+      return;
+    }
+    renderMcp(data);
+  } catch (e) {
+    mcpConfigErrorEl.hidden = false;
+    mcpConfigErrorEl.textContent = 'Ошибка сети: ' + e;
+  } finally {
+    mcpBusy = false;
+    renderMcp(mcpData);
+  }
+}
+
+function renderMcp(data) {
+  mcpData = data;
+  const servers = data.servers || [];
+  mcpConfigPathEl.textContent = data.config_path || '';
+  if (!mcpBusy) {
+    mcpConfigErrorEl.hidden = !data.config_error;
+    mcpConfigErrorEl.textContent = data.config_error || '';
+  }
+  mcpReloadBtn.disabled = mcpBusy;
+  if (!servers.some((s) => s.name === mcpSelected)) {
+    mcpSelected = servers.length ? servers[0].name : null;
+  }
+
+  mcpServersEl.replaceChildren();
+  if (!servers.length) {
+    const empty = document.createElement('div');
+    empty.className = 'mcp-empty';
+    empty.textContent = 'Серверов нет — добавьте их в файл конфигурации (пример: mcp.example.json).';
+    mcpServersEl.appendChild(empty);
+  }
+  for (const server of servers) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'mcp-server-item' + (server.name === mcpSelected ? ' active' : '');
+    const name = document.createElement('span');
+    name.className = 'mcp-server-name';
+    name.textContent = server.name;
+    const status = mcpStatusEl(server.status);
+    if (server.status.state === 'connected') status.textContent += ` · ${server.tools.length} инстр.`;
+    item.append(name, status);
+    item.addEventListener('click', () => {
+      mcpSelected = server.name;
+      renderMcp(mcpData);
+    });
+    mcpServersEl.appendChild(item);
+  }
+
+  renderMcpDetail(servers.find((s) => s.name === mcpSelected));
+
+  // Пока какой-то сервер подключается — опрашиваем, чтобы статус сменился сам.
+  const pending = servers.some((s) => s.status.state === 'connecting' || s.status.state === 'idle' && s.enabled);
+  clearTimeout(mcpPollTimer);
+  if (pending) mcpPollTimer = setTimeout(loadMcp, 1500);
+}
+
+function renderMcpDetail(server) {
+  // Перерисовка (после вызова, при опросе статуса) не должна сбрасывать
+  // прокрутку списка инструментов к началу — только смена сервера.
+  const keepScroll = mcpDetailEl.dataset.server === (server && server.name) ? mcpDetailEl.scrollTop : 0;
+  mcpDetailEl.dataset.server = server ? server.name : '';
+  mcpDetailEl.replaceChildren();
+  if (!server) return;
+  requestAnimationFrame(() => { mcpDetailEl.scrollTop = keepScroll; });
+
+  const head = document.createElement('div');
+  head.className = 'mcp-detail-head';
+  const title = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = server.name;
+  const status = mcpStatusEl(server.status);
+  title.append(h, status);
+  if (server.server_version) {
+    const v = document.createElement('span');
+    v.className = 'mcp-meta';
+    v.textContent = '  ·  ' + server.server_version;
+    title.appendChild(v);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'mcp-server-actions';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.textContent = server.enabled ? 'Выключить' : 'Включить';
+  toggle.disabled = mcpBusy;
+  toggle.addEventListener('click', () =>
+    mcpAction(`/api/mcp/${encodeURIComponent(server.name)}/${server.enabled ? 'disable' : 'enable'}`));
+  actions.appendChild(toggle);
+  if (server.enabled) {
+    const reconnect = document.createElement('button');
+    reconnect.type = 'button';
+    reconnect.textContent = '↻ Переподключить';
+    reconnect.disabled = mcpBusy;
+    reconnect.addEventListener('click', () =>
+      mcpAction(`/api/mcp/${encodeURIComponent(server.name)}/reconnect`));
+    actions.appendChild(reconnect);
+  }
+  head.append(title, actions);
+  mcpDetailEl.appendChild(head);
+
+  const transport = document.createElement('div');
+  transport.className = 'mcp-meta';
+  transport.textContent = server.transport;
+  mcpDetailEl.appendChild(transport);
+  if (server.description) {
+    const d = document.createElement('p');
+    d.className = 'mcp-tool-desc';
+    d.textContent = server.description;
+    mcpDetailEl.appendChild(d);
+  }
+  if (server.status.state === 'failed') {
+    const err = document.createElement('div');
+    err.className = 'mcp-error';
+    err.textContent = server.status.error;
+    mcpDetailEl.appendChild(err);
+  }
+
+  if (server.tools.length) {
+    const t = document.createElement('div');
+    t.className = 'mcp-tools-title';
+    t.textContent = `Инструменты (${server.tools.length}) — агенты видят их как mcp__${server.name}__<имя>`;
+    mcpDetailEl.appendChild(t);
+  }
+  for (const tool of server.tools) {
+    const card = document.createElement('div');
+    card.className = 'mcp-tool';
+    const name = document.createElement('div');
+    name.className = 'mcp-tool-name';
+    name.textContent = tool.name + (tool.title ? `  (${tool.title})` : '');
+    card.appendChild(name);
+    if (tool.description) {
+      const desc = document.createElement('div');
+      desc.className = 'mcp-tool-desc';
+      desc.textContent = tool.description;
+      card.appendChild(desc);
+    }
+    const params = document.createElement('div');
+    params.className = 'mcp-tool-params';
+    params.textContent = 'параметры: ' + mcpParamsSummary(tool.input_schema);
+    card.appendChild(params);
+    const schema = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'JSON Schema';
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(tool.input_schema, null, 2);
+    schema.append(summary, pre);
+    card.appendChild(schema);
+    renderMcpCall(card, server, tool);
+    mcpDetailEl.appendChild(card);
+  }
+}
+
+mcpReloadBtn.addEventListener('click', () => mcpAction('/api/mcp/reload'));
+document.getElementById('tab-mcp').addEventListener('click', loadMcp);
+loadMcp();
 </script>
 </body>
 </html>
