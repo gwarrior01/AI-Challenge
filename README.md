@@ -201,13 +201,35 @@ Servers are configured in `mcp.json` in the working directory (override with `LL
 - `enabled: false` (or Cline-style `disabled: true`) — the server **stays in the config but is not connected**, and agents don't see its tools. Every interface can flip this flag; the change is written back into `mcp.json` (other fields and key order are preserved), so it survives restarts;
 - `${VAR}` in `args`, `env`, `url` and `headers` is substituted from the environment, so tokens stay in `.env`, not in the config file. A missing variable is reported as that server's connection error.
 
-Tools are offered to the model as `mcp__<server>__<tool>` so they can't clash with each other or with the task state machine's `move_stage`/`update_step`. They are offered on every agent request, with `tool_choice: "auto"` (the model decides; the forced first tool call only applies when a task is active, see above). Results are truncated to 20 000 characters before going back to the model. Each call the model makes is returned in `AgentReply::tool_calls` and shown in the chat right before the agent's reply: server · tool(arguments) → short result. In the web UI the row expands to show the full arguments and result. Like per-request cost, these rows are not persisted: reopening a chat after a restart shows only the dialogue itself.
+Tools are offered to the model as `mcp__<server>__<tool>` so they can't clash with each other or with the task state machine's `move_stage`/`update_step`. Without an active task they are offered on every agent request, with `tool_choice: "auto"` (the model decides; the forced first tool call only applies when a task is active, see above). With an active task they follow its stage. They **run** only in `execution` and `validation` (doing the approved plan and checking the result, e.g. measuring again): a call in `planning` or `done` is refused before it reaches the server, with a message telling the model to put that step into the plan instead. That refusal goes to the model only — it gets no row in the chat, where it would be noise in front of the plan itself — otherwise the model does the whole job while "planning" and the human approves a plan that has already been carried out. They are still **offered** to the model in `planning`, because a model judges what it can do by the tool list in the request, not by prose: with them removed, live runs had it answer that it has no access to the machine and plan around shell commands (`jps`, `jstack`, `jmap`) instead of the tools it actually has. Seeing them, it names them in the plan — `java_profile` with `duration_sec`, and so on — and at most one refused call per exchange gets it there. Results are truncated to 20 000 characters before going back to the model. Each MCP call the model makes is returned in `AgentReply::tool_calls` and shown in the chat right before the agent's reply: server · tool(arguments) → short result (the task state machine's own `move_stage`/`update_step` calls are not shown — their effect is visible in the task status). A call appears **when it starts**, not when the whole reply is done: the agent records calls as they run (`Agent::live_tool_calls`), the row shows `⏳ … → выполняется…` and gets its result in place when the call returns — the web UI polls `GET /api/agents/:name/tool-calls` while it waits for `/ask`, the TUI polls from the task that awaits the reply, and the CLI prints the `⏳` line straight away. That matters for slow tools: a 20-second `java_profile` is otherwise invisible until the answer arrives. In the web UI the row expands to show the full arguments and result. Like per-request cost, these rows are not persisted: reopening a chat after a restart shows only the dialogue itself.
 
 Where to see it:
 
 - **CLI** — `llm-cli mcp` connects to all enabled servers and prints their tools; `llm-cli mcp tools <server>` prints one server's tools with parameters; `llm-cli mcp enable|disable <server>`; `llm-cli mcp call <server> <tool> '{"a":1}'` calls a tool directly, no model involved. None of these need `LLM_API_*`. `agent start` connects before the chat and prints `[🔧 server · tool(args) → result]` lines.
 - **TUI** — **F4** from any screen opens the MCP screen: servers with status on the left, the selected server's tools (description, parameters) on the right; Space/`e` enables/disables, `r` reconnects, `l` re-reads the config file. **Tab** moves focus to the tools: ↑/↓ picks one, **Enter** opens the bottom input with a JSON arguments template (required parameters with placeholders; a repeat call reuses the last arguments), **Enter** again calls the tool directly — no model involved — and the result appears right under it. Servers connect in the background at startup; the agent chat status line shows `🔌 MCP connected/enabled · N инстр.`, and tool calls appear as `Тул:` rows.
 - **Web** — the **MCP** tab shows the same: server list, statuses, tools with JSON Schemas, enable/disable/reconnect buttons, and "re-read config". Each tool has a **Вызвать** block: a JSON editor pre-filled with the arguments template, a call button (or Ctrl/Cmd+Enter), and the result with timing. Arguments and results survive re-renders while the tab is open. API: `GET /api/mcp`, `POST /api/mcp/:name/enable|disable|reconnect`, `POST /api/mcp/reload`, `POST /api/mcp/:name/tools/:tool` with `{"arguments": {...}}`.
+
+#### Own MCP server: Java profiler
+
+`mcp/java-profiler-mcp/` is an MCP **server** of this repo (Rust, `rmcp`), served over Streamable HTTP. It profiles JVMs running on the same machine under the same user, using the JDK's own tools (`jps`, `jcmd`, `jfr`; taken from `$JAVA_HOME/bin`, otherwise from `PATH`). Recording needs JDK 11+ in the target JVM; `jfr view` needs JDK 21+ locally.
+
+```bash
+cargo run -p java-profiler-mcp        # listens on http://127.0.0.1:8091/mcp (override: JAVA_PROFILER_MCP_ADDR)
+```
+
+`mcp.example.json` already has the `java-profiler` entry pointing there. Tools (all read-only):
+
+| Tool | Arguments | What it returns |
+|---|---|---|
+| `java_list_processes` | — | JVMs on this machine: pid, main class/jar, program arguments, JVM flags |
+| `java_process_info` | `pid` | JVM version, uptime, GC and heap usage, non-default JVM flags |
+| `java_thread_dump` | `pid`, `max_threads` (20), `include_system` (false) | thread counts by state, detected deadlocks, stacks of the busiest threads by CPU with lock info |
+| `java_heap_histogram` | `pid`, `top` (20) | classes taking the most heap: instances and bytes (note: forces a full GC) |
+| `java_profile` | `pid`, `duration_sec` (10, max 120), `views` | records Java Flight Recorder for the given time and returns `jfr view` summaries — by default `hot-methods`, `allocation-by-class`, `contention-by-site`, `gc-pauses` |
+
+To try it, run the demo app with a hot CPU loop, heavy allocation, and lock contention — `java mcp/java-profiler-mcp/demo/Busy.java` — then ask an agent why the Java app is slow, or call a tool directly: `llm-cli mcp call java-profiler java_profile '{"pid":<pid>,"duration_sec":5}'`.
+
+Only local JVMs are supported for now. Remote ones are planned: all data comes from HotSpot diagnostic commands, which a remote JVM runs over JMX (the `DiagnosticCommand` MBean) with the same text output, so a remote JVM will need only a new `Target` variant and a `Jvm` implementation (`mcp/java-profiler-mcp/src/jvm.rs`); parsing and tools stay as they are.
 
 ## Installing Rust
 
@@ -375,6 +397,8 @@ Cargo.toml       — workspace tying all crates together
 core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs)
 cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents and `mcp` subcommand for MCP servers
 mcp.example.json  — example MCP server config (copy to mcp.json)
+mcp/              — this repo's own MCP servers, one folder each:
+  java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template

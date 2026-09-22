@@ -114,6 +114,20 @@ fn task_tools_offered(task: Option<&TaskState>) -> bool {
     task.map(|t| !t.paused && t.stage != Stage::Done && t.pending_stage.is_none()).unwrap_or(false)
 }
 
+/// Можно ли сейчас ВЫПОЛНЯТЬ вызовы инструментов MCP-серверов: без задачи —
+/// всегда, с задачей — только на этапах, где это допускает автомат (см.
+/// [`Stage::allows_external_tools`]).
+fn mcp_tools_allowed(task: Option<&TaskState>) -> bool {
+    task.is_none_or(|t| t.stage.allows_external_tools())
+}
+
+/// Показывать ли инструменты MCP-серверов модели (см.
+/// [`Stage::offers_external_tools`]): на planning они показываются, хотя вызов
+/// и будет отклонён — иначе модель считает, что таких возможностей у неё нет.
+fn mcp_tools_offered(task: Option<&TaskState>) -> bool {
+    task.is_none_or(|t| t.stage.offers_external_tools())
+}
+
 /// Складывает метрики токенов/стоимости двух обменов — используется, чтобы
 /// показать пользователю честную сумму по всем кругам вызова инструментов
 /// внутри одного обмена ([`Agent::run_tool_loop`]), а не только последний.
@@ -350,15 +364,26 @@ pub struct AgentReply {
     /// пояснение для человека. Сам запрос запомнен в задаче и уйдёт заново
     /// при возобновлении (см. [`Agent::task_resume`]).
     pub interrupted: bool,
-    /// Инструменты, которые модель вызвала в рамках этого обмена, по порядку —
-    /// и MCP-серверов (см. [`crate::mcp`]), и встроенные инструменты автомата
-    /// задачи. Как и `cost`, не персистится: интерфейсы показывают эти вызовы
-    /// рядом с ответом, пока открыт диалог.
+    /// Инструменты MCP-серверов (см. [`crate::mcp`]), которые модель вызвала в
+    /// рамках этого обмена, по порядку. Встроенные инструменты автомата задачи
+    /// (`move_stage`/`update_step`) сюда не попадают: их результат и так виден
+    /// человеку в состоянии задачи, а отдельные строки о них в чате — шум. Как и
+    /// `cost`, не персистится: интерфейсы показывают эти вызовы рядом с
+    /// ответом, пока открыт диалог.
     pub tool_calls: Vec<ToolCallRecord>,
 }
 
+/// Выполненный вызов инструмента: сама запись и признак того, показывать ли её
+/// человеку. Невидимыми бывают вызовы, отклонённые автоматом задачи (например,
+/// MCP-инструмент на этапе planning): модели отказ нужен — он объясняет, что
+/// делать вместо вызова, — а в чате это лишняя строка.
+struct ExecutedTool {
+    record: ToolCallRecord,
+    visible: bool,
+}
+
 /// Один вызов инструмента моделью за обмен — для показа в интерфейсах.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// MCP-сервер, которому ушёл вызов; `None` — встроенный инструмент
     /// автомата задачи (`move_stage`/`update_step`).
@@ -403,6 +428,29 @@ impl ToolCallRecord {
             flat
         }
     }
+}
+
+/// Вызовы инструментов MCP-серверов в текущем (или последнем завершённом)
+/// обмене агента — по мере выполнения, чтобы интерфейсы показывали вызов в
+/// момент, когда он начался, а не вместе с итоговым ответом (см.
+/// [`Agent::live_tool_calls`]).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveToolCalls {
+    /// Номер обмена: растёт с каждым обменом агента. Интерфейс запоминает его до
+    /// отправки запроса и показывает только вызовы обмена с бо́льшим номером —
+    /// иначе опрос, успевший раньше начала обмена, выдал бы вызовы прошлого.
+    pub exchange: u64,
+    /// Вызовы по порядку.
+    pub calls: Vec<LiveToolCall>,
+}
+
+/// Один вызов из [`LiveToolCalls`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveToolCall {
+    #[serde(flatten)]
+    pub call: ToolCallRecord,
+    /// Вызов ещё выполняется — `call.result` пока пуст.
+    pub running: bool,
 }
 
 /// Стоимость одного обмена, разложенная на входную и выходную часть — так
@@ -503,6 +551,8 @@ pub struct Agent {
     /// MCP-серверы (см. [`crate::mcp`]) — общие для всех агентов: инструменты
     /// всех подключённых сейчас серверов предлагаются модели в каждом запросе.
     mcp: Arc<crate::mcp::McpManager>,
+    /// Вызовы MCP-инструментов текущего обмена (см. [`Agent::live_tool_calls`]).
+    live_calls: Mutex<LiveToolCalls>,
 }
 
 impl Agent {
@@ -526,6 +576,7 @@ impl Agent {
             facts: Mutex::new(facts),
             db,
             mcp,
+            live_calls: Mutex::new(LiveToolCalls::default()),
         }
     }
 
@@ -1303,7 +1354,10 @@ impl Agent {
                         self.client.chat_with_tools(model, &wire, &move_stage_only, true, options).await?;
                     usage_total = sum_usage(usage_total, forced.usage);
                     for call in &forced.tool_calls {
-                        records.push(self.execute_tool(call).await);
+                        let executed = self.execute_tool(call).await;
+                        if executed.visible {
+                            records.push(executed.record);
+                        }
                     }
                 }
                 let completion = crate::ChatCompletion {
@@ -1320,9 +1374,11 @@ impl Agent {
                 completion.tool_calls.clone(),
             ));
             for call in &completion.tool_calls {
-                let record = self.execute_tool(call).await;
-                wire.push(crate::RequestMessage::tool_result(call.id.clone(), record.result.clone()));
-                records.push(record);
+                let executed = self.execute_tool(call).await;
+                wire.push(crate::RequestMessage::tool_result(call.id.clone(), executed.record.result.clone()));
+                if executed.visible {
+                    records.push(executed.record);
+                }
             }
         }
 
@@ -1345,24 +1401,85 @@ impl Agent {
     /// Выполняет один вызов инструмента моделью: инструмент MCP-сервера уходит
     /// на свой сервер (см. [`crate::mcp::McpManager::call`]), остальное —
     /// встроенные инструменты автомата задачи.
-    async fn execute_tool(&self, call: &crate::ToolCallWire) -> ToolCallRecord {
+    ///
+    /// Этап задачи проверяется здесь ещё раз, а не только при составлении
+    /// списка инструментов: модель может вызвать инструмент, которого ей не
+    /// предлагали, а этап может смениться посреди обмена (откат execution →
+    /// planning применяется сразу).
+    async fn execute_tool(&self, call: &crate::ToolCallWire) -> ExecutedTool {
         let arguments = call.function.arguments.clone();
-        if let Some(result) = self.mcp.call(&call.function.name, &arguments).await {
-            return ToolCallRecord {
-                server: Some(result.server),
-                tool: result.tool,
-                arguments,
-                result: result.text,
-                is_error: result.is_error,
-            };
+        if let Some((server, tool)) = self.mcp.tool_origin(&call.function.name) {
+            if let Some(task) = self.task_state().filter(|t| !mcp_tools_allowed(Some(t))) {
+                let record = ToolCallRecord {
+                    server: Some(server),
+                    tool,
+                    arguments,
+                    result: format!(
+                        "вызов не выполнен: на этапе «{}» инструменты внешних серверов не выполняются (задача \
+                         «{}»). Не повторяй вызов — включи этот шаг в план, назвав инструмент и параметры, и \
+                         предложи move_stage в execution: инструменты включатся, как только человек утвердит \
+                         план.",
+                        task.stage, task.name
+                    ),
+                    is_error: true,
+                };
+                // Человеку этот вызов не показывается: отказ адресован модели и
+                // говорит ей вернуться к плану, а в чате строка «вызов не
+                // выполнен» — шум, за которым всё равно идёт сам план.
+                return ExecutedTool { record, visible: false };
+            }
+            let mut record =
+                ToolCallRecord { server: Some(server), tool, arguments, result: String::new(), is_error: false };
+            let slot = self.live_call_started(&record);
+            match self.mcp.call(&call.function.name, &record.arguments).await {
+                Some(result) => {
+                    record.result = result.text;
+                    record.is_error = result.is_error;
+                }
+                None => {
+                    // Сервер отключился между выбором инструмента и вызовом.
+                    record.result = "вызов не выполнен: MCP-сервер отключился".to_string();
+                    record.is_error = true;
+                }
+            }
+            self.live_call_finished(slot, &record);
+            return ExecutedTool { record, visible: true };
         }
         let is_known = matches!(call.function.name.as_str(), "move_stage" | "update_step");
-        ToolCallRecord {
-            server: None,
-            tool: call.function.name.clone(),
-            result: self.execute_task_tool(call),
-            arguments,
-            is_error: !is_known,
+        ExecutedTool {
+            record: ToolCallRecord {
+                server: None,
+                tool: call.function.name.clone(),
+                result: self.execute_task_tool(call),
+                arguments,
+                is_error: !is_known,
+            },
+            visible: true,
+        }
+    }
+
+    /// Вызовы MCP-инструментов текущего обмена по мере выполнения, включая
+    /// ещё не завершившиеся (`running`). Интерфейсы опрашивают его, пока ждут
+    /// ответа агента (см. [`LiveToolCalls::exchange`]); итоговый список — в
+    /// [`AgentReply::tool_calls`].
+    pub fn live_tool_calls(&self) -> LiveToolCalls {
+        self.live_calls.lock().expect("вызовы инструментов отравлены паникой").clone()
+    }
+
+    /// Отмечает начало вызова; возвращает его место — номер обмена и индекс.
+    fn live_call_started(&self, record: &ToolCallRecord) -> (u64, usize) {
+        let mut live = self.live_calls.lock().expect("вызовы инструментов отравлены паникой");
+        live.calls.push(LiveToolCall { call: record.clone(), running: true });
+        (live.exchange, live.calls.len() - 1)
+    }
+
+    /// Подставляет результат вызова — если за это время не начался новый обмен.
+    fn live_call_finished(&self, (exchange, index): (u64, usize), record: &ToolCallRecord) {
+        let mut live = self.live_calls.lock().expect("вызовы инструментов отравлены паникой");
+        if live.exchange == exchange {
+            if let Some(slot) = live.calls.get_mut(index) {
+                *slot = LiveToolCall { call: record.clone(), running: false };
+            }
         }
     }
 
@@ -1676,6 +1793,11 @@ impl Agent {
         if !self.is_running() {
             bail!("агент «{}» остановлен — сначала запустите его", self.name);
         }
+        {
+            let mut live = self.live_calls.lock().expect("вызовы инструментов отравлены паникой");
+            live.exchange += 1;
+            live.calls.clear();
+        }
 
         let config = self.config();
         let mut messages = Vec::new();
@@ -1742,10 +1864,13 @@ impl Agent {
         // случаях модель и так не должна двигать автомат, поэтому инструменты просто не даются
         // (см. документацию Stage::directive/format_stage_block, откуда модель узнаёт, почему).
         let task_tools = task_tools_offered(active_task.as_ref());
-        // Инструменты подключённых MCP-серверов (см. crate::mcp) предлагаются в
-        // каждом запросе, независимо от задачи — список читается заново, т.к.
-        // серверы могли только что подключиться/отключиться.
-        let mcp_tools = self.mcp.tool_definitions();
+        // Инструменты подключённых MCP-серверов (см. crate::mcp) — список читается
+        // заново, т.к. серверы могли только что подключиться/отключиться. С
+        // активной задачей они предлагаются на этапах, где автомат их показывает
+        // (Stage::offers_external_tools); выполняются не на всех из них — вызов на
+        // planning отклоняется в execute_tool.
+        let mcp_tools =
+            if mcp_tools_offered(active_task.as_ref()) { self.mcp.tool_definitions() } else { Vec::new() };
         // Просьба перескочить обязательный этап перехватывается ДО модели (см.
         // crate::memory::skip_request_target): переход автомат не пропустит и
         // так, но без этого модель могла бы послушаться и написать реализацию
@@ -1910,7 +2035,7 @@ impl Agent {
             response_json: completion.response_json,
             cost,
             interrupted: false,
-            tool_calls,
+            tool_calls: tool_calls.into_iter().filter(|call| call.server.is_some()).collect(),
         })
     }
 
@@ -3937,6 +4062,12 @@ mod tests {
         assert_eq!((call.server.as_deref(), call.tool.as_str(), call.result.as_str()), (Some("calc"), "add", "42"));
         assert!(!call.is_error);
         assert_eq!(call.headline(80), r#"calc · add({"a":2,"b":40})"#);
+        // Тот же вызов виден интерфейсам и по ходу обмена — здесь уже завершённым.
+        let live = agent.live_tool_calls();
+        assert_eq!(live.exchange, 1);
+        assert_eq!(live.calls.len(), 1);
+        assert!(!live.calls[0].running);
+        assert_eq!((live.calls[0].call.tool.as_str(), live.calls[0].call.result.as_str()), ("add", "42"));
 
         let requests = requests.lock().unwrap();
         // Без задачи — только MCP-инструменты и без принуждения к вызову.
@@ -3952,11 +4083,132 @@ mod tests {
         assert_eq!(agent.history().len(), 2);
     }
 
+    /// Агент с подключённым MCP-сервером-калькулятором и начатой задачей (этап planning).
+    async fn agent_with_calculator_and_task(base_url: &str, store: &TempStore) -> Arc<Agent> {
+        let mcp = Arc::new(crate::mcp::McpManager::empty());
+        mcp.attach_for_tests("calc", crate::mcp::test_support::spawn_calculator()).await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(base_url), store.0.clone(), mcp).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("задача", None).unwrap();
+        agent
+    }
+
+    fn offered_tools(request: &serde_json::Value) -> Vec<String> {
+        request["tools"]
+            .as_array()
+            .map(|tools| tools.iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
     #[tokio::test]
-    async fn mcp_tools_are_offered_alongside_task_tools() {
+    async fn planning_offers_mcp_tools_but_directive_forbids_calling_them() {
         let (base_url, requests) = mock_llm(vec![
-            tool_call("mcp__calc__fail", serde_json::json!({ "a": 1, "b": 1 })),
-            serde_json::json!({ "content": "Инструмент сломался." }),
+            tool_call("update_step", serde_json::json!({ "step": "план: сложить числа калькулятором" })),
+            serde_json::json!({ "content": "План готов." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let agent = agent_with_calculator_and_task(&base_url, &store).await;
+
+        let reply = agent.handle_request("составь план").await.unwrap();
+        // Вызовы инструментов автомата задачи в чат не выводятся — только MCP.
+        assert!(reply.tool_calls.is_empty(), "{:?}", reply.tool_calls);
+
+        let requests = requests.lock().unwrap();
+        // Инструменты видны модели (иначе она считает, что таких возможностей у
+        // неё нет), но директива этапа запрещает их вызывать.
+        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(requests[0]["tool_choice"], "required");
+        let block = requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .find(|text| text.contains("Состояние задачи (конечный автомат)"))
+            .expect("в запросе должен быть блок задачи");
+        assert!(block.contains("на этом этапе они не выполняются"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn planning_without_mcp_servers_offers_only_task_tools() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("update_step", serde_json::json!({ "step": "собрать требования" })),
+            serde_json::json!({ "content": "План готов." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        // Реестр MCP пуст — требовать, чтобы шаги плана назывались инструментами, не о чем.
+        let manager = AgentManager::with_mcp(
+            LlmClient::for_tests_at(&base_url),
+            store.0.clone(),
+            Arc::new(crate::mcp::McpManager::empty()),
+        )
+        .unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        agent.task_start("задача", None).unwrap();
+
+        agent.handle_request("составь план").await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_call_in_planning_is_refused_without_a_chat_row() {
+        let (base_url, requests) = mock_llm(vec![
+            // Модель вызывает инструмент, которого ей не предлагали.
+            tool_call("mcp__calc__add", serde_json::json!({ "a": 2, "b": 40 })),
+            serde_json::json!({ "content": "Сначала согласуем план." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let agent = agent_with_calculator_and_task(&base_url, &store).await;
+
+        let reply = agent.handle_request("сколько будет 2 + 40?").await.unwrap();
+        // Отказ адресован модели, человеку он в чате не показывается.
+        assert!(reply.tool_calls.is_empty(), "{:?}", reply.tool_calls);
+        assert!(agent.live_tool_calls().calls.is_empty());
+
+        // Модель получила его вместо суммы — вызов до сервера не дошёл.
+        let requests = requests.lock().unwrap();
+        let tool_message = requests[1]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(tool_message["role"], "tool");
+        let result = tool_message["content"].as_str().unwrap();
+        assert!(result.contains("не выполняются"), "{result}");
+        assert!(result.contains("включи этот шаг в план"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_are_offered_alongside_task_tools_in_execution() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("mcp__calc__add", serde_json::json!({ "a": 2, "b": 40 })),
+            serde_json::json!({ "content": "Получилось 42." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let agent = agent_with_calculator_and_task(&base_url, &store).await;
+        assert!(move_stage(&agent, "execution").contains("ждёт подтверждения"));
+        agent.task_approve().unwrap();
+        assert_eq!(task(&agent).stage, Stage::Execution);
+
+        let reply = agent.handle_request("выполняй план").await.unwrap();
+        let call = &reply.tool_calls[0];
+        assert_eq!((call.result.as_str(), call.is_error), ("42", false));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
+    }
+
+    #[tokio::test]
+    async fn each_exchange_starts_a_new_list_of_live_tool_calls() {
+        let (base_url, _requests) = mock_llm(vec![
+            tool_call("mcp__calc__add", serde_json::json!({ "a": 1, "b": 2 })),
+            serde_json::json!({ "content": "3" }),
+            serde_json::json!({ "content": "Без инструментов." }),
         ])
         .await;
         let store = TempStore::new();
@@ -3966,15 +4218,24 @@ mod tests {
         manager.create(AgentConfig::new("tester")).unwrap();
         manager.start("tester").unwrap();
         let agent = manager.get("tester").unwrap();
-        agent.task_start("задача", None).unwrap();
+        assert_eq!(agent.live_tool_calls().exchange, 0);
 
-        let reply = agent.handle_request("составь план").await.unwrap();
-        assert!(reply.tool_calls[0].is_error);
+        agent.handle_request("1 + 2?").await.unwrap();
+        assert_eq!(agent.live_tool_calls().calls.len(), 1);
 
-        let requests = requests.lock().unwrap();
-        let offered: Vec<&str> =
-            requests[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(offered, ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
-        assert_eq!(requests[0]["tool_choice"], "required");
+        agent.handle_request("а теперь просто ответь").await.unwrap();
+        let live = agent.live_tool_calls();
+        assert_eq!(live.exchange, 2);
+        assert!(live.calls.is_empty(), "вызовы прошлого обмена не должны остаться: {:?}", live.calls);
+    }
+
+    #[test]
+    fn external_tools_are_shown_on_planning_but_run_only_later() {
+        let all = [Stage::Planning, Stage::Execution, Stage::Validation, Stage::Done];
+        let allowed: Vec<Stage> = all.into_iter().filter(|s| s.allows_external_tools()).collect();
+        let offered: Vec<Stage> = all.into_iter().filter(|s| s.offers_external_tools()).collect();
+        assert_eq!(allowed, [Stage::Execution, Stage::Validation]);
+        assert_eq!(offered, [Stage::Planning, Stage::Execution, Stage::Validation]);
+        assert!(mcp_tools_allowed(None) && mcp_tools_offered(None), "без задачи ограничений нет");
     }
 }

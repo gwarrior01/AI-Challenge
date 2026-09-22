@@ -622,6 +622,16 @@ async fn task_ensure_agent(State(state): State<AppState>, Path(name): Path<Strin
 
 /// Текущее состояние задачи агента — фронтенд опрашивает его, пока агент
 /// отвечает, чтобы смена этапа посреди ответа (move_stage) была видна сразу.
+/// Вызовы MCP-инструментов текущего обмена агента по ходу выполнения (см.
+/// llm_core::LiveToolCalls) — чат опрашивает их, пока ждёт ответа /ask, и
+/// показывает каждый вызов в момент его начала, а не вместе с ответом.
+async fn agent_tool_calls(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    Json(serde_json::json!(agent.live_tool_calls()))
+}
+
 async fn task_state_agent(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
     let Some(agent) = state.agents.get(&name) else {
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
@@ -898,8 +908,8 @@ async fn ask_agent(
                 // внутри handle_request; веб-интерфейс показывает его прямо в чате
                 // (полоска вверху + панель у кнопки "Отправить"), не в панели памяти.
                 "task": info.task,
-                // Вызовы инструментов за этот обмен (MCP-серверов и автомата
-                // задачи) — чат показывает их перед ответом (см. AgentReply::tool_calls).
+                // Вызовы инструментов MCP-серверов за этот обмен — чат показывает
+                // их перед ответом (см. AgentReply::tool_calls).
                 "tool_calls": reply.tool_calls,
             }))
         }
@@ -1083,6 +1093,7 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/start", post(start_agent))
         .route("/api/agents/:name/stop", post(stop_agent))
         .route("/api/agents/:name/ask", post(ask_agent))
+        .route("/api/agents/:name/tool-calls", get(agent_tool_calls))
         .route("/api/agents/:name/history", get(agent_history))
         .route("/api/agents/:name/strategy", post(set_agent_strategy))
         .route("/api/agents/:name/profile", post(set_agent_profile))

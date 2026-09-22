@@ -14,6 +14,10 @@
       "enabled": false,
       "url": "https://api.githubcopilot.com/mcp/",
       "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+    },
+    "java-profiler": {
+      "description": "Профилирование Java-приложений на этой машине (свой сервер, Streamable HTTP; запуск: cargo run -p java-profiler-mcp)",
+      "url": "http://127.0.0.1:8091/mcp"
     }
   }
 }

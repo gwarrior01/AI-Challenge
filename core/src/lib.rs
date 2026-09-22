@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub use agent::{
     Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
-    FactsInfo, ProfileStatus, SlidingWindowInfo, ToolCallRecord,
+    FactsInfo, LiveToolCall, LiveToolCalls, ProfileStatus, SlidingWindowInfo, ToolCallRecord,
 };
 
 pub mod context;
