@@ -547,6 +547,12 @@ impl McpManager {
         self.resolve(qualified_name).is_some()
     }
 
+    /// Сервер и исходное имя инструмента по имени, под которым его вызвала
+    /// модель; `None` — это не инструмент подключённого MCP-сервера.
+    pub fn tool_origin(&self, qualified_name: &str) -> Option<(String, String)> {
+        self.resolve(qualified_name).map(|(server, tool, _)| (server, tool))
+    }
+
     /// Вызывает инструмент по имени, под которым его вызвала модель, с доводами
     /// как их прислала модель (сырой JSON-текст). Никогда не возвращает ошибку:
     /// сбой вызова — это тоже результат для модели (`is_error`), а не повод

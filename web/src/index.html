@@ -2091,6 +2091,11 @@
     margin-top: 6px;
     color: var(--muted);
   }
+
+  /* Вызов ещё выполняется — результат подставится, когда он завершится. */
+  .agent-message.tool.running {
+    border-style: dashed;
+  }
 </style>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
@@ -4640,16 +4645,24 @@ function renderAgentMessage(msg) {
   // доводы и результат целиком (то, что ушло модели).
   if (msg.role === 'tool') {
     const call = msg.call;
+    // running — вызов ещё идёт (см. pollLiveToolCalls), interrupted — ответ
+    // оборвался раньше, чем вызов успел завершиться.
     if (call.is_error) row.classList.add('error');
+    if (msg.running) row.classList.add('running');
     const details = document.createElement('details');
     const summary = document.createElement('summary');
     const args = (call.arguments || '').trim();
     const shortArgs = args === '{}' ? '' : args.length > 120 ? args.slice(0, 120) + '…' : args;
-    summary.textContent = `${call.is_error ? '⚠' : '🔧'} ${call.server ? call.server : 'автомат задачи'} · ${call.tool}(${shortArgs})`;
+    const icon = msg.running ? '⏳' : call.is_error || msg.interrupted ? '⚠' : '🔧';
+    summary.textContent = `${icon} ${call.server ? call.server : 'автомат задачи'} · ${call.tool}(${shortArgs})`;
     const preview = document.createElement('span');
     preview.className = 'tool-preview';
     const flat = (call.result || '').replace(/\s+/g, ' ').trim();
-    preview.textContent = '→ ' + (flat.length > 200 ? flat.slice(0, 200) + '…' : flat);
+    preview.textContent = msg.running
+      ? '→ выполняется…'
+      : msg.interrupted
+        ? '→ прервано: ответ агента оборвался раньше, чем вызов завершился'
+        : '→ ' + (flat.length > 200 ? flat.slice(0, 200) + '…' : flat);
     const argsLabel = document.createElement('span');
     argsLabel.className = 'tool-label';
     argsLabel.textContent = 'Доводы:';
@@ -4990,6 +5003,11 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
   agentTaskWorkingFor = name;
   if (currentAgentChatName === name) renderTaskWorking(currentTaskSnapshot);
   const taskPoll = setInterval(() => refreshTaskWhileWorking(name), TASK_POLL_MS);
+  // Вызовы инструментов — по мере выполнения, а не вместе с ответом. Номер
+  // обмена запоминается ДО отправки: опрос покажет только вызовы более нового.
+  const live = { rows: [], base: null, busy: false };
+  live.base = await fetchLiveToolCalls(name).then((d) => d.exchange).catch(() => null);
+  const livePoll = live.base == null ? null : setInterval(() => pollLiveToolCalls(name, live), LIVE_TOOL_POLL_MS);
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}/ask`, {
       method: 'POST',
@@ -5013,12 +5031,10 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
         setAgentMessageTokens(userRow, 'user', userMsg.requestTokens, data.usage);
       }
     }
-    // Вызовы инструментов — перед ответом, в том порядке, в каком их делала модель.
-    for (const call of (!data.error && data.tool_calls) || []) {
-      const toolMsg = { role: 'tool', call };
-      agentChats[name].push(toolMsg);
-      if (currentAgentChatName === name) agentChatMainEl.appendChild(renderAgentMessage(toolMsg));
-    }
+    // Вызовы инструментов — перед ответом, в том порядке, в каком их делала
+    // модель. Уже показанные по ходу обмена строки получают итоговые данные.
+    if (livePoll) clearInterval(livePoll);
+    finishLiveToolCalls(name, live, (!data.error && data.tool_calls) || []);
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
       agentChatMainEl.appendChild(renderAgentMessage(msg));
@@ -5075,6 +5091,8 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
       }
     }
   } catch (e) {
+    if (livePoll) clearInterval(livePoll);
+    finishLiveToolCalls(name, live, []);
     const msg = { role: 'error', text: 'Ошибка сети: ' + e };
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {
@@ -5094,6 +5112,72 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
 }
 
 const TASK_POLL_MS = 1500;
+// Вызовы инструментов опрашиваются чаще этапа: строка должна появиться почти
+// сразу после начала вызова.
+const LIVE_TOOL_POLL_MS = 500;
+
+async function fetchLiveToolCalls(name) {
+  const res = await fetch(`/api/agents/${encodeURIComponent(name)}/tool-calls`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// Строка вызова в ленте: новая дописывается в конец, уже показанная —
+// перерисовывается на месте (раскрытые подробности остаются раскрытыми).
+function showLiveToolCall(name, live, index, call, running, interrupted = false) {
+  let entry = live.rows[index];
+  if (!entry) {
+    entry = { msg: { role: 'tool', call }, row: null };
+    live.rows[index] = entry;
+    agentChats[name].push(entry.msg);
+  }
+  entry.msg.call = call;
+  entry.msg.running = running;
+  entry.msg.interrupted = interrupted;
+  if (currentAgentChatName !== name) return;
+  const row = renderAgentMessage(entry.msg);
+  if (entry.row && entry.row.isConnected) {
+    const wasOpen = entry.row.querySelector('details')?.open;
+    if (wasOpen) row.querySelector('details').open = true;
+    entry.row.replaceWith(row);
+  } else {
+    agentChatMainEl.appendChild(row);
+    agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+  }
+  entry.row = row;
+}
+
+async function pollLiveToolCalls(name, live) {
+  if (live.busy || live.done) return;
+  live.busy = true;
+  try {
+    const data = await fetchLiveToolCalls(name);
+    // Ответ /ask мог прийти, пока шёл этот опрос, — его итог главнее.
+    if (live.done || data.exchange <= live.base) return;
+    data.calls.forEach((item, index) => {
+      const shown = live.rows[index]?.msg;
+      if (shown && shown.running === item.running && shown.call.result === item.result) return;
+      const { running, ...call } = item;
+      showLiveToolCall(name, live, index, call, running);
+    });
+  } catch (e) {
+    // Опрос — лишь подсказка: итоговый список вызовов придёт с ответом /ask.
+  } finally {
+    live.busy = false;
+  }
+}
+
+// Итог обмена: строки получают окончательные данные из ответа /ask, новые
+// дописываются; не завершившиеся (ответ оборван паузой или ошибкой)
+// помечаются прерванными.
+function finishLiveToolCalls(name, live, finalCalls) {
+  live.done = true;
+  finalCalls.forEach((call, index) => showLiveToolCall(name, live, index, call, false));
+  live.rows.slice(finalCalls.length).forEach((entry, i) => {
+    if (entry.msg.running) showLiveToolCall(name, live, finalCalls.length + i, entry.msg.call, false, true);
+  });
+}
 
 function renderTaskWorking(task) {
   const working = !!task && agentTaskWorkingFor === currentAgentChatName && !task.paused;

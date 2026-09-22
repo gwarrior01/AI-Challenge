@@ -1178,6 +1178,52 @@ fn print_restored_history(agent: &Agent) {
 
 /// Интерактивный чат с конкретным запущенным агентом. Завершается по Ctrl+D или
 /// командам `stop`/`exit`, при этом агент останавливается и состояние сохраняется.
+/// Запрос агенту, печатающий вызовы MCP-инструментов в момент, когда они
+/// происходят: строка «⏳ …» при начале вызова и её результат по завершении —
+/// иначе долгий вызов (например, запись профиля) никак не виден, пока не
+/// придёт весь ответ.
+async fn ask_printing_tool_calls(agent: &Agent, prompt: &str) -> Result<llm_core::AgentReply> {
+    // Номер обмена ДО запроса — чтобы не напечатать вызовы предыдущего.
+    let base = agent.live_tool_calls().exchange;
+    let request = agent.handle_request(prompt);
+    tokio::pin!(request);
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut printed = 0usize;
+    let mut running: Option<String> = None;
+    loop {
+        tokio::select! {
+            reply = &mut request => {
+                print_tool_calls(&agent.live_tool_calls(), base, &mut printed, &mut running);
+                return reply;
+            }
+            _ = poll.tick() => print_tool_calls(&agent.live_tool_calls(), base, &mut printed, &mut running),
+        }
+    }
+}
+
+/// Печатает то, что ещё не напечатано: начало очередного вызова и его
+/// результат. `printed` — сколько вызовов уже показано целиком, `running` —
+/// заголовок вызова, о начале которого уже сообщили.
+fn print_tool_calls(live: &llm_core::LiveToolCalls, base: u64, printed: &mut usize, running: &mut Option<String>) {
+    if live.exchange <= base {
+        return;
+    }
+    for item in live.calls.iter().skip(*printed) {
+        let headline = item.call.headline(120);
+        if item.running {
+            if running.as_deref() != Some(headline.as_str()) {
+                println!("[⏳ {headline} …]");
+                *running = Some(headline);
+            }
+            break;
+        }
+        let mark = if item.call.is_error { "⚠" } else { "🔧" };
+        println!("[{mark} {headline} → {}]", item.call.result_preview(200));
+        *printed += 1;
+        *running = None;
+    }
+}
+
 async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()> {
     let stdin = io::stdin();
     let mut session_tokens: u64 = 0;
@@ -1225,12 +1271,10 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
             break;
         }
 
-        match agent.handle_request(prompt).await {
+        // Вызовы инструментов печатаются по ходу обмена (см. ask_printing_tool_calls),
+        // поэтому reply.tool_calls здесь повторно не выводится.
+        match ask_printing_tool_calls(&agent, prompt).await {
             Ok(reply) => {
-                for call in &reply.tool_calls {
-                    let mark = if call.is_error { "⚠" } else { "🔧" };
-                    println!("[{mark} {} → {}]", call.headline(120), call.result_preview(200));
-                }
                 println!("{}", reply.text);
                 if let Some(usage) = reply.usage {
                     session_tokens += usage.total_tokens as u64;

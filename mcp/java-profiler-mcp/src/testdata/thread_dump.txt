@@ -1,0 +1,164 @@
+88666:
+2026-09-22 15:26:42
+Full thread dump OpenJDK 64-Bit Server VM (25+36-3489 mixed mode, sharing):
+
+Threads class SMR info:
+_java_thread_list=0x00000007210070a0, length=16, elements={
+0x00000001009eb950, 0x0000000722d50000, 0x0000000722d50800, 0x0000000722d51000,
+0x0000000722d51800, 0x0000000722d52000, 0x0000000722c92800, 0x0000000722c93200,
+0x0000000722d52800, 0x0000000722d53800, 0x000000072013c800, 0x000000072013d000,
+0x000000072013e000, 0x000000072013e800, 0x000000072013f000, 0x0000000720234000
+}
+
+"main" #3 [8707] prio=5 os_prio=31 cpu=252,14ms elapsed=12,15s tid=0x00000001009eb950 nid=8707 in Object.wait()  [0x000000016f736000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait0(java.base@25/Native Method)
+	- waiting on <0x0000000303200000> (a java.lang.Thread)
+	at java.lang.Object.wait(java.base@25/Object.java:389)
+	at java.lang.Thread.join(java.base@25/Thread.java:1887)
+	- locked <0x0000000303200000> (a java.lang.Thread)
+	at java.lang.Thread.join(java.base@25/Thread.java:1963)
+	at Busy.main(Busy.java:25)
+	at java.lang.invoke.LambdaForm$DMH/0x0000060001050400.invokeStatic(java.base@25/LambdaForm$DMH)
+	at java.lang.invoke.LambdaForm$MH/0x0000060001135400.invoke(java.base@25/LambdaForm$MH)
+	at java.lang.invoke.Invokers$Holder.invokeExact_MT(java.base@25/Invokers$Holder)
+	at jdk.internal.reflect.DirectMethodHandleAccessor.invokeImpl(java.base@25/DirectMethodHandleAccessor.java:155)
+	at jdk.internal.reflect.DirectMethodHandleAccessor.invoke(java.base@25/DirectMethodHandleAccessor.java:104)
+	at java.lang.reflect.Method.invoke(java.base@25/Method.java:565)
+	at com.sun.tools.javac.launcher.SourceLauncher.execute(jdk.compiler@25/SourceLauncher.java:258)
+	at com.sun.tools.javac.launcher.SourceLauncher.run(jdk.compiler@25/SourceLauncher.java:138)
+	at com.sun.tools.javac.launcher.SourceLauncher.main(jdk.compiler@25/SourceLauncher.java:76)
+
+"Reference Handler" #14 [25091] daemon prio=10 os_prio=31 cpu=0,20ms elapsed=12,12s tid=0x0000000722d50000 nid=25091 waiting on condition  [0x00000001708ae000]
+   java.lang.Thread.State: RUNNABLE
+	at java.lang.ref.Reference.waitForReferencePendingList(java.base@25/Native Method)
+	at java.lang.ref.Reference.processPendingReferences(java.base@25/Reference.java:246)
+	at java.lang.ref.Reference$ReferenceHandler.run(java.base@25/Reference.java:208)
+
+"Finalizer" #15 [25603] daemon prio=8 os_prio=31 cpu=0,03ms elapsed=12,12s tid=0x0000000722d50800 nid=25603 in Object.wait()  [0x0000000170aba000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait0(java.base@25/Native Method)
+	- waiting on <0x00000003033b9708> (a java.lang.ref.ReferenceQueue$Lock)
+	at java.lang.Object.wait(java.base@25/Object.java:389)
+	at java.lang.Object.wait(java.base@25/Object.java:351)
+	at java.lang.ref.ReferenceQueue.remove0(java.base@25/ReferenceQueue.java:137)
+	at java.lang.ref.ReferenceQueue.remove(java.base@25/ReferenceQueue.java:215)
+	- locked <0x00000003033b9708> (a java.lang.ref.ReferenceQueue$Lock)
+	at java.lang.ref.Finalizer$FinalizerThread.run(java.base@25/Finalizer.java:165)
+
+"Signal Dispatcher" #16 [26115] daemon prio=9 os_prio=31 cpu=0,14ms elapsed=12,12s tid=0x0000000722d51000 nid=26115 waiting on condition  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"Service Thread" #17 [26371] daemon prio=9 os_prio=31 cpu=0,13ms elapsed=12,12s tid=0x0000000722d51800 nid=26371 runnable  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"Monitor Deflation Thread" #18 [26883] daemon prio=9 os_prio=31 cpu=0,33ms elapsed=12,12s tid=0x0000000722d52000 nid=26883 runnable  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"C2 CompilerThread0" #19 [27139] daemon prio=9 os_prio=31 cpu=274,59ms elapsed=12,12s tid=0x0000000722c92800 nid=27139 waiting on condition  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+   No compile task
+
+"C1 CompilerThread0" #22 [27395] daemon prio=9 os_prio=31 cpu=173,48ms elapsed=12,12s tid=0x0000000722c93200 nid=27395 waiting on condition  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+   No compile task
+
+"Notification Thread" #23 [27907] daemon prio=9 os_prio=31 cpu=0,02ms elapsed=12,10s tid=0x0000000722d52800 nid=27907 runnable  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"Common-Cleaner" #24 [28675] daemon prio=8 os_prio=31 cpu=0,04ms elapsed=12,09s tid=0x0000000722d53800 nid=28675 in Object.wait()  [0x000000017190e000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait0(java.base@25/Native Method)
+	- waiting on <0x00000003034dcbc0> (a java.lang.ref.ReferenceQueue$Lock)
+	at java.lang.Object.wait(java.base@25/Object.java:389)
+	at java.lang.ref.ReferenceQueue.remove0(java.base@25/ReferenceQueue.java:123)
+	at java.lang.ref.ReferenceQueue.remove(java.base@25/ReferenceQueue.java:201)
+	- locked <0x00000003034dcbc0> (a java.lang.ref.ReferenceQueue$Lock)
+	at jdk.internal.ref.CleanerImpl.run(java.base@25/CleanerImpl.java:146)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+	at jdk.internal.misc.InnocuousThread.run(java.base@25/InnocuousThread.java:148)
+
+"hot-loop" #25 [32771] daemon prio=5 os_prio=31 cpu=11439,88ms elapsed=11,83s tid=0x000000072013c800 nid=32771 runnable  [0x0000000171b1a000]
+   java.lang.Thread.State: RUNNABLE
+	at Busy.isPrime(Busy.java:51)
+	at Busy.countPrimes(Busy.java:43)
+	at Busy.hotLoop(Busy.java:36)
+	at Busy$$Lambda/0x0000060001134210.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+
+"allocator" #26 [43267] daemon prio=5 os_prio=31 cpu=11365,22ms elapsed=11,83s tid=0x000000072013d000 nid=43267 runnable  [0x0000000171d26000]
+   java.lang.Thread.State: RUNNABLE
+	at jdk.internal.util.DecimalDigits.uncheckedGetCharsLatin1(java.base@25/DecimalDigits.java:229)
+	at java.lang.AbstractStringBuilder.append(java.base@25/AbstractStringBuilder.java:954)
+	at java.lang.StringBuilder.append(java.base@25/StringBuilder.java:259)
+	at Busy.buildReport(Busy.java:75)
+	at Busy.allocate(Busy.java:63)
+	at Busy$$Lambda/0x0000060001134438.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+
+"worker-1" #27 [33539] daemon prio=5 os_prio=31 cpu=5160,65ms elapsed=11,83s tid=0x000000072013e000 nid=33539 waiting for monitor entry  [0x0000000171f32000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Busy.contend(Busy.java:83)
+	- waiting to lock <0x0000000303400260> (a java.lang.Object)
+	at Busy$$Lambda/0x0000060001135800.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+
+"worker-2" #28 [42755] daemon prio=5 os_prio=31 cpu=4402,04ms elapsed=11,83s tid=0x000000072013e800 nid=42755 waiting for monitor entry  [0x000000017213e000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Busy.contend(Busy.java:83)
+	- waiting to lock <0x0000000303400260> (a java.lang.Object)
+	at Busy$$Lambda/0x0000060001135800.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+
+"worker-3" #29 [42499] daemon prio=5 os_prio=31 cpu=1992,82ms elapsed=11,83s tid=0x000000072013f000 nid=42499 runnable  [0x000000017234a000]
+   java.lang.Thread.State: RUNNABLE
+	at Busy.isPrime(Busy.java:51)
+	at Busy.countPrimes(Busy.java:43)
+	at Busy.contend(Busy.java:83)
+	- locked <0x0000000303400260> (a java.lang.Object)
+	at Busy$$Lambda/0x0000060001135800.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25/Thread.java:1474)
+
+"Attach Listener" #39 [24075] daemon prio=9 os_prio=31 cpu=0,56ms elapsed=0,11s tid=0x0000000720234000 nid=24075 waiting on condition  [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"GC Thread#9" os_prio=31 cpu=219,04ms elapsed=11,60s tid=0x0000000720394500 nid=39683 runnable  
+
+"GC Thread#8" os_prio=31 cpu=216,76ms elapsed=11,60s tid=0x0000000720394000 nid=40195 runnable  
+
+"GC Thread#7" os_prio=31 cpu=218,87ms elapsed=11,60s tid=0x000000072105f700 nid=35587 runnable  
+
+"GC Thread#6" os_prio=31 cpu=217,03ms elapsed=11,60s tid=0x000000072105f200 nid=40707 runnable  
+
+"GC Thread#5" os_prio=31 cpu=233,19ms elapsed=11,82s tid=0x000000072105e800 nid=34819 runnable  
+
+"GC Thread#4" os_prio=31 cpu=237,16ms elapsed=11,82s tid=0x000000072105e300 nid=34563 runnable  
+
+"GC Thread#3" os_prio=31 cpu=235,06ms elapsed=11,82s tid=0x000000072105de00 nid=41475 runnable  
+
+"GC Thread#2" os_prio=31 cpu=236,57ms elapsed=11,82s tid=0x000000072105d900 nid=41987 runnable  
+
+"GC Thread#1" os_prio=31 cpu=235,94ms elapsed=11,82s tid=0x000000072105d400 nid=42243 runnable  
+
+"VM Thread" os_prio=31 cpu=37,98ms elapsed=12,12s tid=0x0000000722cd2000 nid=17923 runnable  
+
+"VM Periodic Task Thread" os_prio=31 cpu=0,39ms elapsed=12,13s tid=0x0000000722cd1400 nid=20755 waiting on condition  
+
+"G1 Service" os_prio=31 cpu=2,08ms elapsed=12,15s tid=0x0000000722cb4a00 nid=16643 runnable  
+
+"G1 Refine#0" os_prio=31 cpu=5,45ms elapsed=12,15s tid=0x0000000722cb4500 nid=21251 runnable  
+
+"G1 Conc#0" os_prio=31 cpu=0,01ms elapsed=12,15s tid=0x0000000722cb4000 nid=16387 runnable  
+
+"G1 Main Marker" os_prio=31 cpu=0,01ms elapsed=12,15s tid=0x00000001009f6540 nid=13571 runnable  
+
+"GC Thread#0" os_prio=31 cpu=231,75ms elapsed=12,15s tid=0x00000001009f5490 nid=14083 runnable  
+
+JNI global refs: 9, weak refs: 0
+

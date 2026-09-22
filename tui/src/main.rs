@@ -423,6 +423,10 @@ enum AppEvent {
     /// вместе с ответом — см. обработчик события).
     DirectResponse { prompt: String, result: Result<ChatCompletion> },
     AgentResponse { name: String, result: Result<llm_core::AgentReply> },
+    /// Вызовы MCP-инструментов, которые агент сделал к этому моменту — приходят,
+    /// пока ответ ещё готовится (см. send_to_agent), чтобы вызов был виден в
+    /// момент начала, а не вместе с ответом.
+    AgentToolCalls { name: String, calls: Vec<llm_core::LiveToolCall> },
     /// Фоновое действие с MCP-серверами (подключение, включение/выключение)
     /// завершилось — перерисовать экран; `message` — итог для строки статуса
     /// экрана MCP (текст, признак ошибки).
@@ -583,6 +587,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
         cost_approx: false,
     }];
     let mut waiting = false;
+    // Строки вызовов инструментов, показанные в истории агента, пока ответ ещё
+    // готовится: имя агента → (индекс первой строки, сколько их). Когда ответ
+    // приходит, они заменяются итоговыми (см. AppEvent::AgentToolCalls).
+    let mut live_tool_rows: HashMap<String, (usize, usize)> = HashMap::new();
     // Имя агента, чей ответ сейчас ожидается (None — если ждём прямой чат).
     // Позволяет показать индикатор на экране списка агентов даже когда его
     // диалог сейчас не открыт (пользователь вышел из него клавишей Esc/F2).
@@ -1403,8 +1411,34 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             cost_approx: false,
                         });
                     }
+                    // Не ответ на запрос — флаги ожидания не трогаем.
+                    AppEvent::AgentToolCalls { name, calls } => {
+                        let entry = agent_histories.entry(name.clone()).or_default();
+                        let (start, count) = *live_tool_rows.get(&name).unwrap_or(&(entry.len(), 0));
+                        if entry.len() >= start + count {
+                            entry.splice(start..start + count, calls.iter().map(live_tool_row));
+                            live_tool_rows.insert(name, (start, calls.len()));
+                        }
+                    }
                     AppEvent::AgentResponse { name, result } => {
                         let entry = agent_histories.entry(name.clone()).or_default();
+                        // Показанные по ходу обмена строки вызовов заменяются итоговыми
+                        // (ниже), а при оборванном ответе помечаются прерванными.
+                        if let Some((start, count)) = live_tool_rows.remove(&name) {
+                            if entry.len() >= start + count {
+                                let finished = matches!(&result, Ok(reply) if !reply.interrupted);
+                                if finished {
+                                    entry.drain(start..start + count);
+                                } else {
+                                    for row in &mut entry[start..start + count] {
+                                        if let Some(text) = row.text.strip_suffix(WAITING_RESULT) {
+                                            row.text = format!("{text}→ прервано");
+                                            row.role = Role::ToolError;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         match result {
                             // Пауза, поставленная во время ответа, оборвала его — вместо
                             // ответа пометка; запрос уйдёт заново после task resume.
@@ -2609,6 +2643,24 @@ fn parse_tui_transition_pair(tokens: &[&str], action: &str) -> Result<(llm_core:
     Ok((from, to))
 }
 
+/// Текст строки «выполняется…» в истории — по нему же она и находится, когда
+/// ответ оборвался и вызов так и не завершился.
+const WAITING_RESULT: &str = "→ выполняется…";
+
+/// Строка истории для одного вызова инструмента: идущего или завершённого.
+fn live_tool_row(call: &llm_core::LiveToolCall) -> HistoryItem {
+    let result =
+        if call.running { WAITING_RESULT.to_string() } else { format!("→ {}", call.call.result_preview(300)) };
+    HistoryItem {
+        role: if call.call.is_error { Role::ToolError } else { Role::Tool },
+        text: format!("{}\n{result}", call.call.headline(160)),
+        debug: None,
+        tokens: None,
+        cost: None,
+        cost_approx: false,
+    }
+}
+
 /// Отправляет сообщение агенту так же, как Enter в его диалоге: реплика
 /// человека сразу появляется в истории, ответ приходит событием
 /// [`AppEvent::AgentResponse`]. `from_human = false` — служебное продолжение
@@ -2634,8 +2686,26 @@ fn send_to_agent(
     }
     let tx = tx.clone();
     tokio::spawn(async move {
-        let response =
-            if from_human { agent.handle_request(&prompt).await } else { agent.continue_task(&prompt).await };
+        // Номер обмена ДО запроса: опрос показывает вызовы только более нового
+        // обмена — иначе первый же тик выдал бы вызовы предыдущего.
+        let base = agent.live_tool_calls().exchange;
+        let request =
+            async { if from_human { agent.handle_request(&prompt).await } else { agent.continue_task(&prompt).await } };
+        tokio::pin!(request);
+        let mut poll = tokio::time::interval(Duration::from_millis(250));
+        let mut shown: Vec<llm_core::LiveToolCall> = Vec::new();
+        let response = loop {
+            tokio::select! {
+                response = &mut request => break response,
+                _ = poll.tick() => {
+                    let live = agent.live_tool_calls();
+                    if live.exchange > base && live.calls != shown {
+                        shown = live.calls;
+                        let _ = tx.send(AppEvent::AgentToolCalls { name: name.clone(), calls: shown.clone() });
+                    }
+                }
+            }
+        };
         let _ = tx.send(AppEvent::AgentResponse { name, result: response });
     });
 }
