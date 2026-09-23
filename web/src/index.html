@@ -1411,6 +1411,13 @@
     align-self: flex-start;
   }
 
+  /* Ответ, который агент дал сам — по расписанию или доставив событие MCP
+     (см. llm_core::automation): текст начинается с ⏰. */
+  .agent-message.assistant.scheduled {
+    border-left: 3px solid var(--accent, #6b8cff);
+    padding-left: 10px;
+  }
+
   .agent-message.error {
     color: var(--error);
     align-self: flex-start;
@@ -1592,6 +1599,12 @@
     line-height: 1;
   }
 
+  .schedule-prompt {
+    flex: 1 1 100%;
+    min-height: 60px;
+    resize: vertical;
+  }
+
   .memory-kv-form {
     display: flex;
     flex-wrap: wrap;
@@ -1600,6 +1613,7 @@
   }
 
   .memory-kv-form input[type="text"],
+  .memory-kv-form textarea,
   .memory-kv-form select {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -1752,6 +1766,28 @@
 
   .agent-chat-footer textarea:disabled {
     opacity: 0.5;
+  }
+
+  /* ---------- Вкладка «Расписание» ---------- */
+
+  #view-schedule {
+    padding: 20px 24px;
+    gap: 20px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+
+  #view-schedule .memory-kv-list li {
+    padding: 4px 10px;
+  }
+
+  #view-schedule .card-hint {
+    font-size: 12px;
+  }
+
+  #view-schedule .settings-btn {
+    font-size: 11px;
+    padding: 3px 8px;
   }
 
   /* ---------- Вкладка «MCP» ---------- */
@@ -2147,6 +2183,7 @@
   <button type="button" class="tab-btn" id="tab-temperature" data-view="view-temperature">Температура</button>
   <button type="button" class="tab-btn" id="tab-agents" data-view="view-agents">Агенты</button>
   <button type="button" class="tab-btn" id="tab-mcp" data-view="view-mcp">MCP</button>
+  <button type="button" class="tab-btn" id="tab-schedule" data-view="view-schedule">Расписание</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -2288,6 +2325,23 @@
     <div class="mcp-servers" id="mcp-servers"></div>
     <div class="mcp-detail" id="mcp-detail"></div>
   </div>
+</div>
+
+<div class="view" id="view-schedule" hidden>
+  <div class="memory-section">
+    <h4>🗓 Задания MCP-планировщика</h4>
+    <ul class="memory-kv-list" id="scheduler-jobs-list"></ul>
+    <div class="memory-kv-form">
+      <label class="card-hint"><input type="checkbox" id="scheduler-jobs-all"> показывать завершённые</label>
+      <button type="button" class="settings-btn" id="scheduler-jobs-refresh">↻ Обновить</button>
+    </div>
+  </div>
+  <div class="memory-section">
+    <h4>⏰ Агенты, присылающие сводки</h4>
+    <div class="card-hint">Добавить — в чате агента: 🧠 Память → ⏰ Плановые запуски.</div>
+    <ul class="memory-kv-list" id="all-schedule-list"></ul>
+  </div>
+  <span class="field-error" id="schedule-error" hidden></span>
 </div>
 
 <div class="view" id="view-agents" hidden>
@@ -2468,6 +2522,17 @@
           <option value="knowledge"></option>
         </datalist>
         <button type="button" class="settings-btn" id="agent-remember-btn">+ Запомнить</button>
+      </div>
+    </div>
+    <div class="memory-section">
+      <h4>⏰ Плановые запуски — агент на дежурстве: сам отвечает по расписанию</h4>
+      <div class="card-hint">Работают, пока запущен веб-сервер, TUI или <code>llm-cli agent daemon</code>. Запуск пропускается, если агент остановлен, занят или ведёт задачу. Напоминания и сбои MCP-планировщика приходят в чат дежурного агента сразу, без обращения к модели.</div>
+      <ul class="memory-kv-list" id="agent-schedule-list"></ul>
+      <div class="memory-kv-form">
+        <input type="text" id="agent-schedule-every" placeholder="интервал: 30m, 1h, 1d" size="16">
+        <input type="text" id="agent-schedule-name" placeholder="подпись (необязательно)">
+        <button type="button" class="settings-btn" id="agent-schedule-add-btn">+ Добавить</button>
+        <textarea id="agent-schedule-prompt" class="schedule-prompt" placeholder="промпт; пусто — сводка MCP-планировщика за интервал"></textarea>
       </div>
     </div>
     <span class="field-error" id="agent-memory-error" hidden></span>
@@ -3949,8 +4014,269 @@ agentMemoryToggleBtn.addEventListener('click', async () => {
     await fetchProfiles();
     await fetchInvariants();
     if (currentAgentChatName) renderMemoryPanel(findAgentInfo(currentAgentChatName));
+    if (currentAgentChatName) await fetchSchedule(currentAgentChatName);
   }
 });
+
+// ---- Задания MCP-планировщика (см. llm_core::automation::scheduler_jobs) ----
+const schedulerJobsListEl = document.getElementById('scheduler-jobs-list');
+const schedulerJobsAllEl = document.getElementById('scheduler-jobs-all');
+
+async function fetchSchedulerJobs() {
+  try {
+    const res = await fetch(`/api/scheduler/jobs?all=${schedulerJobsAllEl.checked}`);
+    renderSchedulerJobs(await res.json());
+  } catch (e) {
+    schedulerJobsListEl.innerHTML = `<li class="card-hint">Ошибка сети: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+function renderSchedulerJobs(data) {
+  if (data.error) {
+    schedulerJobsListEl.innerHTML = `<li class="card-hint">${escapeHtml(data.error)}</li>`;
+    return;
+  }
+  const jobs = data.jobs || [];
+  schedulerJobsListEl.innerHTML = jobs.length
+    ? jobs
+        .map((j) => {
+          const last = j.last_run_at ? ` · последний ${escapeHtml(j.last_run_at.slice(11, 19))}` : '';
+          const fails = j.consecutive_failures ? ` · ошибок подряд: ${j.consecutive_failures}` : '';
+          const reason = j.pause_reason ? ` · ${escapeHtml(j.pause_reason)}` : '';
+          const live = j.state === 'active' || j.state === 'paused';
+          const toggle = j.state === 'active'
+            ? `<button type="button" class="settings-btn" data-id="${j.id}" data-action="pause">⏸ Пауза</button>`
+            : j.state === 'paused'
+              ? `<button type="button" class="settings-btn" data-id="${j.id}" data-action="resume">▶ Продолжить</button>`
+              : '';
+          const cancel = live
+            ? `<button type="button" class="memory-forget-btn" data-id="${j.id}" data-action="cancel" title="Отменить задание">✕</button>`
+            : '';
+          return `
+        <li>
+          <span class="memory-kv-cat">#${j.id} · ${escapeHtml(j.action)} · ${escapeHtml(j.schedule)}</span>
+          <span class="memory-kv-text">${escapeHtml(j.name)} · ${escapeHtml(j.state)}${last}${fails}${reason}</span>
+          ${toggle}${cancel}
+        </li>`;
+        })
+        .join('')
+    : '<li class="card-hint">Заданий нет.</li>';
+  schedulerJobsListEl.querySelectorAll('button[data-action]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      // Отмена необратима — второй щелчок в течение 3 с подтверждает её.
+      if (btn.dataset.action === 'cancel' && !btn.dataset.armed) {
+        btn.dataset.armed = '1';
+        btn.textContent = 'Отменить?';
+        setTimeout(() => {
+          delete btn.dataset.armed;
+          btn.textContent = '✕';
+        }, 3000);
+        return;
+      }
+      schedulerJobAction(btn.dataset.id, btn.dataset.action);
+    });
+  });
+}
+
+const scheduleErrorEl = document.getElementById('schedule-error');
+const viewScheduleEl = document.getElementById('view-schedule');
+function showScheduleError(message) {
+  scheduleErrorEl.textContent = message;
+  scheduleErrorEl.hidden = false;
+}
+
+async function schedulerJobAction(id, action) {
+  scheduleErrorEl.hidden = true;
+  try {
+    const res = await fetch(`/api/scheduler/jobs/${id}/${action}`, { method: 'POST' });
+    const data = await res.json();
+    if (data.error) showScheduleError(data.error);
+  } catch (e) {
+    showScheduleError('Ошибка сети: ' + e);
+  }
+  await fetchSchedulerJobs();
+}
+
+// Плановые запуски всех агентов (см. llm_core::automation).
+const allScheduleListEl = document.getElementById('all-schedule-list');
+
+async function fetchAllSchedule() {
+  try {
+    const res = await fetch('/api/schedule');
+    renderAllSchedule(await res.json());
+  } catch (e) {
+    allScheduleListEl.innerHTML = `<li class="card-hint">Ошибка сети: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+function renderAllSchedule(data) {
+  if (data.error) {
+    allScheduleListEl.innerHTML = `<li class="card-hint">${escapeHtml(data.error)}</li>`;
+    return;
+  }
+  const runs = data.runs || [];
+  allScheduleListEl.innerHTML = runs.length
+    ? runs
+        .map((r) => {
+          const state = r.enabled ? `вкл · следующий ${escapeHtml(r.next_in)}` : 'выкл';
+          const last = r.last_status ? ` · последний ${escapeHtml(r.last_ago || '')}: ${escapeHtml(r.last_status)}` : '';
+          return `
+        <li title="${escapeHtml(r.prompt)}">
+          <span class="memory-kv-cat">#${r.id} · ${escapeHtml(r.agent)} · каждые ${escapeHtml(r.every)}</span>
+          <span class="memory-kv-text">${escapeHtml(r.name)} · ${state}${last}</span>
+          <button type="button" class="settings-btn" data-agent="${escapeHtml(r.agent)}" data-id="${r.id}" data-action="run" ${r.enabled ? '' : 'disabled'} title="Выполнить сейчас">▶</button>
+          <button type="button" class="settings-btn" data-agent="${escapeHtml(r.agent)}" data-id="${r.id}" data-action="${r.enabled ? 'disable' : 'enable'}">${r.enabled ? 'Выкл' : 'Вкл'}</button>
+          <button type="button" class="memory-forget-btn" data-agent="${escapeHtml(r.agent)}" data-id="${r.id}" data-action="delete" title="Удалить">✕</button>
+        </li>`;
+        })
+        .join('')
+    : '<li class="card-hint">Нет. Добавить — в чате агента: 🧠 Память → ⏰ Плановые запуски.</li>';
+  allScheduleListEl.querySelectorAll('button[data-action]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      scheduleErrorEl.hidden = true;
+      try {
+        const res = await fetch(
+          `/api/agents/${encodeURIComponent(btn.dataset.agent)}/schedule/${btn.dataset.id}/${btn.dataset.action}`,
+          { method: 'POST' }
+        );
+        const result = await res.json();
+        if (result.error) showScheduleError(result.error);
+      } catch (e) {
+        showScheduleError('Ошибка сети: ' + e);
+      }
+      await fetchAllSchedule();
+    });
+  });
+}
+
+function refreshScheduleView() {
+  fetchSchedulerJobs();
+  fetchAllSchedule();
+}
+document.getElementById('tab-schedule').addEventListener('click', refreshScheduleView);
+
+document.getElementById('scheduler-jobs-refresh').addEventListener('click', fetchSchedulerJobs);
+schedulerJobsAllEl.addEventListener('change', fetchSchedulerJobs);
+
+// ---- Плановые запуски агента (см. llm_core::automation) ----
+const agentScheduleListEl = document.getElementById('agent-schedule-list');
+const agentScheduleEveryEl = document.getElementById('agent-schedule-every');
+const agentScheduleNameEl = document.getElementById('agent-schedule-name');
+const agentSchedulePromptEl = document.getElementById('agent-schedule-prompt');
+
+function renderSchedule(data) {
+  if (data.error) {
+    showMemoryError(data.error);
+    return;
+  }
+  const runs = data.runs || [];
+  agentScheduleListEl.innerHTML = runs.length
+    ? runs
+        .map((r) => {
+          const state = r.enabled ? `вкл · следующий ${escapeHtml(r.next_in)}` : 'выкл';
+          const last = r.last_status ? ` · последний ${escapeHtml(r.last_ago || '')}: ${escapeHtml(r.last_status)}` : '';
+          return `
+        <li title="${escapeHtml(r.prompt)}">
+          <span class="memory-kv-cat">#${r.id} · каждые ${escapeHtml(r.every)}</span>
+          <span class="memory-kv-text">${escapeHtml(r.name)} · ${state}${last}</span>
+          <button type="button" class="settings-btn" data-id="${r.id}" data-action="run" ${r.enabled ? '' : 'disabled'} title="Выполнить сейчас">▶</button>
+          <button type="button" class="settings-btn" data-id="${r.id}" data-action="${r.enabled ? 'disable' : 'enable'}">${r.enabled ? 'Выкл' : 'Вкл'}</button>
+          <button type="button" class="memory-forget-btn" data-id="${r.id}" data-action="delete" title="Удалить">✕</button>
+        </li>`;
+        })
+        .join('')
+    : '<li class="card-hint">Нет. Например: интервал 30m, промпт пустой — сводка планировщика раз в 30 минут.</li>';
+  agentScheduleListEl.querySelectorAll('button[data-action]').forEach((btn) => {
+    btn.addEventListener('click', () => scheduleAction(btn.dataset.id, btn.dataset.action));
+  });
+}
+
+async function fetchSchedule(name) {
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/schedule`);
+    renderSchedule(await res.json());
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+}
+
+async function scheduleAction(id, action) {
+  const name = currentAgentChatName;
+  if (!name) return;
+  agentMemoryErrorEl.hidden = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/schedule/${id}/${action}`, { method: 'POST' });
+    renderSchedule(await res.json());
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+}
+
+document.getElementById('agent-schedule-add-btn').addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const every = agentScheduleEveryEl.value.trim();
+  if (!every) {
+    showMemoryError('Укажите интервал, например 30m.');
+    return;
+  }
+  agentMemoryErrorEl.hidden = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/schedule`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        every,
+        prompt: agentSchedulePromptEl.value.trim() || null,
+        name: agentScheduleNameEl.value.trim() || null,
+      }),
+    });
+    const data = await res.json();
+    renderSchedule(data);
+    if (!data.error) {
+      agentScheduleEveryEl.value = '';
+      agentScheduleNameEl.value = '';
+      agentSchedulePromptEl.value = '';
+    }
+  } catch (e) {
+    showMemoryError('Ошибка сети: ' + e);
+  }
+});
+
+// Что агенты сказали сами (плановые запуски, события MCP) — дописывается в
+// уже подгруженные чаты; чат, который ещё не открывали, получит это из
+// истории на сервере. Первый опрос только запоминает номер: всё, что было
+// раньше, уже есть в истории.
+let activitySeq = null;
+let activityPolls = 0;
+async function pollActivity() {
+  try {
+    const res = await fetch(`/api/activity?after=${activitySeq === null ? 0 : activitySeq}`);
+    const data = await res.json();
+    if (activitySeq !== null) {
+      for (const item of data.items || []) {
+        if (!agentChatsHistoryLoaded.has(item.agent)) continue;
+        agentChats[item.agent] = agentChats[item.agent] || [];
+        agentChats[item.agent].push({ role: 'assistant', text: item.text, usage: null });
+        if (currentAgentChatName === item.agent) {
+          agentChatMainEl.appendChild(renderAgentMessage({ role: 'assistant', text: item.text }));
+          agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+        }
+      }
+      if ((data.items || []).length && currentAgentChatName && !agentMemoryPanelEl.hidden) {
+        await fetchSchedule(currentAgentChatName);
+      }
+    }
+    activitySeq = data.seq;
+    // Пока открыта панель памяти, список заданий обновляется раз в ~9 с.
+    activityPolls += 1;
+    if (activityPolls % 3 === 0 && !viewScheduleEl.hidden) refreshScheduleView();
+  } catch (e) {
+    // сервер недоступен — попробуем при следующем опросе
+  }
+}
+pollActivity();
+setInterval(pollActivity, 3000);
 
 function showMemoryError(message) {
   agentMemoryErrorEl.textContent = message;
@@ -4683,6 +5009,7 @@ function renderAgentMessage(msg) {
     row.textContent = msg.text;
     return row;
   }
+  if (msg.role === 'assistant' && (msg.text || '').startsWith('⏰')) row.classList.add('scheduled');
   const prefix = msg.role === 'user' ? 'Вы: ' : msg.role === 'error' ? 'Ошибка: ' : '';
   // Markdown — только для user/assistant (сути диалога), как и в addRow
   // простого чата: "Ошибка: ..." — техническое сообщение, не ответ модели,

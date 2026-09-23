@@ -84,9 +84,10 @@ use crate::{context, context::ContextStrategy, ChatMessage, ChatOptions, LlmClie
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::automation::{Activity, ScheduledRun};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Имя ветки, с которой начинается диалог любого агента и которая остаётся
@@ -523,6 +524,56 @@ impl Branches {
     }
 }
 
+/// Реестр агентов по имени — общий для [`AgentManager`] и самих агентов:
+/// агент держит на него слабую ссылку, чтобы инструмент `assign_duty` мог
+/// завести дежурного (см. [`Agent::tool_assign_duty`]).
+type Registry = RwLock<HashMap<String, Arc<Agent>>>;
+
+/// Имя дежурного агента по умолчанию (см. `assign_duty`).
+pub const DEFAULT_DUTY_AGENT: &str = "Дежурный";
+
+/// Системный промпт дежурного агента, которого заводит `assign_duty`.
+const DUTY_SYSTEM_PROMPT: &str = "Ты дежурный агент: по расписанию смотришь, что накопили фоновые задания, \
+    и коротко докладываешь по-русски — с цифрами, аномалиями и ошибками. Не выдумывай того, чего нет в данных.";
+
+/// Откуда пришёл запрос к модели (см. [`Agent::exchange`]).
+#[derive(Debug, Clone, Copy)]
+enum Origin<'a> {
+    /// Реплика человека.
+    Human,
+    /// Служебное продолжение работы по задаче.
+    Continuation,
+    /// Плановый запуск по расписанию с этой подписью.
+    Scheduled { label: &'a str },
+}
+
+/// Встроенный инструмент «назначить дежурного» (см. [`Agent::tool_assign_duty`]).
+const ASSIGN_DUTY_TOOL: &str = "assign_duty";
+
+/// Как встроенные инструменты приложения подписаны в чате вместо имени
+/// MCP-сервера.
+const BUILTIN_TOOLS_SERVER: &str = "агенты";
+
+/// Пометка ответов, которые агент дал сам — по расписанию или доставив
+/// событие (см. [`crate::automation`]); по ней интерфейсы их и выделяют.
+pub const SCHEDULED_MARK: &str = "⏰";
+
+/// Текст ответа планового запуска без заголовка `⏰ <подпись>` (см.
+/// [`Agent::run_scheduled`]); `None` — это не такой ответ. Однострочные
+/// уведомления (`⏰ Напоминание: …`) заголовка не имеют и не трогаются.
+fn strip_scheduled_header(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(SCHEDULED_MARK)?;
+    rest.split_once("\n\n").map(|(_, body)| body)
+}
+
+/// Итог [`Agent::run_scheduled`].
+#[derive(Debug)]
+pub enum ScheduledOutcome {
+    Replied(AgentReply),
+    /// Запуск пропущен, с причиной.
+    Skipped(String),
+}
+
 /// Агент — отдельная сущность, инкапсулирующая обращение к LLM через API.
 /// Хранит свою конфигурацию и состояние запуска; пока агент не запущен,
 /// обработка запросов отклоняется без обращения к API.
@@ -553,14 +604,24 @@ pub struct Agent {
     mcp: Arc<crate::mcp::McpManager>,
     /// Вызовы MCP-инструментов текущего обмена (см. [`Agent::live_tool_calls`]).
     live_calls: Mutex<LiveToolCalls>,
+    /// Один обмен с моделью за раз: плановый запуск (см. [`crate::automation`])
+    /// мог бы начаться, пока человек ждёт ответа, и оба обмена одновременно
+    /// дописывали бы историю ветки и сбрасывали друг другу `live_calls`.
+    /// Реплика человека ждёт своей очереди, плановый запуск при занятом агенте
+    /// пропускается.
+    exchange_lock: tokio::sync::Mutex<()>,
+    /// Реестр агентов (слабая ссылка — реестр сам владеет агентами).
+    registry: std::sync::Weak<Registry>,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: AgentConfig,
         client: LlmClient,
         db: Arc<Db>,
         mcp: Arc<crate::mcp::McpManager>,
+        registry: std::sync::Weak<Registry>,
         branches: Branches,
         summary: CompressionState,
         facts: FactsState,
@@ -577,6 +638,8 @@ impl Agent {
             db,
             mcp,
             live_calls: Mutex::new(LiveToolCalls::default()),
+            exchange_lock: tokio::sync::Mutex::new(()),
+            registry,
         }
     }
 
@@ -1221,6 +1284,100 @@ impl Agent {
         Ok(crate::memory::rejection_followup(current.stage, pending, note))
     }
 
+    fn assign_duty_definition() -> crate::ToolDefinition {
+        crate::ToolDefinition {
+            name: ASSIGN_DUTY_TOOL.to_string(),
+            description: "Назначить агента-дежурного: он будет сам, без реплик человека, раз в `every` смотреть, \
+                 что накопили фоновые задания (по умолчанию — сводка планировщика: get_summary и get_events за \
+                 интервал), и присылать сводку в свой чат; туда же сразу приходят напоминания и сбои заданий. \
+                 Если дежурного нет — он создаётся и запускается. Вызывай, когда человек просит следить за \
+                 чем-то и регулярно докладывать (присылать сводку, отчёт, итог), обычно сразу после \
+                 schedule_job. Для разового напоминания не нужен."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "every": {
+                        "type": "string",
+                        "description": "Как часто присылать сводку: 30m, 1h, 1d (не чаще 30s)."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Инструкция дежурному на каждый запуск — что проверить и о чём доложить. \
+                            Без него — сводка планировщика за интервал. Инструкции для дежурного передаются \
+                            только здесь, а не напоминаниями: напоминание лишь показывает текст человеку."
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Имя дежурного агента, по умолчанию «Дежурный»."
+                    }
+                },
+                "required": ["every"]
+            }),
+        }
+    }
+
+    /// `assign_duty`: заводит (или находит) дежурного агента, запускает его и
+    /// добавляет плановый запуск (см. [`crate::automation`]); тот же запуск
+    /// повторно не добавляется.
+    fn tool_assign_duty(&self, arguments: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Args {
+            every: String,
+            #[serde(default)]
+            prompt: Option<String>,
+            #[serde(default)]
+            agent: Option<String>,
+        }
+        let args: Args = serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments })
+            .context("доводы не разобраны: ожидался JSON-объект с полем every")?;
+        let name = args.agent.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(DEFAULT_DUTY_AGENT);
+        let registry = self.registry.upgrade().ok_or_else(|| anyhow!("реестр агентов недоступен"))?;
+
+        let existing = registry.read().expect("реестр агентов отравлен паникой").get(name).cloned();
+        let (duty, created) = match existing {
+            Some(agent) => (agent, false),
+            None => {
+                let mut config = AgentConfig::new(name);
+                config.system_prompt = Some(DUTY_SYSTEM_PROMPT.to_string());
+                config.model = self.config().model;
+                let agent = register_agent(&registry, &self.db, &self.client, &self.mcp, config)?;
+                (agent, true)
+            }
+        };
+        if !duty.is_running() {
+            duty.start();
+            self.db.set_running(name, true)?;
+        }
+
+        let planned = scheduled_run_for(name, &args.every, args.prompt.as_deref(), None)?;
+        let same = self
+            .db
+            .scheduled_runs(Some(name))?
+            .into_iter()
+            .find(|r| r.interval_ms == planned.interval_ms && r.prompt == planned.prompt);
+        let run = match same {
+            Some(run) if run.enabled => run,
+            Some(run) => {
+                self.db.update_scheduled_run(run.id, Some(true), Some(crate::automation::now_ms() + run.interval_ms))?;
+                run
+            }
+            None => {
+                let mut run = planned;
+                run.id = self.db.insert_scheduled_run(&run)?;
+                run
+            }
+        };
+        let who = if created { "создан и запущен" } else { "уже был, запущен" };
+        Ok(format!(
+            "Дежурный агент «{name}» {who}: плановый запуск #{} — сводка каждые {}, первая через {}. \
+             Напоминания и сбои заданий приходят в его чат сразу. Скажи человеку, что сводки будут в чате «{name}».",
+            run.id,
+            run.every(),
+            run.every()
+        ))
+    }
+
     /// Описания инструментов автомата задачи (function calling) — единственная
     /// инструкция модели о том, как ими пользоваться (см. документацию
     /// [`crate::memory::Stage::directive`]): текст описания стабилен между
@@ -1439,6 +1596,35 @@ impl Agent {
                 None => {
                     // Сервер отключился между выбором инструмента и вызовом.
                     record.result = "вызов не выполнен: MCP-сервер отключился".to_string();
+                    record.is_error = true;
+                }
+            }
+            self.live_call_finished(slot, &record);
+            return ExecutedTool { record, visible: true };
+        }
+        if call.function.name == ASSIGN_DUTY_TOOL {
+            let mut record = ToolCallRecord {
+                server: Some(BUILTIN_TOOLS_SERVER.to_string()),
+                tool: ASSIGN_DUTY_TOOL.to_string(),
+                arguments,
+                result: String::new(),
+                is_error: false,
+            };
+            if let Some(task) = self.task_state().filter(|t| !mcp_tools_allowed(Some(t))) {
+                record.result = format!(
+                    "вызов не выполнен: на этапе «{}» дежурного не назначают (задача «{}»). Не повторяй вызов — \
+                     включи в план шаг «назначить дежурного» с интервалом сводки и предложи move_stage в execution.",
+                    task.stage, task.name
+                );
+                record.is_error = true;
+                return ExecutedTool { record, visible: false };
+            }
+            // Как и вызов MCP — виден интерфейсам по ходу обмена.
+            let slot = self.live_call_started(&record);
+            match self.tool_assign_duty(&record.arguments) {
+                Ok(text) => record.result = text,
+                Err(err) => {
+                    record.result = format!("дежурный не назначен: {err:#}");
                     record.is_error = true;
                 }
             }
@@ -1774,7 +1960,8 @@ impl Agent {
     /// управления контекстом. Если агент остановлен, запрос отклоняется без
     /// обращения к сети.
     pub async fn handle_request(&self, prompt: &str) -> Result<AgentReply> {
-        self.exchange(prompt, true).await
+        let _turn = self.exchange_lock.lock().await;
+        self.exchange(prompt, Origin::Human).await
     }
 
     /// Служебное продолжение работы по задаче — после утверждения перехода,
@@ -1783,13 +1970,45 @@ impl Agent {
     /// историю диалога — человек его не писал, поэтому ни в чате, ни при
     /// загрузке истории его не видно; сохраняется лишь ответ агента.
     pub async fn continue_task(&self, instruction: &str) -> Result<AgentReply> {
-        self.exchange(instruction, false).await
+        let _turn = self.exchange_lock.lock().await;
+        self.exchange(instruction, Origin::Continuation).await
     }
 
-    /// Общий путь [`Agent::handle_request`] и [`Agent::continue_task`]:
-    /// `from_human` — реплику написал человек (сохраняется в историю и
-    /// проверяется на просьбу перескочить этап) или это служебное продолжение.
-    async fn exchange(&self, prompt: &str, from_human: bool) -> Result<AgentReply> {
+    /// Плановый запуск агента по расписанию (см. [`crate::automation`]):
+    /// `prompt` уходит модели, как служебное продолжение, — в историю не
+    /// пишется, человек его не писал, — а ответ сохраняется с пометкой
+    /// `⏰ <label>`, чтобы в чате было видно, что агент заговорил сам.
+    ///
+    /// Запуск пропускается, а не ждёт, если агент остановлен, занят другим
+    /// обменом или ведёт задачу: плановый промпт посреди задачи вмешался бы в
+    /// диалог о ней, а инструменты на этапе planning и не выполнились бы.
+    pub async fn run_scheduled(&self, label: &str, prompt: &str) -> Result<ScheduledOutcome> {
+        if !self.is_running() {
+            return Ok(ScheduledOutcome::Skipped("агент остановлен".into()));
+        }
+        if let Some(task) = self.task_state().filter(|t| t.stage != Stage::Done) {
+            return Ok(ScheduledOutcome::Skipped(format!("агент ведёт задачу «{}»", task.name)));
+        }
+        let Ok(_turn) = self.exchange_lock.try_lock() else {
+            return Ok(ScheduledOutcome::Skipped("агент занят другим запросом".into()));
+        };
+        let reply = self.exchange(prompt, Origin::Scheduled { label }).await?;
+        Ok(ScheduledOutcome::Replied(reply))
+    }
+
+    /// Дописывает в чат агента сообщение от имени агента без обращения к
+    /// модели — например, сработавшее напоминание планировщика. Модель увидит
+    /// его в истории при следующем обмене.
+    pub fn append_notice(&self, text: &str) {
+        self.save_to_history(None, Some((&ChatMessage::assistant(text.to_string()), None)));
+    }
+
+    /// Общий путь [`Agent::handle_request`], [`Agent::continue_task`] и
+    /// [`Agent::run_scheduled`]; вызывающий уже держит `exchange_lock`.
+    /// Реплику человека (`Origin::Human`) сохраняем в историю и проверяем на
+    /// просьбу перескочить этап; служебное продолжение и плановый запуск — нет.
+    async fn exchange(&self, prompt: &str, origin: Origin<'_>) -> Result<AgentReply> {
+        let from_human = matches!(origin, Origin::Human);
         if !self.is_running() {
             bail!("агент «{}» остановлен — сначала запустите его", self.name);
         }
@@ -1869,8 +2088,14 @@ impl Agent {
         // активной задачей они предлагаются на этапах, где автомат их показывает
         // (Stage::offers_external_tools); выполняются не на всех из них — вызов на
         // planning отклоняется в execute_tool.
-        let mcp_tools =
+        let mut mcp_tools =
             if mcp_tools_offered(active_task.as_ref()) { self.mcp.tool_definitions() } else { Vec::new() };
+        // Завести дежурного — вместе с инструментами MCP: без них ему нечего
+        // сводить. Плановому запуску не предлагается, чтобы дежурный не
+        // размножал сам себя.
+        if !mcp_tools.is_empty() && !matches!(origin, Origin::Scheduled { .. }) {
+            mcp_tools.push(Self::assign_duty_definition());
+        }
         // Просьба перескочить обязательный этап перехватывается ДО модели (см.
         // crate::memory::skip_request_target): переход автомат не пропустит и
         // так, но без этого модель могла бы послушаться и написать реализацию
@@ -1916,6 +2141,14 @@ impl Agent {
                     let start = history.len().saturating_sub(window_raw);
                     messages.extend(history[start..].iter().map(|(m, _)| m.clone()));
                 }
+            }
+        }
+        // Заголовок «⏰ <подпись>» у ответов плановых запусков — пометка для
+        // интерфейсов, модели он не нужен: увидев его во всех своих прошлых
+        // ответах, она начинает писать такой же сама, и в чате он двоится.
+        for message in messages.iter_mut().filter(|m| m.role == "assistant") {
+            if let Some(body) = strip_scheduled_header(&message.content) {
+                message.content = body.to_string();
             }
         }
         messages.push(ChatMessage::user(prompt));
@@ -1989,6 +2222,15 @@ impl Agent {
         };
 
         let user_message = ChatMessage::user(prompt.to_string());
+        let mut completion = completion;
+        if let Origin::Scheduled { label } = origin {
+            // Модель всё же могла начать ответ со своего «⏰ …» — не дублируем.
+            let body = match completion.content.trim_start().strip_prefix(SCHEDULED_MARK) {
+                Some(rest) => rest.split_once('\n').map(|(_, body)| body.trim_start()).unwrap_or(""),
+                None => completion.content.as_str(),
+            };
+            completion.content = format!("{SCHEDULED_MARK} {label}\n\n{body}");
+        }
         let assistant_message = ChatMessage::assistant(completion.content.clone());
         self.save_to_history(from_human.then_some(&user_message), Some((&assistant_message, completion.usage)));
 
@@ -2289,6 +2531,21 @@ impl Db {
              CREATE TABLE IF NOT EXISTS agent_current_task (
                  agent_name TEXT PRIMARY KEY REFERENCES agents(name) ON DELETE CASCADE,
                  task_name  TEXT NOT NULL REFERENCES shared_tasks(name) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS scheduled_runs (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_name  TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+                 name        TEXT NOT NULL,
+                 prompt      TEXT NOT NULL,
+                 interval_ms INTEGER NOT NULL,
+                 enabled     INTEGER NOT NULL DEFAULT 1,
+                 next_run_at INTEGER NOT NULL,
+                 last_run_at INTEGER,
+                 last_status TEXT
+             );
+             CREATE TABLE IF NOT EXISTS runtime_leases (
+                 key     TEXT PRIMARY KEY,
+                 next_at INTEGER NOT NULL
              );",
         )
         .context("не удалось создать таблицы БД агентов")?;
@@ -2989,6 +3246,83 @@ impl Db {
         Ok(())
     }
 
+    fn insert_scheduled_run(&self, run: &ScheduledRun) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO scheduled_runs (agent_name, name, prompt, interval_ms, enabled, next_run_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![run.agent, run.name, run.prompt, run.interval_ms, run.enabled, run.next_run_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn scheduled_runs(&self, agent: Option<&str>) -> Result<Vec<ScheduledRun>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_name, name, prompt, interval_ms, enabled, next_run_at, last_run_at, last_status
+             FROM scheduled_runs WHERE ?1 IS NULL OR agent_name = ?1 ORDER BY id",
+        )?;
+        let runs = stmt
+            .query_map([agent], |row| {
+                Ok(ScheduledRun {
+                    id: row.get(0)?,
+                    agent: row.get(1)?,
+                    name: row.get(2)?,
+                    prompt: row.get(3)?,
+                    interval_ms: row.get(4)?,
+                    enabled: row.get::<_, i64>(5)? != 0,
+                    next_run_at: row.get(6)?,
+                    last_run_at: row.get(7)?,
+                    last_status: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(runs)
+    }
+
+    /// Переносит срок запуска с `expected` на `next`, только если его ещё
+    /// никто не перенёс: `true` — запуск достался этому процессу.
+    fn claim_scheduled_run(&self, id: i64, expected: i64, next: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE scheduled_runs SET next_run_at = ?1 WHERE id = ?2 AND next_run_at = ?3 AND enabled = 1",
+            rusqlite::params![next, id, expected],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn update_scheduled_run(&self, id: i64, enabled: Option<bool>, next_run_at: Option<i64>) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE scheduled_runs SET enabled = COALESCE(?1, enabled), next_run_at = COALESCE(?2, next_run_at)
+             WHERE id = ?3",
+            rusqlite::params![enabled, next_run_at, id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn record_scheduled_result(&self, id: i64, at: i64, status: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE scheduled_runs SET last_run_at = ?1, last_status = ?2 WHERE id = ?3",
+            rusqlite::params![at, status, id],
+        )?;
+        Ok(())
+    }
+
+    fn delete_scheduled_run(&self, id: i64) -> Result<bool> {
+        Ok(self.conn().execute("DELETE FROM scheduled_runs WHERE id = ?1", [id])? == 1)
+    }
+
+    /// Общий на все процессы «слот» раз в `interval_ms`: `true` — слот,
+    /// наступивший к `now`, достался этому процессу.
+    fn claim_lease(&self, key: &str, interval_ms: i64, now: i64) -> Result<bool> {
+        let conn = self.conn();
+        conn.execute("INSERT OR IGNORE INTO runtime_leases (key, next_at) VALUES (?1, 0)", [key])?;
+        let changed = conn.execute(
+            "UPDATE runtime_leases SET next_at = ?1 WHERE key = ?2 AND next_at <= ?3",
+            rusqlite::params![now + interval_ms, key, now],
+        )?;
+        Ok(changed == 1)
+    }
+
     fn set_running(&self, name: &str, running: bool) -> Result<()> {
         self.conn().execute(
             "UPDATE agents SET running = ?1 WHERE name = ?2",
@@ -3032,7 +3366,11 @@ pub struct AgentManager {
     client: LlmClient,
     db: Arc<Db>,
     mcp: Arc<crate::mcp::McpManager>,
-    agents: RwLock<HashMap<String, Arc<Agent>>>,
+    agents: Arc<Registry>,
+    /// Последние фоновые ответы и уведомления (см. [`crate::automation`]) —
+    /// по ним интерфейсы понимают, что открытый чат пора перечитать.
+    activity: Mutex<VecDeque<Activity>>,
+    activity_seq: AtomicU64,
 }
 
 impl AgentManager {
@@ -3051,7 +3389,14 @@ impl AgentManager {
         mcp: Arc<crate::mcp::McpManager>,
     ) -> Result<Self> {
         let db = Arc::new(Db::open(&store_path.into())?);
-        let manager = Self { client, db, mcp, agents: RwLock::new(HashMap::new()) };
+        let manager = Self {
+            client,
+            db,
+            mcp,
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            activity: Mutex::new(VecDeque::new()),
+            activity_seq: AtomicU64::new(0),
+        };
         manager.load()?;
         Ok(manager)
     }
@@ -3081,6 +3426,7 @@ impl AgentManager {
                 self.client.clone(),
                 self.db.clone(),
                 self.mcp.clone(),
+                Arc::downgrade(&self.agents),
                 branches,
                 summary,
                 facts,
@@ -3104,31 +3450,8 @@ impl AgentManager {
         self.agents.read().expect("реестр агентов отравлен паникой").get(name).cloned()
     }
 
-    pub fn create(&self, mut config: AgentConfig) -> Result<AgentInfo> {
-        let name = config.name.trim().to_string();
-        if name.is_empty() {
-            bail!("имя агента не может быть пустым");
-        }
-        config.name = name.clone();
-
-        let mut agents = self.agents.write().expect("реестр агентов отравлен паникой");
-        if agents.contains_key(&name) {
-            bail!("агент с именем «{name}» уже существует");
-        }
-        self.db.insert_agent(&config, false)?;
-        let agent = Agent::new(
-            config,
-            self.client.clone(),
-            self.db.clone(),
-            self.mcp.clone(),
-            Branches::default(),
-            CompressionState::default(),
-            FactsState::default(),
-        );
-        let info = agent.info();
-        agents.insert(name, Arc::new(agent));
-
-        Ok(info)
+    pub fn create(&self, config: AgentConfig) -> Result<AgentInfo> {
+        Ok(register_agent(&self.agents, &self.db, &self.client, &self.mcp, config)?.info())
     }
 
     /// Список всех существующих общих задач (рабочая память, см.
@@ -3171,7 +3494,204 @@ impl AgentManager {
         self.db.set_running(name, false)?;
         Ok(agent.info())
     }
+
+    /// Плановые запуски (см. [`crate::automation`]) — все или одного агента.
+    pub fn scheduled_runs(&self, agent: Option<&str>) -> Result<Vec<ScheduledRun>> {
+        self.db.scheduled_runs(agent)
+    }
+
+    /// Добавляет плановый запуск агента `agent` каждые `every` (`30m`, `1h`).
+    /// Без `prompt` — сводка планировщика ([`crate::automation::DEFAULT_PROMPT`]).
+    /// Первый запуск — через интервал.
+    pub fn add_scheduled_run(
+        &self,
+        agent: &str,
+        every: &str,
+        prompt: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<ScheduledRun> {
+        if self.get(agent).is_none() {
+            bail!("агент «{agent}» не найден");
+        }
+        let mut run = scheduled_run_for(agent, every, prompt, name)?;
+        run.id = self.db.insert_scheduled_run(&run)?;
+        Ok(run)
+    }
+
+    pub fn remove_scheduled_run(&self, id: i64) -> Result<()> {
+        if !self.db.delete_scheduled_run(id)? {
+            bail!("планового запуска #{id} нет");
+        }
+        Ok(())
+    }
+
+    /// Включает или выключает плановый запуск; включённый заново идёт через
+    /// интервал от этого момента.
+    pub fn set_scheduled_run_enabled(&self, id: i64, enabled: bool) -> Result<ScheduledRun> {
+        let run = self.scheduled_run(id)?;
+        let next = enabled.then(|| crate::automation::now_ms() + run.interval_ms);
+        self.db.update_scheduled_run(id, Some(enabled), next)?;
+        self.scheduled_run(id)
+    }
+
+    /// Выполнить плановый запуск при ближайшей проверке, не дожидаясь срока.
+    pub fn trigger_scheduled_run(&self, id: i64) -> Result<ScheduledRun> {
+        let run = self.scheduled_run(id)?;
+        if !run.enabled {
+            bail!("плановый запуск #{id} выключен");
+        }
+        self.db.update_scheduled_run(id, None, Some(crate::automation::now_ms()))?;
+        self.scheduled_run(id)
+    }
+
+    fn scheduled_run(&self, id: i64) -> Result<ScheduledRun> {
+        self.db
+            .scheduled_runs(None)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| anyhow!("планового запуска #{id} нет"))
+    }
+
+    /// Забирает наступившие плановые запуски и переносит их сроки на
+    /// следующий интервал (см. [`crate::automation`] о нескольких процессах).
+    pub(crate) fn claim_due_scheduled(&self, now: i64) -> Result<Vec<ScheduledRun>> {
+        let mut claimed = Vec::new();
+        for run in self.db.scheduled_runs(None)? {
+            if !run.enabled || run.next_run_at > now {
+                continue;
+            }
+            let next = crate::automation::next_on_grid(run.next_run_at, run.interval_ms, now);
+            if self.db.claim_scheduled_run(run.id, run.next_run_at, next)? {
+                claimed.push(run);
+            }
+        }
+        Ok(claimed)
+    }
+
+    pub(crate) fn record_scheduled_result(&self, id: i64, at: i64, status: &str) -> Result<()> {
+        self.db.record_scheduled_result(id, at, status)
+    }
+
+    pub(crate) fn claim_lease(&self, key: &str, interval: std::time::Duration, now: i64) -> Result<bool> {
+        self.db.claim_lease(key, interval.as_millis() as i64, now)
+    }
+
+    /// Кому доставлять события MCP-серверов: запущенные агенты с включённым
+    /// плановым запуском, а если таких нет — все запущенные.
+    pub(crate) fn duty_agents(&self) -> Vec<String> {
+        let running: Vec<String> =
+            self.list().into_iter().filter(|a| a.running).map(|a| a.config.name).collect();
+        let on_duty: Vec<String> = self
+            .db
+            .scheduled_runs(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.enabled && running.contains(&r.agent))
+            .map(|r| r.agent)
+            .fold(Vec::new(), |mut acc, a| {
+                if !acc.contains(&a) {
+                    acc.push(a);
+                }
+                acc
+            });
+        if on_duty.is_empty() {
+            running
+        } else {
+            on_duty
+        }
+    }
+
+    pub(crate) fn push_activity(&self, agent: &str, text: &str) {
+        let seq = self.activity_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut activity = self.activity.lock().expect("журнал активности отравлен паникой");
+        if activity.len() == ACTIVITY_LIMIT {
+            activity.pop_front();
+        }
+        activity.push_back(Activity { seq, agent: agent.to_string(), text: text.to_string() });
+    }
+
+    /// Номер последней фоновой активности — дёшево сравнить с запомненным.
+    pub fn activity_seq(&self) -> u64 {
+        self.activity_seq.load(Ordering::SeqCst)
+    }
+
+    /// Фоновые ответы и уведомления с номером больше `seq`.
+    pub fn activity_since(&self, seq: u64) -> Vec<Activity> {
+        let activity = self.activity.lock().expect("журнал активности отравлен паникой");
+        activity.iter().filter(|a| a.seq > seq).cloned().collect()
+    }
 }
+
+
+/// Создаёт агента и регистрирует его в реестре и БД (остановленным).
+fn register_agent(
+    registry: &Arc<Registry>,
+    db: &Arc<Db>,
+    client: &LlmClient,
+    mcp: &Arc<crate::mcp::McpManager>,
+    mut config: AgentConfig,
+) -> Result<Arc<Agent>> {
+    let name = config.name.trim().to_string();
+    if name.is_empty() {
+        bail!("имя агента не может быть пустым");
+    }
+    config.name = name.clone();
+
+    let mut agents = registry.write().expect("реестр агентов отравлен паникой");
+    if agents.contains_key(&name) {
+        bail!("агент с именем «{name}» уже существует");
+    }
+    db.insert_agent(&config, false)?;
+    let agent = Arc::new(Agent::new(
+        config,
+        client.clone(),
+        db.clone(),
+        mcp.clone(),
+        Arc::downgrade(registry),
+        Branches::default(),
+        CompressionState::default(),
+        FactsState::default(),
+    ));
+    agents.insert(name, agent.clone());
+    Ok(agent)
+}
+
+/// Плановый запуск агента `agent` каждые `every` (ещё не сохранённый, `id` — 0).
+/// Без `prompt` — сводка планировщика ([`crate::automation::DEFAULT_PROMPT`]).
+/// Первый запуск — через интервал.
+fn scheduled_run_for(agent: &str, every: &str, prompt: Option<&str>, name: Option<&str>) -> Result<ScheduledRun> {
+    let interval = crate::automation::parse_duration(every)?;
+    if interval < crate::automation::MIN_INTERVAL {
+        bail!(
+            "слишком часто: каждый плановый запуск — обращение к модели, интервал не меньше {} с",
+            crate::automation::MIN_INTERVAL.as_secs()
+        );
+    }
+    let interval_ms = interval.as_millis() as i64;
+    let every = crate::automation::format_duration(interval_ms);
+    let prompt = match prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(prompt) => prompt.to_string(),
+        None => crate::automation::DEFAULT_PROMPT.replace("{every}", &every),
+    };
+    let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => name.to_string(),
+        None => format!("Плановый запуск, каждые {every}"),
+    };
+    Ok(ScheduledRun {
+        id: 0,
+        agent: agent.to_string(),
+        name,
+        prompt,
+        interval_ms,
+        enabled: true,
+        next_run_at: crate::automation::now_ms() + interval_ms,
+        last_run_at: None,
+        last_status: None,
+    })
+}
+
+/// Сколько последних записей фоновой активности хранить в памяти.
+const ACTIVITY_LIMIT: usize = 100;
 
 #[cfg(test)]
 mod tests {
@@ -4073,7 +4593,7 @@ mod tests {
         // Без задачи — только MCP-инструменты и без принуждения к вызову.
         let offered: Vec<&str> =
             requests[0]["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(offered, ["mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(offered, ["mcp__calc__add", "mcp__calc__fail", "assign_duty"]);
         assert_eq!(requests[0]["tool_choice"], "auto");
         // Результат вызова ушёл модели во втором круге.
         let tool_message = requests[1]["messages"].as_array().unwrap().last().unwrap().clone();
@@ -4119,7 +4639,7 @@ mod tests {
         let requests = requests.lock().unwrap();
         // Инструменты видны модели (иначе она считает, что таких возможностей у
         // неё нет), но директива этапа запрещает их вызывать.
-        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail", "assign_duty"]);
         assert_eq!(requests[0]["tool_choice"], "required");
         let block = requests[0]["messages"]
             .as_array()
@@ -4200,7 +4720,7 @@ mod tests {
         assert_eq!((call.result.as_str(), call.is_error), ("42", false));
 
         let requests = requests.lock().unwrap();
-        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail"]);
+        assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step", "mcp__calc__add", "mcp__calc__fail", "assign_duty"]);
     }
 
     #[tokio::test]
@@ -4237,5 +4757,162 @@ mod tests {
         assert_eq!(allowed, [Stage::Execution, Stage::Validation]);
         assert_eq!(offered, [Stage::Planning, Stage::Execution, Stage::Validation]);
         assert!(mcp_tools_allowed(None) && mcp_tools_offered(None), "без задачи ограничений нет");
+    }
+
+    #[tokio::test]
+    async fn scheduled_run_replies_with_mark_and_skips_when_busy_stopped_or_tasked() {
+        let (base_url, requests) = mock_llm(vec![
+            delayed(800, serde_json::json!({ "content": "Ответ человеку." })),
+            serde_json::json!({ "content": "Heap вырос на 12%." }),
+            // Модель повторила заголовок по образцу прошлых ответов.
+            serde_json::json!({ "content": "⏰ Плановая сводка\n\nКуча стабильна." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = Arc::new(AgentManager::new(LlmClient::for_tests_at(&base_url), store.0.clone()).unwrap());
+        manager.create(AgentConfig::new("duty")).unwrap();
+        let agent = manager.get("duty").unwrap();
+
+        let skipped = agent.run_scheduled("Сводка", "сделай сводку").await.unwrap();
+        assert!(matches!(skipped, ScheduledOutcome::Skipped(ref r) if r.contains("остановлен")));
+
+        manager.start("duty").unwrap();
+        let human = tokio::spawn({
+            let agent = agent.clone();
+            async move { agent.handle_request("привет").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let busy = agent.run_scheduled("Сводка", "сделай сводку").await.unwrap();
+        assert!(matches!(busy, ScheduledOutcome::Skipped(ref r) if r.contains("занят")), "{busy:?}");
+        human.await.unwrap().unwrap();
+
+        let ScheduledOutcome::Replied(reply) = agent.run_scheduled("Сводка", "сделай сводку").await.unwrap() else {
+            panic!("плановый запуск должен был выполниться");
+        };
+        assert_eq!(reply.text, "⏰ Сводка\n\nHeap вырос на 12%.");
+        // Промпт планового запуска модели ушёл, но в историю не попал.
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let history: Vec<String> = agent.history().into_iter().map(|m| m.content).collect();
+        assert_eq!(history, ["привет", "Ответ человеку.", "⏰ Сводка\n\nHeap вырос на 12%."]);
+
+        let ScheduledOutcome::Replied(again) = agent.run_scheduled("Сводка", "сделай сводку").await.unwrap() else {
+            panic!("плановый запуск должен был выполниться");
+        };
+        assert_eq!(again.text, "⏰ Сводка\n\nКуча стабильна.", "заголовок не двоится");
+        // Прошлый ответ ушёл модели без заголовка — копировать ей нечего.
+        let sent = requests.lock().unwrap()[2]["messages"].to_string();
+        assert!(sent.contains("Heap вырос на 12%.") && !sent.contains("⏰"), "{sent}");
+
+        assert_eq!(strip_scheduled_header("⏰ Сводка\n\nтекст"), Some("текст"));
+        assert_eq!(strip_scheduled_header("⏰ Напоминание: позвонить"), None);
+        assert_eq!(strip_scheduled_header("обычный ответ"), None);
+
+        agent.task_start("demo", None).unwrap();
+        let tasked = agent.run_scheduled("Сводка", "сделай сводку").await.unwrap();
+        assert!(matches!(tasked, ScheduledOutcome::Skipped(ref r) if r.contains("demo")));
+    }
+
+    #[test]
+    fn scheduled_runs_are_claimed_once_across_processes() {
+        let store = TempStore::new();
+        let a = AgentManager::new(LlmClient::for_tests(), store.0.clone()).unwrap();
+        a.create(AgentConfig::new("duty")).unwrap();
+        // Второй «процесс» над тем же файлом БД.
+        let b = AgentManager::new(LlmClient::for_tests(), store.0.clone()).unwrap();
+
+        assert!(a.add_scheduled_run("duty", "10s", None, None).is_err(), "слишком часто");
+        assert!(a.add_scheduled_run("nobody", "1h", None, None).is_err());
+        let run = a.add_scheduled_run("duty", "1h", None, None).unwrap();
+        assert!(run.prompt.contains("since=\"1h\""), "{}", run.prompt);
+        assert_eq!(run.name, "Плановый запуск, каждые 1h");
+
+        let due = run.next_run_at;
+        assert!(a.claim_due_scheduled(due - 1).unwrap().is_empty());
+        assert_eq!(a.claim_due_scheduled(due + 10).unwrap().len(), 1);
+        assert!(b.claim_due_scheduled(due + 10).unwrap().is_empty(), "уже забрал другой процесс");
+        let stored = &b.scheduled_runs(Some("duty")).unwrap()[0];
+        assert_eq!(stored.next_run_at, due + 3_600_000);
+
+        a.set_scheduled_run_enabled(run.id, false).unwrap();
+        assert!(a.claim_due_scheduled(due + 10_000_000).unwrap().is_empty(), "выключенный не запускается");
+        assert!(a.trigger_scheduled_run(run.id).is_err());
+        a.set_scheduled_run_enabled(run.id, true).unwrap();
+        a.trigger_scheduled_run(run.id).unwrap();
+        assert_eq!(b.claim_due_scheduled(crate::automation::now_ms()).unwrap().len(), 1);
+
+        assert!(a.claim_lease("events", std::time::Duration::from_secs(15), 1000).unwrap());
+        assert!(!b.claim_lease("events", std::time::Duration::from_secs(15), 1001).unwrap());
+        assert!(b.claim_lease("events", std::time::Duration::from_secs(15), 16_000).unwrap());
+
+        a.remove_scheduled_run(run.id).unwrap();
+        assert!(a.scheduled_runs(None).unwrap().is_empty());
+        assert!(a.remove_scheduled_run(run.id).is_err());
+    }
+
+    #[test]
+    fn events_go_to_agents_on_duty_or_to_all_running() {
+        let store = TempStore::new();
+        let m = AgentManager::new(LlmClient::for_tests(), store.0.clone()).unwrap();
+        for name in ["a", "b", "c"] {
+            m.create(AgentConfig::new(name)).unwrap();
+        }
+        assert!(m.duty_agents().is_empty(), "никто не запущен");
+        m.start("a").unwrap();
+        m.start("b").unwrap();
+        assert_eq!(m.duty_agents(), ["a", "b"]);
+        m.add_scheduled_run("b", "30m", Some("сводка"), None).unwrap();
+        m.add_scheduled_run("c", "30m", Some("сводка"), None).unwrap();
+        assert_eq!(m.duty_agents(), ["b"], "c на дежурстве, но остановлен");
+
+        m.push_activity("b", "раз");
+        m.push_activity("b", "два");
+        assert_eq!(m.activity_seq(), 2);
+        let since: Vec<String> = m.activity_since(1).into_iter().map(|a| a.text).collect();
+        assert_eq!(since, ["два"]);
+    }
+
+    #[tokio::test]
+    async fn assign_duty_creates_and_starts_a_duty_agent_once() {
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("assign_duty", serde_json::json!({ "every": "30m" })),
+            serde_json::json!({ "content": "Дежурный назначен." }),
+            tool_call("assign_duty", serde_json::json!({ "every": "30m" })),
+            serde_json::json!({ "content": "Уже назначен." }),
+            serde_json::json!({ "content": "Сводка." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let mcp = Arc::new(crate::mcp::McpManager::empty());
+        mcp.attach_for_tests("calc", crate::mcp::test_support::spawn_calculator()).await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(&base_url), store.0.clone(), mcp).unwrap();
+        let mut config = AgentConfig::new("boss");
+        config.model = Some("some-model".into());
+        manager.create(config).unwrap();
+        manager.start("boss").unwrap();
+        let boss = manager.get("boss").unwrap();
+
+        let reply = boss.handle_request("следи за сервисом и присылай сводку раз в полчаса").await.unwrap();
+        assert_eq!(reply.text, "Дежурный назначен.");
+        let call = &reply.tool_calls[0];
+        assert_eq!((call.server.as_deref(), call.tool.as_str(), call.is_error), (Some("агенты"), "assign_duty", false));
+        assert!(call.result.contains("«Дежурный» создан и запущен"), "{}", call.result);
+        assert_eq!(boss.live_tool_calls().calls.len(), 1, "вызов виден интерфейсам по ходу обмена");
+
+        let duty = manager.get(DEFAULT_DUTY_AGENT).expect("дежурный создан");
+        assert!(duty.is_running());
+        assert_eq!(duty.config().model.as_deref(), Some("some-model"), "модель — как у вызвавшего");
+        let runs = manager.scheduled_runs(Some(DEFAULT_DUTY_AGENT)).unwrap();
+        assert_eq!((runs.len(), runs[0].every().as_str()), (1, "30m"));
+
+        let again = boss.handle_request("и ещё раз назначь").await.unwrap();
+        assert!(again.tool_calls[0].result.contains("уже был"), "{}", again.tool_calls[0].result);
+        assert_eq!(manager.scheduled_runs(Some(DEFAULT_DUTY_AGENT)).unwrap().len(), 1, "не дублируется");
+
+        // Самому дежурному в плановом запуске инструмент не предлагается.
+        duty.run_scheduled("Сводка", "сделай сводку").await.unwrap();
+        let tools = requests.lock().unwrap()[4]["tools"].to_string();
+        assert!(tools.contains("mcp__calc__add") && !tools.contains("assign_duty"), "{tools}");
+        // А тот, кто назначал, его видел.
+        assert!(requests.lock().unwrap()[0]["tools"].to_string().contains("assign_duty"));
     }
 }

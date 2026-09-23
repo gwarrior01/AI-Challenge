@@ -231,6 +231,79 @@ To try it, run the demo app with a hot CPU loop, heavy allocation, and lock cont
 
 Only local JVMs are supported for now. Remote ones are planned: all data comes from HotSpot diagnostic commands, which a remote JVM runs over JMX (the `DiagnosticCommand` MBean) with the same text output, so a remote JVM will need only a new `Target` variant and a `Jvm` implementation (`mcp/java-profiler-mcp/src/jvm.rs`); parsing and tools stay as they are.
 
+#### Own MCP server: scheduler (deferred and periodic jobs)
+
+`mcp/scheduler-mcp/` is the second own server: a **job scheduler** that runs around the clock by itself. A job is an *action* plus a *schedule*; the server executes it on time, stores every run in SQLite, and returns aggregated results. It knows nothing about any particular data source — JVM monitoring is just one thing it can be pointed at.
+
+```bash
+cargo run -p scheduler-mcp            # http://127.0.0.1:8092/mcp (SCHEDULER_MCP_ADDR); data in scheduler.db (SCHEDULER_DB)
+```
+
+Actions:
+
+- `reminder` — at the due time creates an event with the text;
+- `http` — GET/HEAD/POST to a URL; the run stores `status`, `ok`, `latency_ms` and the body (JSON, or text truncated to 4 000 chars). A non-2xx status is a result, not a failure — a health check going `DOWN` is exactly what the summary should show; only a failed request counts as an error;
+- `mcp_tool` — calls a tool of **another MCP server**, by its name from `mcp.json` (`LLM_MCP_CONFIG`, the same file the client reads; only `url` servers) or by `url`. This is what makes the scheduler universal: anything some server can already do can be run on a schedule without new code here — e.g. `java-profiler · java_process_info` every 30 s.
+
+Running shell commands is deliberately not supported: jobs are created by the model, and "run any command on a schedule" would be a hole rather than a tool. The scheduler also refuses to call its own tools.
+
+Tools:
+
+| Tool | What it does |
+|---|---|
+| `schedule_job` | `action`, `params`, and `every` (periodic, ≥ 5s) and/or `in`/`at` (one-off, or the start of a periodic job); optional `name`, `extract` |
+| `schedule_reminder` | `text`, `in`/`at`, optional `every` |
+| `list_jobs`, `cancel_job`, `pause_job`, `resume_job` | manage jobs; `resume_job` also revives a job the scheduler paused itself |
+| `get_runs` | raw runs of a job: time, duration, result, extracted metrics or error |
+| `get_summary` | aggregation over the runs of one job or all, optionally `since` (`30m`, `24h`, or a moment) |
+| `get_events`, `ack_events` | reminders and failures for the agent; events stay unread until acknowledged, so a reader that crashes midway loses nothing |
+
+Every reply carries `now` — the server's time, since the model does not know it; relative times are `30s`, `10m`, `1h30m`, `1d`, absolute ones RFC 3339, `2026-09-23 18:00` (local) or just `18:00` (the next such time).
+
+**Summary without an LLM.** Metrics are taken from each successful result when it is stored: all scalar fields by path (`status`, `body.data.rate`), or only the ones named in `extract` — `{"heap_used_kb": {"path": "heap", "regex": "used (\\d+)K"}}` pulls a number out of a text field. `get_summary` then does the same for any source: run counts (ok/errors), last error, average duration; for numbers `min/max/avg/first/last` and `change_percent`; for strings the last value, how many times it changed (UP → DOWN → UP is two) and the most frequent values. The model only interprets the result.
+
+**Surviving restarts.** Jobs, runs and events live in `scheduler.db`; one tokio task sleeps until the nearest `next_run_at`. Runs missed while the server was down are not replayed one by one: a periodic job runs once on start and then continues on its old grid (every 5m with runs at 12:00, 12:05 and the server back at 12:22 → 12:22, 12:25, 12:30). A reminder that fires late says so. A slow run does not overlap the next one — that run is skipped.
+
+**Self-protection.** A periodic job that fails `SCHEDULER_MAX_FAILURES` times in a row (5) is paused with the reason and a `job_paused` event — e.g. the JVM it watched was restarted and got a new pid. Runs and acknowledged events older than `SCHEDULER_RETENTION_DAYS` (7) are deleted hourly.
+
+### Agents on duty: scheduled runs
+
+The scheduler collects data 24/7, but someone has to *say* something. A **scheduled run** (`core/src/automation.rs`) is an agent, a prompt and an interval (≥ 30 s — every run is a model call): every interval the agent gets the prompt and answers into its own chat with a `⏰ <name>` mark. The prompt is not saved to the history (a human did not write it), the answer is. Without a prompt it asks for a summary of the scheduler over the last interval (`get_summary` + `get_events` with `since` = the interval).
+
+A run is **skipped, not queued** when the agent is stopped, busy with another request (an agent now handles one exchange at a time — a human request waits its turn), or has an active task: a scheduled prompt in the middle of a task would cut into it, and MCP calls would not even run in `planning`. The status of the last run says which. Give monitoring its own agent.
+
+**Events without the model.** The same loop polls every 15 s every connected server that has `get_events` and `ack_events` (that is `scheduler-mcp`): unread events are appended to the chats of the agents on duty — running agents with an enabled scheduled run, or all running agents if none has one — and acknowledged. So "remind me in 20 minutes" arrives on time and costs nothing, instead of waiting for the next summary.
+
+**The agent can appoint the duty agent itself.** Whenever MCP tools are offered, the model also gets the built-in tool `assign_duty(every, prompt?, agent?)` (shown in the chat as `агенты · assign_duty(…)`): it creates the duty agent (`Дежурный` by default, with the caller's model), starts it and adds a scheduled run; calling it again with the same interval and prompt changes nothing. So a request like *"проверяй /health раз в 20 секунд и присылай сводку раз в 10 минут"* to any agent ends with a `schedule_job` on the scheduler and an `assign_duty(every="10m")` — the summaries then arrive in the `Дежурный` chat, as do all reminders and job failures. The tool follows the same stage rules as MCP tools (in `planning` it only goes into the plan), and it is not offered to a scheduled run, so the duty agent cannot multiply itself.
+
+Scheduled runs live in `agents.db` and run in any long-lived process — the web server, the TUI, or headless `llm-cli agent daemon`. When several of them share one `agents.db`, each run and each event poll is taken by exactly one: its due time is moved with a conditional `UPDATE … WHERE next_run_at = <old>`, and only the process whose update went through runs it.
+
+- **CLI** — `llm-cli agent schedule <agent> [list]`, `… add <interval> [prompt…]`, `… remove|on|off|run <id>`; `llm-cli agent daemon` works in the background 24/7 and prints what agents say (stops on Ctrl+C or SIGTERM, so launchd/systemd can run it).
+- **TUI** — the agent's memory screen (**F3**) has a "Плановые запуски" section and the same `schedule …` commands; answers appear in the open chat by themselves, in light blue.
+- **Web** — the **🧠 Память** panel of an agent has a "⏰ Плановые запуски" section: add (interval, optional name and prompt), ▶ run now, on/off, delete. The page polls `GET /api/activity?after=<seq>` and appends new answers to the open chat. API: `GET|POST /api/agents/:name/schedule` (`{"every": "30m", "prompt": null, "name": null}`), `POST /api/agents/:name/schedule/:id/enable|disable|run|delete`.
+
+**Stopping things.** A scheduler job (collecting) and a duty agent's scheduled run (reporting) are separate: cancelling a job does not stop the summaries, and turning the summaries off does not stop the collecting. Jobs can be managed without the model everywhere:
+
+- **CLI** — `llm-cli jobs [list [all]]`, `llm-cli jobs cancel|pause|resume <id>` (no `LLM_API_*` needed);
+- **TUI** — the **Расписание** screen (**F5** from any screen, F5/Esc back) shows everything on a schedule: the scheduler's jobs (refreshed every 5 s) and the scheduled runs of all agents; commands `jobs cancel|pause|resume <id>`, `jobs list all`, `schedule on|off|run|remove <id>`; ↑/↓, PgUp/PgDn scroll. (The agent memory screen, F3, is scrollable the same way.)
+- **Web** — the **Расписание** tab next to «Агенты» and «MCP»: the scheduler's jobs with pause/resume and ✕ cancel (a second click within 3 s confirms) and "show finished", and the scheduled runs of all agents with ▶ run now, on/off, delete. It refreshes about every 9 s while open. API: `GET /api/scheduler/jobs?all=true|false`, `POST /api/scheduler/jobs/:id/cancel|pause|resume`, `GET /api/schedule` (all agents' runs).
+
+Or just ask any agent ("отмени мониторинг java-monitor") — it calls `list_jobs` and `cancel_job` itself.
+
+**Demo, end to end:**
+
+```bash
+cargo run -p java-profiler-mcp &          # :8091
+cargo run -p scheduler-mcp &              # :8092
+java mcp/java-profiler-mcp/demo/Busy.java &
+llm-cli agent add duty --system "Ты дежурный агент мониторинга. Отвечай кратко."
+llm-cli agent start duty --no-chat        # a stopped agent's runs are skipped
+llm-cli agent schedule duty add 30m       # summary of the scheduler every 30 minutes
+llm-cli agent daemon                      # or just keep the web UI / TUI open
+```
+
+Then ask any agent: *"Следи за JVM <pid>: раз в 30 секунд снимай занятую кучу, и напомни через 10 минут проверить отчёт"* — it calls `schedule_job(action="mcp_tool", params={"server": "java-profiler", "tool": "java_process_info", "arguments": {"pid": …}}, every="30s", extract={"heap_used_kb": …})` and `schedule_reminder`. From there the scheduler collects on its own, the reminder arrives in the duty agent's chat on time, and every 30 minutes the duty agent posts a summary like *"Busy heap: 3 runs, no errors; used grew 275 → 916 MB (+233%) — looks like a leak or a large allocation burst"*.
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -305,7 +378,7 @@ cargo run -p llm-cli -- agent stop Переводчик
 cargo run -p llm-cli -- agent remove Переводчик
 ```
 
-`agent add` flags: `--system TEXT`, `--model NAME`, `--show-tokens`, `--max-tokens N`, `--temperature N`, `--top-p N`, `--reasoning on|off`, `--context-strategy full|summary|sliding-window|facts|branching` (see "Context-management strategies for named agents" above; `--compress` still works as a deprecated alias for `--context-strategy summary`), `--window-size N` (override the shared window size for `sliding-window`/`facts`), `--profile NAME` (personalization profile, see "Personalization: profiles" above; defaults to `default`). Inside `agent start`'s chat loop, type `stop` (or `exit`, or `Ctrl+D`) to stop the agent and leave — it also prints a one-line notice whenever a summary is recomputed or facts are updated. Agents and their message history are persisted to `AGENTS_STORE_PATH` (SQLite, see above) and are the same registry the web UI's "Агенты" tab and the TUI's agents screen use. An agent remembers the whole conversation so far — this survives stopping/starting the agent *and* restarting the whole application; `agent start` prints any restored history before opening the chat prompt. Removing an agent (`agent remove`) deletes its stored history (all branches), summary, and facts too. `agent list` also shows each agent's active `context_strategy` (and, for `branching`, its current branch, branch count, and checkpoint count).
+`agent add` flags: `--system TEXT`, `--model NAME`, `--show-tokens`, `--max-tokens N`, `--temperature N`, `--top-p N`, `--reasoning on|off`, `--context-strategy full|summary|sliding-window|facts|branching` (see "Context-management strategies for named agents" above; `--compress` still works as a deprecated alias for `--context-strategy summary`), `--window-size N` (override the shared window size for `sliding-window`/`facts`), `--profile NAME` (personalization profile, see "Personalization: profiles" above; defaults to `default`). `agent start <name> --no-chat` only starts the agent (e.g. one on duty for `agent daemon`, see "Agents on duty" above). Inside `agent start`'s chat loop, type `stop` (or `exit`, or `Ctrl+D`) to stop the agent and leave — it also prints a one-line notice whenever a summary is recomputed or facts are updated. Agents and their message history are persisted to `AGENTS_STORE_PATH` (SQLite, see above) and are the same registry the web UI's "Агенты" tab and the TUI's agents screen use. An agent remembers the whole conversation so far — this survives stopping/starting the agent *and* restarting the whole application; `agent start` prints any restored history before opening the chat prompt. Removing an agent (`agent remove`) deletes its stored history (all branches), summary, and facts too. `agent list` also shows each agent's active `context_strategy` (and, for `branching`, its current branch, branch count, and checkpoint count).
 
 Additional `agent` subcommands for managing strategy and branches on an existing agent:
 
@@ -394,11 +467,12 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs)
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs)
 cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents and `mcp` subcommand for MCP servers
 mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
+  scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template

@@ -69,6 +69,13 @@
 //! проверяемые кодом на переходах автомата, а не только текстом) показаны в
 //! секции "Рабочая — данные ОБЩЕЙ задачи" того же экрана.
 //!
+//! ## Расписание (F5 с любого экрана)
+//!
+//! Всё, что работает по расписанию (см. llm_core::automation): задания
+//! MCP-планировщика — что собирается (`jobs cancel|pause|resume <id>`,
+//! `jobs list all`), и плановые запуски всех агентов — кто присылает сводки
+//! (`schedule on|off|run|remove <id>`; добавляются на экране памяти агента).
+//!
 //! ## MCP (F4 с любого экрана)
 //!
 //! Экран MCP-серверов (см. llm_core::mcp) из файла `mcp.json` (или
@@ -103,6 +110,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -212,6 +220,9 @@ enum Screen {
     AgentMemory,
     /// MCP-серверы и их инструменты (F4 с любого экрана, F4/Esc — обратно).
     Mcp,
+    /// Расписание: задания MCP-планировщика и плановые запуски агентов (F5 с
+    /// любого экрана, F5/Esc — обратно).
+    Schedule,
 }
 
 /// Шаги мастера создания агента — по одному вопросу за раз в нижнем поле ввода.
@@ -433,6 +444,9 @@ enum AppEvent {
     McpUpdated { message: Option<(String, bool)> },
     /// Ручной вызов инструмента с экрана MCP завершился.
     McpCalled(McpCallView),
+    /// Список заданий MCP-планировщика обновлён (см. llm_core::automation::scheduler_jobs);
+    /// `message` — итог команды `jobs …` для строки статуса экрана памяти.
+    SchedulerJobs { jobs: Result<Vec<llm_core::SchedulerJob>, String>, message: Option<(String, bool)> },
 }
 
 /// Ручной вызов инструмента с экрана MCP — показывается под этим инструментом.
@@ -496,6 +510,20 @@ struct DrawState<'a> {
     /// только на экране памяти агента, чтобы показать, к каким задачам можно
     /// присоединиться командой `task join`; `&[]` на остальных экранах.
     shared_tasks: &'a [llm_core::SharedTaskSummary],
+    /// Плановые запуски (см. llm_core::automation): открытого агента — на экране
+    /// памяти, всех агентов — на экране расписания; `&[]` на остальных экранах.
+    scheduled_runs: &'a [llm_core::ScheduledRun],
+    /// Задания MCP-планировщика (общие) — последний полученный список или ошибка;
+    /// `None`, пока ещё не запрашивали.
+    scheduler_jobs: Option<&'a Result<Vec<llm_core::SchedulerJob>, String>>,
+    /// Прокрутка экрана памяти (строк сверху).
+    memory_scroll: u16,
+    /// Сюда отрисовка пишет предел прокрутки экрана памяти.
+    memory_scroll_max: &'a std::cell::Cell<u16>,
+    /// Экран расписания: прокрутка, её предел и итог последней команды.
+    schedule_scroll: u16,
+    schedule_scroll_max: &'a std::cell::Cell<u16>,
+    schedule_status: Option<(&'a str, bool)>,
     /// Снимок MCP-серверов (см. llm_core::mcp) — берётся на каждой перерисовке,
     /// поэтому смена статуса подключения видна сразу.
     mcp_servers: &'a [llm_core::McpServerInfo],
@@ -579,7 +607,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut history: Vec<HistoryItem> = vec![HistoryItem {
         role: Role::System,
         text: "Challenger (TUI). Enter — отправить, Esc — выход, Tab — JSON запроса/ответа, \
-               F2 — управление агентами, F4 — MCP-серверы."
+               F2 — управление агентами, F4 — MCP-серверы, F5 — расписание."
             .to_string(),
         debug: None,
         tokens: None,
@@ -620,7 +648,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // виджету. Отслеживаем предыдущий экран и при каждой смене форсируем полную
     // перерисовку терминала, чтобы такой "хвост" не оставался виден.
     let mut previous_screen = screen;
-    let agent_manager = AgentManager::from_env(client.clone())?;
+    let agent_manager = Arc::new(AgentManager::from_env(client.clone())?);
     // Реестр MCP-серверов общий с агентами: подключение идёт в фоне, чтобы
     // медленный сервер (npx скачивает пакет) не задерживал запуск TUI, — по
     // готовности приходит AppEvent::McpUpdated и экран перерисовывается.
@@ -647,6 +675,21 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // см. run_memory_command) — сбрасывается при входе на экран и при смене
     // открытого агента, чтобы не показывать результат команды для другого агента.
     let mut memory_status: Option<(String, bool)> = None;
+    // Задания MCP-планировщика для экрана расписания: запрашиваются в фоне,
+    // пока экран открыт (раз в 5 с) и после команды `jobs …`.
+    let mut scheduler_jobs: Option<Result<Vec<llm_core::SchedulerJob>, String>> = None;
+    let mut scheduler_jobs_fetching = false;
+    // Экран расписания (F5): куда вернуться, прокрутка и итог последней команды.
+    let mut schedule_return = Screen::Chat;
+    let mut schedule_scroll: u16 = 0;
+    let schedule_scroll_max = std::cell::Cell::new(u16::MAX);
+    let mut schedule_status: Option<(String, bool)> = None;
+    // Прокрутка экрана памяти: разделов много, на невысоком терминале нижние
+    // (плановые запуски) иначе не видны.
+    let mut memory_scroll: u16 = 0;
+    // Предел прокрутки, который узнаёт только отрисовка (сколько строк не влезло).
+    let memory_scroll_max = std::cell::Cell::new(u16::MAX);
+    let mut activity_ticks: u64 = 0;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     {
@@ -657,6 +700,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             let _ = tx.send(AppEvent::McpUpdated { message: None });
         });
     }
+    // Плановые запуски агентов и доставка событий MCP (см. llm_core::automation)
+    // работают, пока открыт TUI; всё, что агенты сказали сами, дописывается в
+    // открытые чаты по журналу активности (activity_tick ниже).
+    let _automation = llm_core::automation::spawn(agent_manager.clone());
+    let mut activity_seen = agent_manager.activity_seq();
+    let mut activity_tick = tokio::time::interval(Duration::from_secs(1));
     let mut events = EventStream::new();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
 
@@ -762,6 +811,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
         // на каждой перерисовке зря.
         let screen_shared_tasks =
             if matches!(screen, Screen::AgentMemory) { agent_manager.list_tasks() } else { Vec::new() };
+        let screen_scheduled_runs = match (&screen, &agent_chat_name) {
+            (Screen::AgentMemory, Some(name)) => agent_manager.scheduled_runs(Some(name)).unwrap_or_default(),
+            (Screen::Schedule, _) => agent_manager.scheduled_runs(None).unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let screen_agent_task = match &screen {
             Screen::AgentChat => {
                 agent_chat_name.as_ref().and_then(|n| agent_manager.get(n)).and_then(|a| a.task_state())
@@ -807,6 +861,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             agent_history_len: screen_agent_history_len,
             memory_status: memory_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
             shared_tasks: &screen_shared_tasks,
+            scheduled_runs: &screen_scheduled_runs,
+            scheduler_jobs: scheduler_jobs.as_ref(),
+            memory_scroll,
+            memory_scroll_max: &memory_scroll_max,
+            schedule_scroll,
+            schedule_scroll_max: &schedule_scroll_max,
+            schedule_status: schedule_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
             mcp_servers: &mcp_servers,
             mcp_selected,
             mcp_scroll,
@@ -838,9 +899,27 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 Screen::AgentCreate => { wizard = None; Screen::AgentsList }
                                 Screen::AgentChat | Screen::AgentMemory => { agent_chat_name = None; Screen::AgentsList }
                                 Screen::Mcp => { mcp_editing = false; Screen::AgentsList }
+                                Screen::Schedule => Screen::AgentsList,
                             };
                             input.clear();
                             confirm_delete = None;
+                            continue;
+                        }
+
+                        // F5 — расписание, как F4 — с любого экрана и обратно.
+                        if key.code == KeyCode::F(5) {
+                            if screen == Screen::Schedule {
+                                screen = schedule_return;
+                            } else {
+                                if screen == Screen::Mcp {
+                                    mcp_editing = false;
+                                }
+                                schedule_return = screen;
+                                screen = Screen::Schedule;
+                                schedule_status = None;
+                                schedule_scroll = 0;
+                            }
+                            input.clear();
                             continue;
                         }
 
@@ -873,6 +952,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             };
                             input.clear();
                             memory_status = None;
+                            memory_scroll = 0;
                             continue;
                         }
 
@@ -1133,7 +1213,89 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             // обращения к LLM здесь нет), поэтому `waiting` не проверяется:
                             // это не мешает и не мешается запросу к самой LLM, если он
                             // сейчас выполняется в фоне для этого же или другого агента.
+                            Screen::Schedule => match key.code {
+                                KeyCode::Esc => {
+                                    screen = schedule_return;
+                                    input.clear();
+                                }
+                                KeyCode::Up => schedule_scroll = schedule_scroll.saturating_sub(1),
+                                KeyCode::Down => {
+                                    schedule_scroll = schedule_scroll.saturating_add(1).min(schedule_scroll_max.get())
+                                }
+                                KeyCode::PageUp => schedule_scroll = schedule_scroll.saturating_sub(PAGE_STEP),
+                                KeyCode::PageDown => {
+                                    schedule_scroll =
+                                        schedule_scroll.saturating_add(PAGE_STEP).min(schedule_scroll_max.get())
+                                }
+                                KeyCode::Enter => {
+                                    let raw = input.trim().to_string();
+                                    input.clear();
+                                    let words: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+                                    match words.first().map(String::as_str) {
+                                        Some("jobs") => {
+                                            schedule_status = Some(("Планировщик: выполняется…".to_string(), false));
+                                            scheduler_jobs_fetching = true;
+                                            let mcp = mcp.clone();
+                                            let tx = tx.clone();
+                                            tokio::spawn(async move {
+                                                let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+                                                let message = match llm_core::automation::run_jobs_command(&mcp, &args).await {
+                                                    // Список и так виден на экране.
+                                                    Ok(text) => (text.replace('\n', " · "), false),
+                                                    Err(err) => (err.to_string(), true),
+                                                };
+                                                let all = args == ["list", "all"];
+                                                let jobs = llm_core::automation::scheduler_jobs(&mcp, all)
+                                                    .await
+                                                    .map_err(|e| e.to_string());
+                                                let _ = tx.send(AppEvent::SchedulerJobs { jobs, message: Some(message) });
+                                            });
+                                        }
+                                        Some("schedule") if matches!(
+                                            words.get(1).map(String::as_str),
+                                            Some("on" | "off" | "run" | "remove")
+                                        ) => {
+                                            let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+                                            // Эти действия адресуют запуск по номеру — агент не нужен.
+                                            schedule_status = Some(
+                                                match llm_core::automation::run_command(&agent_manager, "", &args) {
+                                                    Ok(text) => (text.replace('\n', " · "), false),
+                                                    Err(err) => (err.to_string(), true),
+                                                },
+                                            );
+                                        }
+                                        Some("schedule") => {
+                                            schedule_status = Some((
+                                                "Плановый запуск добавляется у агента: чат агента → F3 → schedule add <интервал> [промпт]"
+                                                    .to_string(),
+                                                true,
+                                            ));
+                                        }
+                                        Some(_) => {
+                                            schedule_status = Some((
+                                                "Команды: jobs cancel|pause|resume <id> · jobs list all · schedule on|off|run|remove <id>"
+                                                    .to_string(),
+                                                true,
+                                            ));
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            },
                             Screen::AgentMemory => match key.code {
+                                KeyCode::Up => memory_scroll = memory_scroll.saturating_sub(1),
+                                KeyCode::Down => {
+                                    memory_scroll = memory_scroll.saturating_add(1).min(memory_scroll_max.get())
+                                }
+                                KeyCode::PageUp => memory_scroll = memory_scroll.saturating_sub(PAGE_STEP),
+                                KeyCode::PageDown => {
+                                    memory_scroll = memory_scroll.saturating_add(PAGE_STEP).min(memory_scroll_max.get())
+                                }
                                 KeyCode::Esc => {
                                     screen = Screen::AgentChat;
                                     input.clear();
@@ -1200,6 +1362,17 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                     }
                                                     Err(err) => memory_status = Some((err.to_string(), true)),
                                                 }
+                                                continue;
+                                            }
+                                            if let Some(rest) = raw.strip_prefix("schedule") {
+                                                let args: Vec<&str> = rest.split_whitespace().collect();
+                                                memory_status = Some(
+                                                    match llm_core::automation::run_command(&agent_manager, agent.name(), &args) {
+                                                        // Список и так виден в разделе «Плановые запуски».
+                                                        Ok(text) => (text.replace('\n', " · "), false),
+                                                        Err(err) => (err.to_string(), true),
+                                                    },
+                                                );
                                                 continue;
                                             }
                                             memory_status = Some(match run_memory_command(&agent, &raw) {
@@ -1353,6 +1526,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
                         Screen::AgentMemory => input.push_str(&text),
                         Screen::Mcp if mcp_editing => input.push_str(&text),
+                        Screen::Schedule => input.push_str(&text),
                         Screen::AgentCreate if wizard.as_ref().is_some_and(|w| w.quick.is_some()) => {
                             input.push_str(&text);
                         }
@@ -1373,6 +1547,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                     }
                     AppEvent::McpCalled(call) => {
                         mcp_call = Some(call);
+                        continue;
+                    }
+                    AppEvent::SchedulerJobs { jobs, message } => {
+                        scheduler_jobs_fetching = false;
+                        scheduler_jobs = Some(jobs);
+                        if message.is_some() {
+                            schedule_status = message;
+                        }
                         continue;
                     }
                     AppEvent::DirectResponse { prompt, result: Ok(completion) } => {
@@ -1548,6 +1730,35 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             _ = spinner_tick.tick(), if waiting => {
                 spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
             }
+            _ = activity_tick.tick() => {
+                activity_ticks += 1;
+                if screen == Screen::Schedule
+                    && !scheduler_jobs_fetching
+                    && (scheduler_jobs.is_none() || activity_ticks.is_multiple_of(5))
+                {
+                    scheduler_jobs_fetching = true;
+                    let mcp = mcp.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let jobs = llm_core::automation::scheduler_jobs(&mcp, false).await.map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::SchedulerJobs { jobs, message: None });
+                    });
+                }
+                // Чат, который ещё не открывали, прочитает всё из БД при открытии.
+                for activity in agent_manager.activity_since(activity_seen) {
+                    activity_seen = activity.seq;
+                    if let Some(items) = agent_histories.get_mut(&activity.agent) {
+                        items.push(HistoryItem {
+                            role: Role::Assistant,
+                            text: activity.text,
+                            debug: None,
+                            tokens: None,
+                            cost: None,
+                            cost_approx: false,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -1562,6 +1773,7 @@ fn draw(frame: &mut Frame, state: &DrawState) {
         Screen::AgentChat => draw_agent_chat(frame, state),
         Screen::AgentMemory => draw_agent_memory(frame, state),
         Screen::Mcp => draw_mcp(frame, state),
+        Screen::Schedule => draw_schedule(frame, state),
     }
 }
 
@@ -1743,7 +1955,7 @@ fn draw_agents_list(frame: &mut Frame, state: &DrawState) {
             "✦ Challenger",
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  ·  Агенты  ·  F2/Esc — назад к чату  ·  F4 — MCP"),
+        Span::raw("  ·  Агенты  ·  F2/Esc — назад к чату  ·  F4 — MCP  ·  F5 — расписание"),
     ]))
     .block(
         Block::default()
@@ -1822,6 +2034,82 @@ fn mcp_status_color(status: &llm_core::McpStatus) -> Color {
         llm_core::McpStatus::Failed { .. } => Color::Red,
         llm_core::McpStatus::Disabled => Color::DarkGray,
     }
+}
+
+/// Экран расписания (F5): задания MCP-планировщика (что собирается) и
+/// плановые запуски всех агентов (кто присылает сводки).
+fn draw_schedule(frame: &mut Frame, state: &DrawState) {
+    let area = frame.area();
+    let chunks = layout_chunks(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✦ Challenger", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  Расписание  ·  F5/Esc — назад  ·  F4 — MCP"),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(header, chunks[0]);
+
+    let section_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Задания MCP-планировщика",
+        section_style,
+    )));
+    match state.scheduler_jobs {
+        None => lines.push(Line::from(Span::styled("  загрузка…", hint_style))),
+        Some(Err(err)) => lines.push(Line::from(Span::styled(format!("  {err}"), hint_style))),
+        Some(Ok(jobs)) if jobs.is_empty() => lines.push(Line::from(Span::styled("  заданий нет", hint_style))),
+        Some(Ok(jobs)) => {
+            for job in jobs {
+                let color = match job.state.as_str() {
+                    "active" => Color::Reset,
+                    "paused" => Color::Yellow,
+                    _ => Color::DarkGray,
+                };
+                lines.push(Line::from(Span::styled(format!("  {}", job.describe()), Style::default().fg(color))));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Агенты, присылающие сводки",
+        section_style,
+    )));
+    if state.scheduled_runs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  нет — добавляются у агента: чат агента → F3 → schedule add <интервал> [промпт]",
+            hint_style,
+        )));
+    } else {
+        let now = llm_core::automation::now_ms();
+        for run in state.scheduled_runs {
+            let style = if run.enabled { Style::default() } else { hint_style };
+            lines.push(Line::from(Span::styled(format!("  {} · агент «{}»", run.describe(now), run.agent), style)));
+        }
+    }
+
+    let visible = chunks[1].height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(visible);
+    state.schedule_scroll_max.set(max_scroll);
+    let title = if lines.len() as u16 > visible { " Расписание · ↑/↓ PgUp/PgDn — прокрутка " } else { " Расписание " };
+    let body = Paragraph::new(lines)
+        .scroll((state.schedule_scroll.min(max_scroll), 0))
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title));
+    frame.render_widget(body, chunks[1]);
+
+    let (status_text, status_color) = match state.schedule_status {
+        Some((text, is_error)) => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
+        None => (
+            " Команды: jobs cancel|pause|resume <id> · jobs list all — с завершёнными · schedule on|off|run|remove <id>"
+                .to_string(),
+            Color::DarkGray,
+        ),
+    };
+    frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(status_color)), chunks[2]);
+    render_input_box(frame, chunks[3], state.input, " Команда — Enter выполнить, F5/Esc назад ".to_string(), Color::Reset);
 }
 
 /// Экран MCP-серверов (F4): слева список серверов со статусами, справа —
@@ -2308,7 +2596,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
     ];
     header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
-    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память  ·  F4 MCP"));
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
     let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
@@ -2590,9 +2878,35 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
         ))),
     }
 
-    let body = Paragraph::new(lines).block(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Память агента "),
-    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Плановые запуски — агент на дежурстве: сам отвечает по расписанию (⏰ в диалоге)",
+        section_style,
+    )));
+    if state.scheduled_runs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  нет — команда: schedule add <интервал> [промпт] (без промпта — сводка планировщика)",
+            hint_style,
+        )));
+    } else {
+        let now = llm_core::automation::now_ms();
+        for run in state.scheduled_runs {
+            lines.push(Line::from(format!("  {}", run.describe(now))));
+        }
+    }
+
+    let visible = chunks[1].height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(visible);
+    state.memory_scroll_max.set(max_scroll);
+    let scroll = state.memory_scroll.min(max_scroll);
+    let title = if lines.len() as u16 > visible {
+        " Память агента · ↑/↓ PgUp/PgDn — прокрутка "
+    } else {
+        " Память агента "
+    };
+    let body = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title));
     frame.render_widget(body, chunks[1]);
 
     let (status_text, status_color) = match state.memory_status {
@@ -2603,7 +2917,8 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
              task advance <этап> [--step T] [--expect T] · task pause · task resume · \
              task approve · task reject <причина> · task finish · task invariant set/remove <id> [текст] · \
              task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
-             profile new <имя> · invariants new <id> · invariants remove <id>"
+             profile new <имя> · invariants new <id> · invariants remove <id> · \
+             schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
                 .to_string(),
             Color::DarkGray,
         ),
@@ -2915,6 +3230,8 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
 fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> Vec<Line<'static>> {
     let (label, color) = match item.role {
         Role::User => ("Вы", Color::Cyan),
+        // Ответ, который агент дал сам — по расписанию или доставив событие.
+        Role::Assistant if item.text.starts_with(llm_core::SCHEDULED_MARK) => ("LLM", Color::LightBlue),
         Role::Assistant => ("LLM", Color::Green),
         Role::System => ("Инфо", Color::DarkGray),
         Role::Error => ("Ошибка", Color::Red),

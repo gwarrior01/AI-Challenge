@@ -18,6 +18,10 @@
     "java-profiler": {
       "description": "Профилирование Java-приложений на этой машине (свой сервер, Streamable HTTP; запуск: cargo run -p java-profiler-mcp)",
       "url": "http://127.0.0.1:8091/mcp"
+    },
+    "scheduler": {
+      "description": "Планировщик: отложенные и периодические задания с хранением в SQLite и сводками (свой сервер, Streamable HTTP; запуск: cargo run -p scheduler-mcp)",
+      "url": "http://127.0.0.1:8092/mcp"
     }
   }
 }

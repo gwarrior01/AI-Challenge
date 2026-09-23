@@ -13,7 +13,7 @@
 //!   llm-cli agent list                -- список агентов и их статус
 //!   llm-cli agent add <имя> [флаги]   -- добавить агента (по умолчанию остановлен)
 //!   llm-cli agent remove <имя>        -- удалить агента
-//!   llm-cli agent start <имя>         -- запустить агента и открыть чат с ним
+//!   llm-cli agent start <имя> [--no-chat]  -- запустить агента и открыть чат с ним (или только запустить)
 //!   llm-cli agent stop <имя>          -- остановить агента
 //!   llm-cli agent strategy <имя> <стратегия>       -- сменить стратегию контекста на лету
 //!   llm-cli agent checkpoint <имя> <метка>         -- отметить точку ветвления (strategy branching)
@@ -42,6 +42,10 @@
 //!   llm-cli agent task <имя> require-approval <из> <в>        -- доп. гейт согласия (для перехода МОДЕЛИ)
 //!   llm-cli agent task <имя> unrequire-approval <из> <в>      -- снять доп. гейт согласия
 //!   llm-cli agent tasks                                       -- список всех общих задач и их участников
+//!   llm-cli agent schedule <имя> [list]                       -- плановые запуски агента (см. llm_core::automation)
+//!   llm-cli agent schedule <имя> add <интервал> [промпт…]     -- добавить (без промпта — сводка планировщика)
+//!   llm-cli agent schedule <имя> remove|on|off|run <id>       -- удалить, включить, выключить, выполнить сейчас
+//!   llm-cli agent daemon                                      -- работать в фоне 24/7: плановые запуски и события MCP
 //!   llm-cli agent profile <имя>                    -- показать текущий профиль персонализации агента
 //!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
 //!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
@@ -54,6 +58,8 @@
 //!   llm-cli mcp tools <сервер>                     -- инструменты одного сервера с параметрами
 //!   llm-cli mcp enable|disable <сервер>            -- включить/выключить сервер (флаг пишется в mcp.json)
 //!   llm-cli mcp call <сервер> <инструмент> [JSON]  -- вызвать инструмент напрямую, без модели
+//!   llm-cli jobs [list [all]]                      -- задания MCP-планировщика (scheduler-mcp)
+//!   llm-cli jobs cancel|pause|resume <id>          -- отменить, приостановить, возобновить задание
 //!
 //! ## MCP (см. llm_core::mcp)
 //!   Серверы описываются в `mcp.json` (путь переопределяется `LLM_MCP_CONFIG`) в
@@ -156,6 +162,9 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("mcp") {
         return run_mcp_cli(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("jobs") {
+        return run_jobs_cli(&args[1..]).await;
+    }
 
     let client = LlmClient::from_env()?;
 
@@ -209,6 +218,19 @@ fn format_usage(usage: &llm_core::Usage) -> String {
         "[токены: запрос {} + ответ {} = всего {}]",
         usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
     )
+}
+
+/// `llm-cli jobs ...` — задания MCP-планировщика (см. llm_core::automation):
+/// список и отмена/пауза без модели.
+async fn run_jobs_cli(args: &[String]) -> Result<()> {
+    let mcp = llm_core::McpManager::from_env();
+    if let Some(err) = mcp.config_error() {
+        bail!("{err}");
+    }
+    mcp.connect_all().await;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    println!("{}", llm_core::automation::run_jobs_command(&mcp, &args).await?);
+    Ok(())
 }
 
 /// Разбирает и выполняет подкоманды `llm-cli mcp ...`.
@@ -390,6 +412,13 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 .cloned()
                 .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent start <имя>"))?;
             manager.start(&name)?;
+            // Без чата — например, дежурному агенту для `agent daemon`: выход
+            // из чата агента останавливает, а остановленного плановые запуски
+            // пропускают.
+            if args[2..].iter().any(|a| a == "--no-chat") {
+                println!("Агент «{name}» запущен (без чата). Остановить: llm-cli agent stop {name}");
+                return Ok(());
+            }
             let agent = manager.get(&name).expect("агент только что запущен");
             connect_mcp_for_chat(&manager).await;
             println!("Агент «{name}» запущен. Введите запрос, `stop` или Ctrl+D — остановить и выйти.\n");
@@ -876,10 +905,75 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        Some("schedule") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent schedule <имя> [list|add|remove|on|off|run]"))?;
+            let rest: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            println!("{}", llm_core::automation::run_command(&manager, &name, &rest)?);
+            Ok(())
+        }
+        Some("daemon") => run_daemon(manager).await,
         _ => {
             print_agent_usage();
             Ok(())
         }
+    }
+}
+
+/// `llm-cli agent daemon`: агенты работают без интерфейса — плановые запуски
+/// по расписанию и доставка событий MCP-серверов (см. llm_core::automation);
+/// всё, что агенты сказали сами, печатается сюда и сохраняется в их чатах.
+async fn run_daemon(manager: AgentManager) -> Result<()> {
+    let manager = std::sync::Arc::new(manager);
+    connect_mcp_for_chat(&manager).await;
+    let runs = manager.scheduled_runs(None)?;
+    let now = llm_core::automation::now_ms();
+    if runs.is_empty() {
+        println!("Плановых запусков нет — добавьте: llm-cli agent schedule <имя> add <интервал>");
+    }
+    for run in &runs {
+        println!("{} · агент «{}»", run.describe(now), run.agent);
+        if run.enabled && !manager.get(&run.agent).is_some_and(|a| a.is_running()) {
+            println!("  агент остановлен — запуск будет пропускаться: llm-cli agent start {} --no-chat", run.agent);
+        }
+    }
+    println!("Фоновый режим. Ctrl+C или SIGTERM — выход.\n");
+
+    let _automation = llm_core::automation::spawn(manager.clone());
+    let mut seen = manager.activity_seq();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                for activity in manager.activity_since(seen) {
+                    println!("[{}] {}\n", activity.agent, activity.text);
+                    seen = activity.seq;
+                }
+            }
+            _ = &mut shutdown => return Ok(()),
+        }
+    }
+}
+
+/// Ctrl+C или SIGTERM — так демон корректно останавливают и из терминала, и
+/// менеджером служб (launchd, systemd).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("не удалось подписаться на SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -1052,7 +1146,7 @@ fn print_agent_usage() {
          \x20                        [--context-strategy full|summary|sliding-window|facts|branching]\n\
          \x20                        [--window-size N] [--compress] [--profile NAME]\n\
          \x20 llm-cli agent remove <имя>\n\
-         \x20 llm-cli agent start <имя>\n\
+         \x20 llm-cli agent start <имя> [--no-chat]\n\
          \x20 llm-cli agent stop <имя>\n\
          \x20 llm-cli agent strategy <имя> <стратегия>\n\
          \x20 llm-cli agent checkpoint <имя> <метка>                    (стратегия branching)\n\
@@ -1074,6 +1168,10 @@ fn print_agent_usage() {
          \x20 llm-cli agent task <имя> require-approval <из> <в>       (доп. гейт согласия — только для переходов модели)\n\
          \x20 llm-cli agent task <имя> unrequire-approval <из> <в>     (снять доп. гейт согласия)\n\
          \x20 llm-cli agent tasks                                      (список всех общих задач и их участников)\n\
+         \x20 llm-cli agent schedule <имя> [list]                      (плановые запуски агента)\n\
+         \x20 llm-cli agent schedule <имя> add <интервал> [промпт…]    (без промпта — сводка планировщика)\n\
+         \x20 llm-cli agent schedule <имя> remove|on|off|run <id>\n\
+         \x20 llm-cli agent daemon                                     (фоновый режим 24/7: плановые запуски и события MCP)\n\
          \x20 llm-cli agent profile <имя>                              (показать текущий профиль персонализации)\n\
          \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
          \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
