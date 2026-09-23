@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Html,
     routing::{get, post},
     Json, Router,
@@ -1019,6 +1019,122 @@ fn ensure_task(agent: &llm_core::Agent, agent_name: &str) {
     let _ = agent.task_start(&unique, None);
 }
 
+#[derive(Deserialize)]
+struct AddScheduledRunRequest {
+    every: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    after: u64,
+}
+
+fn scheduled_runs_json(state: &AppState, agent: &str) -> Json<serde_json::Value> {
+    scheduled_runs_of(state, Some(agent))
+}
+
+/// Плановые запуски одного агента или всех (`None`) в виде JSON для интерфейса.
+fn scheduled_runs_of(state: &AppState, agent: Option<&str>) -> Json<serde_json::Value> {
+    match state.agents.scheduled_runs(agent) {
+        Ok(runs) => {
+            let now = llm_core::automation::now_ms();
+            let runs: Vec<serde_json::Value> = runs
+                .into_iter()
+                .map(|r| {
+                    let mut value = serde_json::to_value(&r).unwrap_or_default();
+                    value["every"] = r.every().into();
+                    value["next_in"] = llm_core::automation::relative(r.next_run_at, now).into();
+                    value["last_ago"] = r.last_run_at.map(|at| llm_core::automation::relative(at, now)).into();
+                    value
+                })
+                .collect();
+            Json(serde_json::json!({ "runs": runs, "default_prompt": llm_core::automation::DEFAULT_PROMPT }))
+        }
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Плановые запуски всех агентов — для вкладки «Расписание».
+async fn all_schedule(State(state): State<AppState>) -> Json<serde_json::Value> {
+    scheduled_runs_of(&state, None)
+}
+
+/// Плановые запуски агента (см. llm_core::automation).
+async fn agent_schedule(State(state): State<AppState>, Path(name): Path<String>) -> Json<serde_json::Value> {
+    scheduled_runs_json(&state, &name)
+}
+
+async fn add_agent_schedule(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AddScheduledRunRequest>,
+) -> Json<serde_json::Value> {
+    match state.agents.add_scheduled_run(&name, &req.every, req.prompt.as_deref(), req.name.as_deref()) {
+        Ok(_) => scheduled_runs_json(&state, &name),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// `enable`, `disable`, `run` (выполнить при ближайшей проверке) или `delete`.
+async fn scheduled_run_action(
+    State(state): State<AppState>,
+    Path((name, id, action)): Path<(String, i64, String)>,
+) -> Json<serde_json::Value> {
+    let result = match action.as_str() {
+        "enable" => state.agents.set_scheduled_run_enabled(id, true).map(drop),
+        "disable" => state.agents.set_scheduled_run_enabled(id, false).map(drop),
+        "run" => state.agents.trigger_scheduled_run(id).map(drop),
+        "delete" => state.agents.remove_scheduled_run(id),
+        other => Err(anyhow::anyhow!("неизвестное действие «{other}»")),
+    };
+    match result {
+        Ok(()) => scheduled_runs_json(&state, &name),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct JobsQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+/// Задания MCP-планировщика (см. llm_core::automation::scheduler_jobs) — общие
+/// для всех агентов.
+async fn scheduler_jobs(State(state): State<AppState>, Query(q): Query<JobsQuery>) -> Json<serde_json::Value> {
+    let mcp = state.agents.mcp();
+    match llm_core::automation::scheduler_jobs(&mcp, q.all).await {
+        Ok(jobs) => Json(serde_json::json!({ "jobs": jobs })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// `cancel`, `pause` или `resume` для задания планировщика.
+async fn scheduler_job_action(
+    State(state): State<AppState>,
+    Path((id, action)): Path<(i64, String)>,
+) -> Json<serde_json::Value> {
+    let mcp = state.agents.mcp();
+    match llm_core::automation::scheduler_job_action(&mcp, id, &action).await {
+        Ok(job) => Json(serde_json::json!({ "job": job })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Что агенты сказали сами (плановые запуски, события MCP) после номера
+/// `after` — интерфейс опрашивает, чтобы дописать это в открытый чат.
+async fn activity(State(state): State<AppState>, Query(q): Query<ActivityQuery>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "seq": state.agents.activity_seq(),
+        "items": state.agents.activity_since(q.after),
+    }))
+}
+
 /// Возвращает историю диалога агента, восстановленную из SQLite — используется
 /// интерфейсом, чтобы показать прежние сообщения при открытии чата, даже если
 /// сервер был перезапущен после последнего обращения к агенту.
@@ -1076,6 +1192,9 @@ async fn main() -> Result<()> {
         let mcp = agents.mcp();
         tokio::spawn(async move { mcp.connect_all().await });
     }
+    // Плановые запуски агентов и доставка событий MCP (см. llm_core::automation):
+    // пока работает веб-сервер, агенты на дежурстве отвечают сами.
+    let _automation = llm_core::automation::spawn(agents.clone());
 
     let state = AppState {
         client: Arc::new(client),
@@ -1131,6 +1250,12 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/task/require-approval", post(task_require_approval_agent))
         .route("/api/agents/:name/task/unrequire-approval", post(task_unrequire_approval_agent))
         .route("/api/tasks", get(list_tasks))
+        .route("/api/agents/:name/schedule", get(agent_schedule).post(add_agent_schedule))
+        .route("/api/agents/:name/schedule/:id/:action", post(scheduled_run_action))
+        .route("/api/activity", get(activity))
+        .route("/api/schedule", get(all_schedule))
+        .route("/api/scheduler/jobs", get(scheduler_jobs))
+        .route("/api/scheduler/jobs/:id/:action", post(scheduler_job_action))
         .route("/api/mcp", get(list_mcp))
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/:name/:action", post(set_mcp_enabled))

@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub use agent::{
     Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
-    FactsInfo, LiveToolCall, LiveToolCalls, ProfileStatus, SlidingWindowInfo, ToolCallRecord,
+    FactsInfo, LiveToolCall, LiveToolCalls, ProfileStatus, ScheduledOutcome, SlidingWindowInfo, ToolCallRecord,
+    SCHEDULED_MARK,
 };
+
+pub mod automation;
+pub use automation::{Activity, ScheduledRun, SchedulerJob};
 
 pub mod context;
 pub use context::ContextStrategy;

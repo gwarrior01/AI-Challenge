@@ -1,0 +1,27 @@
+[package]
+name = "scheduler-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Серверная часть rmcp — инструменты планировщика по Streamable HTTP; клиентская —
+# для заданий `mcp_tool`, которые по расписанию вызывают инструменты других
+# MCP-серверов.
+rmcp = { version = "3.4", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+http = "1"
