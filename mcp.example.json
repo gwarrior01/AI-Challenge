@@ -22,6 +22,11 @@
     "scheduler": {
       "description": "Планировщик: отложенные и периодические задания с хранением в SQLite и сводками (свой сервер, Streamable HTTP; запуск: cargo run -p scheduler-mcp)",
       "url": "http://127.0.0.1:8092/mcp"
+    },
+    "documents": {
+      "description": "Документы: PDF → Markdown → краткое содержание → файл, три отдельных инструмента (свой сервер, Streamable HTTP; запуск: cargo run -p documents-mcp)",
+      "url": "http://127.0.0.1:8093/mcp",
+      "timeout_sec": 1800
     }
   }
 }
