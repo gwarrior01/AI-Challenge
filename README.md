@@ -198,6 +198,7 @@ Servers are configured in `mcp.json` in the working directory (override with `LL
 
 - `command` + `args` (+ `env`, `cwd`) — a local server spawned as a child process, spoken to over stdio (its stderr is captured, and the last lines are shown if it fails to start);
 - `url` (+ `headers`) — a remote server over Streamable HTTP;
+- `timeout_sec` — how long to wait for one tool call of this server (120 s by default); raise it for servers whose tools call an LLM themselves, like `documents`;
 - `enabled: false` (or Cline-style `disabled: true`) — the server **stays in the config but is not connected**, and agents don't see its tools. Every interface can flip this flag; the change is written back into `mcp.json` (other fields and key order are preserved), so it survives restarts;
 - `${VAR}` in `args`, `env`, `url` and `headers` is substituted from the environment, so tokens stay in `.env`, not in the config file. A missing variable is reported as that server's connection error.
 
@@ -265,6 +266,31 @@ Every reply carries `now` — the server's time, since the model does not know i
 **Surviving restarts.** Jobs, runs and events live in `scheduler.db`; one tokio task sleeps until the nearest `next_run_at`. Runs missed while the server was down are not replayed one by one: a periodic job runs once on start and then continues on its old grid (every 5m with runs at 12:00, 12:05 and the server back at 12:22 → 12:22, 12:25, 12:30). A reminder that fires late says so. A slow run does not overlap the next one — that run is skipped.
 
 **Self-protection.** A periodic job that fails `SCHEDULER_MAX_FAILURES` times in a row (5) is paused with the reason and a `job_paused` event — e.g. the JVM it watched was restarted and got a new pid. Runs and acknowledged events older than `SCHEDULER_RETENTION_DAYS` (7) are deleted hourly.
+
+#### Own MCP server: documents (tool composition)
+
+`mcp/documents-mcp/` is the third own server: three separate tools that form one chain — the first gets the data, the second processes it, the third saves the result. The server has no "run everything" tool on purpose: the chain is composed by the agent, which plans the three calls and then makes them one after another, passing the id from one result into the next call's arguments.
+
+```bash
+cargo run -p documents-mcp         # http://127.0.0.1:8093/mcp (DOCUMENTS_MCP_ADDR); files in documents/ (DOCUMENTS_DIR)
+```
+
+| Tool | Takes | Returns |
+|---|---|---|
+| `list_pdfs` | — | PDFs in `documents/inbox/` and results in `documents/out/` |
+| `pdf_to_markdown` | `path` — absolute, `~/…`, or just a file name from the inbox | `document_id`; writes `out/<name>.md` |
+| `summarize_markdown` | `document_id`, optional `max_words` (250), `focus` | `summary_id` and the summary text |
+| `save_summary` | `summary_id`, optional `file_name` | path to `out/<name>.summary.md` |
+
+**Passing data between steps.** The steps hand each other ids, not text: if the model copied the Markdown from one tool's result into the next tool's arguments, it could cut or rephrase it, and there would be no way to tell. An id comes from the SHA-256 of the content (`doc-<16 hex>`, `sum-<16 hex>`); the content lives in `documents/.artifacts/`, and on every read the hash is recomputed and checked against the metadata and the id itself, so a step gets exactly what the previous one wrote, or an error. Every step returns `input_sha256` (what it actually read) and `sha256` (what it wrote): the chain is intact when each step's `input_sha256` equals the previous step's `sha256`. `save_summary` re-reads the file after writing and checks the hash of the text after its YAML header, which records where the summary came from (source PDF, Markdown, the hashes of every link, the method). Artifacts live on disk, so a chain can be continued after a server restart.
+
+**PDF → Markdown.** Text is extracted with `pdftotext` (poppler, `brew install poppler`) if it is on `PATH`, otherwise with `pdf-extract` (pure Rust); the result's `extractor` field says which. poppler is preferred because on typeset documents (kerning, letter spacing) `pdf-extract` puts spaces inside words — «К ратки й обзор» — while `pdftotext` gets them right. A PDF has no markup, so structure is recovered by deliberately cautious heuristics: page headers/footers (a line repeated on most pages) and page numbers are dropped; a short line without a closing period that stands alone or follows the end of a sentence, and is followed by a capitalized line, becomes a heading (`1.2 …` → `###` by depth, the first one is the title); broken lines are joined into paragraphs, and a hyphenated word is joined back (`пере-/ход` → `переход`, but `PDF-/документ` keeps its hyphen); a paragraph split by a page break is rejoined; bullets become `- `. Scans without a text layer are reported as such (no OCR). A malformed PDF is an error, not a server crash.
+
+**Summary.** With `LLM_API_URL`/`LLM_API_KEY` set (the same variables as the client), the summary is written by the model (`LLM_MODEL`): the gist in one sentence, then key points — facts, figures, decisions, deadlines — only from the text. A long document is split at section and paragraph boundaries into ~12 000-character chunks, each is summarized — up to `DOCUMENTS_LLM_PARALLEL` (4) requests at a time — and the partial summaries are merged. These requests are sent with reasoning off (`enable_thinking: false`): a summary does not need it, and on a long document it multiplies the time by the number of chunks. Even so, a 40-page document is several model calls, which is why the `documents` entry in `mcp.example.json` has `"timeout_sec": 1800` (see below). Without `LLM_API_*` the server still works and builds an extractive summary (headings and the first sentence of each paragraph). The `method` field says which one was used: `llm (<model>)` or `extractive`.
+
+**The agent composes the chain.** In the web UI the first message to an agent starts a task in `planning`. Ask *"возьми mcp-report.pdf из входящих: преврати в Markdown, сделай краткое содержание не больше 100 слов и сохрани как «итог-mcp»"*. In `planning` the tools are offered but not run, so the model proposes a plan that names all three calls and what goes where (`pdf_to_markdown(path)` → `document_id` → `summarize_markdown(document_id)` → `summary_id` → `save_summary(summary_id, file_name)`). After **Утвердить** it moves to `execution` and makes the three calls in turn. The chat shows three `documents · …` rows: the id in each row's result is the argument of the next row, and an expanded row shows `input_sha256` equal to the previous step's `sha256`. In a live run the model then moved to `validation` by itself and checked the file with `list_pdfs`.
+
+Try it without the model: `cp mcp/documents-mcp/demo/mcp-report.pdf documents/inbox/` and call the steps by hand — `llm-cli mcp call documents pdf_to_markdown '{"path":"mcp-report.pdf"}'`, then `summarize_markdown` with the `document_id` from its result, then `save_summary` with the `summary_id` (or the same through the **Вызвать** blocks on the web MCP tab, or Enter on a tool in the TUI's F4 screen).
 
 ### Agents on duty: scheduled runs
 
@@ -473,6 +499,7 @@ mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
   scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
+  documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/markdown.rs — PDF text to Markdown, src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the three steps, demo/mcp-report.pdf — sample PDF
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template

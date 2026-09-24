@@ -60,7 +60,8 @@ pub const TOOL_PREFIX: &str = "mcp__";
 /// `tools/list`). С запасом: `npx -y ...` при первом запуске скачивает пакет.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Сколько ждать ответа на один вызов инструмента.
+/// Сколько ждать ответа на один вызов инструмента, если у сервера не задан
+/// `timeout_sec`.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Предел длины результата инструмента, который уходит модели: огромный ответ
@@ -103,6 +104,11 @@ pub struct McpServerConfig {
     /// Необязательное пояснение для человека — показывается в интерфейсах.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Сколько ждать ответа на один вызов инструмента, в секундах; по
+    /// умолчанию [`CALL_TIMEOUT`]. Больше — для серверов, у которых вызов
+    /// сам ходит в LLM (краткое содержание длинного документа).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_sec: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -523,7 +529,7 @@ impl McpManager {
 
     /// Находит сервер и исходное имя инструмента по имени, под которым его
     /// вызвала модель. `None` — это не инструмент MCP (или сервер отключён).
-    fn resolve(&self, qualified_name: &str) -> Option<(String, String, Arc<Client>)> {
+    fn resolve(&self, qualified_name: &str) -> Option<(String, String, Arc<Client>, Duration)> {
         if !qualified_name.starts_with(TOOL_PREFIX) {
             return None;
         }
@@ -531,7 +537,8 @@ impl McpManager {
         servers.iter().find_map(|(server, entry)| {
             let client = entry.client.clone()?;
             let tool = entry.tools.iter().find(|t| t.qualified_name == qualified_name)?;
-            Some((server.clone(), tool.name.clone(), client))
+            let timeout = entry.config.timeout_sec.filter(|&s| s > 0).map(Duration::from_secs).unwrap_or(CALL_TIMEOUT);
+            Some((server.clone(), tool.name.clone(), client, timeout))
         })
     }
 
@@ -550,7 +557,7 @@ impl McpManager {
     /// Сервер и исходное имя инструмента по имени, под которым его вызвала
     /// модель; `None` — это не инструмент подключённого MCP-сервера.
     pub fn tool_origin(&self, qualified_name: &str) -> Option<(String, String)> {
-        self.resolve(qualified_name).map(|(server, tool, _)| (server, tool))
+        self.resolve(qualified_name).map(|(server, tool, _, _)| (server, tool))
     }
 
     /// Вызывает инструмент по имени, под которым его вызвала модель, с доводами
@@ -558,7 +565,7 @@ impl McpManager {
     /// сбой вызова — это тоже результат для модели (`is_error`), а не повод
     /// обрывать весь обмен.
     pub async fn call(&self, qualified_name: &str, arguments: &str) -> Option<McpCallResult> {
-        let (server, tool, client) = self.resolve(qualified_name)?;
+        let (server, tool, client, timeout) = self.resolve(qualified_name)?;
         let fail = |text: String| McpCallResult { server: server.clone(), tool: tool.clone(), text, is_error: true };
 
         let arguments = if arguments.trim().is_empty() { "{}" } else { arguments };
@@ -567,8 +574,8 @@ impl McpManager {
             _ => return Some(fail("доводы не разобраны: ожидался JSON-объект".to_string())),
         };
         let params = CallToolRequestParams::new(tool.clone()).with_arguments(args);
-        let result = match tokio::time::timeout(CALL_TIMEOUT, client.call_tool(params)).await {
-            Err(_) => return Some(fail(format!("сервер не ответил за {} с", CALL_TIMEOUT.as_secs()))),
+        let result = match tokio::time::timeout(timeout, client.call_tool(params)).await {
+            Err(_) => return Some(fail(format!("сервер не ответил за {} с", timeout.as_secs()))),
             Ok(Err(err)) => return Some(fail(format!("ошибка вызова: {err}"))),
             Ok(Ok(result)) => result,
         };
