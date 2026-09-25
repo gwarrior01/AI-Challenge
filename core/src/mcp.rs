@@ -310,6 +310,9 @@ pub struct McpServerInfo {
     pub status: McpStatus,
     /// Имя и версия сервера из ответа на `initialize` (если сервер их сообщил).
     pub server_version: Option<String>,
+    /// Инструкции сервера из ответа на `initialize`: как пользоваться его
+    /// инструментами вместе (порядок вызовов, что куда передаётся).
+    pub instructions: Option<String>,
     pub tools: Vec<McpToolInfo>,
 }
 
@@ -330,6 +333,7 @@ struct ServerEntry {
     config: McpServerConfig,
     status: McpStatus,
     server_version: Option<String>,
+    instructions: Option<String>,
     tools: Vec<McpToolInfo>,
     client: Option<Arc<Client>>,
     /// Растёт при каждом (пере)подключении/отключении — завершившееся
@@ -341,7 +345,7 @@ struct ServerEntry {
 impl ServerEntry {
     fn new(config: McpServerConfig) -> Self {
         let status = if config.is_enabled() { McpStatus::Idle } else { McpStatus::Disabled };
-        Self { config, status, server_version: None, tools: Vec::new(), client: None, generation: 0 }
+        Self { config, status, server_version: None, instructions: None, tools: Vec::new(), client: None, generation: 0 }
     }
 }
 
@@ -418,6 +422,7 @@ impl McpManager {
                 description: entry.config.description.clone(),
                 status: entry.status.clone(),
                 server_version: entry.server_version.clone(),
+                instructions: entry.instructions.clone(),
                 tools: entry.tools.clone(),
             })
             .collect()
@@ -452,6 +457,7 @@ impl McpManager {
             entry.client = None;
             entry.tools.clear();
             entry.server_version = None;
+            entry.instructions = None;
             entry.status = McpStatus::Connecting;
             (entry.config.clone(), entry.generation)
         };
@@ -469,6 +475,7 @@ impl McpManager {
             Ok(connected) => {
                 entry.status = McpStatus::Connected;
                 entry.server_version = connected.server_version;
+                entry.instructions = connected.instructions;
                 entry.tools = connected.tools;
                 entry.client = Some(Arc::new(connected.client));
             }
@@ -525,6 +532,47 @@ impl McpManager {
                 })
             })
             .collect()
+    }
+
+    /// Карта подключённых серверов для системного промпта: какой сервер за что
+    /// отвечает, его инструменты и его собственные инструкции из `initialize`.
+    /// Описание одного инструмента говорит, ЧТО он делает; как связывать
+    /// инструменты разных серверов в один флоу, модель узнаёт отсюда — иначе
+    /// инструкции серверов (порядок шагов, какой идентификатор куда
+    /// передавать) до неё вообще не доходят. `None` — серверов нет.
+    pub fn routing_block(&self) -> Option<String> {
+        let servers = self.servers.read().expect("реестр MCP отравлен паникой");
+        let connected: Vec<(&String, &ServerEntry)> =
+            servers.iter().filter(|(_, entry)| entry.client.is_some() && !entry.tools.is_empty()).collect();
+        if connected.is_empty() {
+            return None;
+        }
+        let mut block = String::from(
+            "Подключённые MCP-серверы. Инструмент сервера <s> называется mcp__<s>__<инструмент>; \
+             выбирай сервер по тому, за что он отвечает, а не по похожему названию инструмента.\n",
+        );
+        for (name, entry) in &connected {
+            block.push_str(&format!("\n### {name}\n"));
+            if let Some(description) = &entry.config.description {
+                block.push_str(&format!("{description}\n"));
+            }
+            let tools: Vec<&str> = entry.tools.iter().map(|t| t.name.as_str()).collect();
+            block.push_str(&format!("Инструменты: {}\n", tools.join(", ")));
+            if let Some(instructions) = &entry.instructions {
+                block.push_str(&format!("Инструкции сервера: {instructions}\n"));
+            }
+        }
+        if connected.len() > 1 {
+            block.push_str(
+                "\nЕсли просьба затрагивает несколько серверов, это один флоу: сначала разложи её на шаги \
+                 и для каждого шага выбери сервер; вызывай инструменты по одному, по порядку зависимостей — \
+                 идентификаторы (pid, document_id, summary_id, job_id …) бери только из ответов уже \
+                 выполненных вызовов, не придумывай их. Независимые шаги можно вызвать в одном ответе. \
+                 Если вызов вернул ошибку, исправь аргументы или шаг, а не пропускай его молча. \
+                 В конце перечисли, что сделано на каждом сервере.\n",
+            );
+        }
+        Some(block)
     }
 
     /// Находит сервер и исходное имя инструмента по имени, под которым его
@@ -622,6 +670,7 @@ impl McpManager {
             .collect();
         let mut entry = ServerEntry::new(McpServerConfig { enabled: true, ..Default::default() });
         entry.status = McpStatus::Connected;
+        entry.instructions = server_instructions(&client);
         entry.tools = tools;
         entry.client = Some(Arc::new(client));
         self.servers.write().unwrap().insert(name.to_string(), entry);
@@ -676,19 +725,95 @@ pub(crate) mod test_support {
 
     /// Запускает сервер и возвращает конец канала для клиента.
     pub(crate) fn spawn_calculator() -> tokio::io::DuplexStream {
+        spawn(Calculator)
+    }
+
+    fn spawn<S: ServerHandler>(server: S) -> tokio::io::DuplexStream {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
-            if let Ok(service) = Calculator.serve(server_io).await {
+            if let Ok(service) = server.serve(server_io).await {
                 let _ = service.waiting().await;
             }
         });
         client_io
+    }
+
+    /// Журнал вызовов, общий для нескольких фейковых серверов: по нему видно,
+    /// в какой сервер и в каком порядке ушёл каждый вызов.
+    pub(crate) type Journal = std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    /// Ответ фейкового инструмента: `Ok` — текст результата, `Err` — `isError`.
+    pub(crate) type Handler =
+        std::sync::Arc<dyn Fn(&str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
+
+    /// Фейковый сервер для сценариев: инструменты без схем параметров,
+    /// инструкции для `initialize` и ответы из `handler`; каждый вызов
+    /// пишется в `journal` под именем `name`.
+    struct Scripted {
+        name: String,
+        instructions: String,
+        tools: Vec<(String, String)>,
+        handler: Handler,
+        journal: Journal,
+    }
+
+    impl ServerHandler for Scripted {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(rmcp::model::ServerCapabilities::builder().enable_tools().build())
+                .with_instructions(self.instructions.clone())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let serde_json::Value::Object(schema) = serde_json::json!({ "type": "object" }) else { unreachable!() };
+            let tools = self
+                .tools
+                .iter()
+                .map(|(name, description)| Tool::new(name.clone(), description.clone(), schema.clone()))
+                .collect();
+            Ok(ListToolsResult::with_all_items(tools))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
+            let tool = request.name.to_string();
+            self.journal.lock().unwrap().push((self.name.clone(), tool.clone(), args.clone()));
+            let result = match (self.handler)(&tool, &args) {
+                Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+                Err(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
+            };
+            Ok(CallToolResponse::Complete(result))
+        }
+    }
+
+    pub(crate) fn spawn_scripted(
+        name: &str,
+        instructions: &str,
+        tools: &[(&str, &str)],
+        handler: Handler,
+        journal: Journal,
+    ) -> tokio::io::DuplexStream {
+        spawn(Scripted {
+            name: name.to_string(),
+            instructions: instructions.to_string(),
+            tools: tools.iter().map(|(n, d)| (n.to_string(), d.to_string())).collect(),
+            handler,
+            journal,
+        })
     }
 }
 
 struct Connected {
     client: Client,
     server_version: Option<String>,
+    instructions: Option<String>,
     tools: Vec<McpToolInfo>,
 }
 
@@ -769,6 +894,7 @@ async fn connect_server(name: &str, config: &McpServerConfig) -> Result<Connecte
         let imp = info.server_info.as_ref()?;
         Some(format!("{} {}", imp.name, imp.version))
     });
+    let instructions = server_instructions(&client);
     let tools = client
         .list_all_tools()
         .await
@@ -782,7 +908,13 @@ async fn connect_server(name: &str, config: &McpServerConfig) -> Result<Connecte
             input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
         })
         .collect();
-    Ok(Connected { client, server_version, tools })
+    Ok(Connected { client, server_version, instructions, tools })
+}
+
+fn server_instructions(client: &Client) -> Option<String> {
+    let info = client.peer_info()?;
+    let text = info.instructions.as_deref()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 async fn collect_stderr(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) {

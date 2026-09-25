@@ -96,9 +96,12 @@ pub const MAIN_BRANCH: &str = "main";
 
 /// Предел кругов "вызов инструмента -> результат -> продолжение" внутри
 /// одного обмена (см. [`Agent::run_tool_loop`]) — защита от зацикливания
-/// модели на вызовах инструментов автомата задачи, а не архитектурное
-/// ограничение самого автомата.
-const MAX_TOOL_ROUNDS: usize = 6;
+/// модели, а не архитектурное ограничение. Круг — это один ответ модели,
+/// а флоу через несколько MCP-серверов идёт по цепочке зависимостей
+/// (pid → профиль → отчёт → document_id → summary_id → задание), где каждый
+/// шаг ждёт результата предыдущего: прежние 6 кругов обрывали такой флоу на
+/// середине, поэтому запас — на полтора-два десятка последовательных вызовов.
+const MAX_TOOL_ROUNDS: usize = 24;
 
 /// Как часто [`Agent::handle_request`] проверяет, не поставили ли задачу на
 /// паузу, пока ждёт ответа LLM.
@@ -1541,6 +1544,13 @@ impl Agent {
 
         // Предел кругов достигнут (см. документацию выше) — принудительно просим
         // текстовый ответ без инструментов, чтобы обмен не завершился без ответа.
+        // Модели нужно знать, что флоу оборван, иначе она отчитается о шагах,
+        // которых не было.
+        wire.push(crate::RequestMessage::from(&ChatMessage::user(format!(
+            "[Агент] Достигнут предел в {MAX_TOOL_ROUNDS} кругов вызовов инструментов за один обмен — больше \
+             вызывать их сейчас нельзя. Ответь текстом: что уже сделано (по результатам вызовов выше) и какие \
+             шаги остались невыполненными."
+        ))));
         let completion = self.client.chat_with_tools(model, &wire, &[], false, options).await?;
         usage_total = sum_usage(usage_total, completion.usage);
         if !completion.content.trim().is_empty() {
@@ -2090,6 +2100,14 @@ impl Agent {
         // planning отклоняется в execute_tool.
         let mut mcp_tools =
             if mcp_tools_offered(active_task.as_ref()) { self.mcp.tool_definitions() } else { Vec::new() };
+        // Карта серверов — вместе с их инструментами: из описаний отдельных
+        // инструментов модель не узнаёт, как связать вызовы разных серверов
+        // в один флоу, а инструкции серверов иначе до неё не доходят.
+        if !mcp_tools.is_empty() {
+            if let Some(block) = self.mcp.routing_block() {
+                messages.push(ChatMessage::system(block));
+            }
+        }
         // Завести дежурного — вместе с инструментами MCP: без них ему нечего
         // сводить. Плановому запуску не предлагается, чтобы дежурный не
         // размножал сам себя.
@@ -4747,6 +4765,217 @@ mod tests {
         let live = agent.live_tool_calls();
         assert_eq!(live.exchange, 2);
         assert!(live.calls.is_empty(), "вызовы прошлого обмена не должны остаться: {:?}", live.calls);
+    }
+
+    /// Ответ модели с несколькими вызовами сразу (независимые шаги одного круга).
+    fn tool_calls(calls: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let calls: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, arguments))| {
+                serde_json::json!({
+                    "id": format!("call-{i}"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() }
+                })
+            })
+            .collect();
+        serde_json::json!({ "content": null, "tool_calls": calls })
+    }
+
+    /// Три фейковых сервера сценария Дня 20 с общим журналом вызовов. Каждый
+    /// инструмент проверяет, что получил идентификатор из ответа предыдущего
+    /// шага (другого сервера), а не выдуманный, — иначе отвечает ошибкой.
+    async fn orchestration_servers() -> (Arc<crate::mcp::McpManager>, crate::mcp::test_support::Journal) {
+        use crate::mcp::test_support::{spawn_scripted, Journal};
+        use serde_json::json;
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let mcp = Arc::new(crate::mcp::McpManager::empty());
+
+        let profiler = spawn_scripted(
+            "java-profiler",
+            "Начните с java_list_processes, чтобы узнать pid.",
+            &[
+                ("java_list_processes", "Список JVM: pid и главный класс"),
+                ("java_process_info", "Сведения о JVM по pid"),
+                ("java_profile", "Профиль JFR по pid"),
+                ("java_thread_dump", "Снимок потоков по pid"),
+            ],
+            Arc::new(|tool, args| {
+                if tool == "java_list_processes" {
+                    return Ok(json!({ "processes": [{ "pid": 4242, "main_class": "Busy" }] }).to_string());
+                }
+                if args["pid"] != 4242 {
+                    return Err(format!("нет JVM с pid {}", args["pid"]));
+                }
+                Ok(match tool {
+                    "java_process_info" => json!({ "heap_used_mb": 180, "heap_max_mb": 256, "gc": "G1" }),
+                    "java_profile" => json!({ "hot_methods": ["Busy.spin"], "contention": ["Busy.LOCK"] }),
+                    _ => json!({ "blocked": 3, "deadlocks": 0 }),
+                }
+                .to_string())
+            }),
+            journal.clone(),
+        );
+        let documents = spawn_scripted(
+            "documents",
+            "save_markdown → document_id → summarize_markdown → summary_id → save_summary.",
+            &[
+                ("save_markdown", "Сохранить свой Markdown, вернуть document_id"),
+                ("summarize_markdown", "Краткое содержание по document_id"),
+                ("save_summary", "Сохранить краткое содержание по summary_id"),
+            ],
+            Arc::new(|tool, args| match tool {
+                // В отчёт должны попасть данные профилировщика, а не пересказ промпта.
+                "save_markdown" if args["markdown"].as_str().is_some_and(|m| m.contains("Busy.spin")) => {
+                    Ok(json!({ "document_id": "doc-0000000000000abc" }).to_string())
+                }
+                "save_markdown" => Err("в отчёте нет данных профиля".into()),
+                "summarize_markdown" if args["document_id"] == "doc-0000000000000abc" => {
+                    Ok(json!({ "summary_id": "sum-0000000000000def", "summary": "CPU съедает Busy.spin" }).to_string())
+                }
+                "save_summary" if args["summary_id"] == "sum-0000000000000def" => {
+                    Ok(json!({ "path": "documents/out/busy-report.summary.md" }).to_string())
+                }
+                _ => Err(format!("неизвестный идентификатор в {args}")),
+            }),
+            journal.clone(),
+        );
+        let scheduler = spawn_scripted(
+            "scheduler",
+            "schedule_job ставит периодический сбор данных, schedule_reminder — напоминание человеку.",
+            &[
+                ("schedule_job", "Задание: action=mcp_tool вызывает инструмент другого сервера"),
+                ("schedule_reminder", "Напоминание человеку"),
+            ],
+            Arc::new(|tool, args| match tool {
+                "schedule_job"
+                    if args["action"] == "mcp_tool"
+                        && args["params"]["server"] == "java-profiler"
+                        && args["params"]["arguments"]["pid"] == 4242 =>
+                {
+                    Ok(json!({ "job_id": 7 }).to_string())
+                }
+                "schedule_reminder" => Ok(json!({ "job_id": 8 }).to_string()),
+                _ => Err(format!("задание не создано: {args}")),
+            }),
+            journal.clone(),
+        );
+        mcp.attach_for_tests("java-profiler", profiler).await;
+        mcp.attach_for_tests("documents", documents).await;
+        mcp.attach_for_tests("scheduler", scheduler).await;
+        (mcp, journal)
+    }
+
+    #[tokio::test]
+    async fn long_flow_routes_calls_across_three_servers_in_dependency_order() {
+        use serde_json::json;
+        let report = "# Busy тормозит\n\n- CPU: Busy.spin\n- ожидание Busy.LOCK, 3 потока BLOCKED";
+        let (base_url, requests) = mock_llm(vec![
+            tool_call("mcp__java-profiler__java_list_processes", json!({})),
+            // Два независимых шага по одному pid — в одном круге.
+            tool_calls(&[
+                ("mcp__java-profiler__java_process_info", json!({ "pid": 4242 })),
+                ("mcp__java-profiler__java_profile", json!({ "pid": 4242, "duration_sec": 10 })),
+            ]),
+            tool_call("mcp__java-profiler__java_thread_dump", json!({ "pid": 4242 })),
+            tool_call("mcp__documents__save_markdown", json!({ "name": "busy-report", "markdown": report })),
+            tool_call("mcp__documents__summarize_markdown", json!({ "document_id": "doc-0000000000000abc" })),
+            tool_call("mcp__documents__save_summary", json!({ "summary_id": "sum-0000000000000def" })),
+            tool_calls(&[
+                (
+                    "mcp__scheduler__schedule_job",
+                    json!({
+                        "action": "mcp_tool",
+                        "every": "30s",
+                        "params": { "server": "java-profiler", "tool": "java_process_info", "arguments": { "pid": 4242 } }
+                    }),
+                ),
+                ("mcp__scheduler__schedule_reminder", json!({ "in": "10m", "text": "Посмотреть итоги мониторинга Busy" })),
+            ]),
+            json!({ "content": "Готово: причина — Busy.spin и Busy.LOCK, отчёт сохранён, мониторинг и напоминание поставлены." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let (mcp, journal) = orchestration_servers().await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(&base_url), store.0.clone(), mcp).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+
+        let reply = agent.handle_request("Java-приложение тормозит: разберись, запиши отчёт и последи").await.unwrap();
+        assert!(reply.text.starts_with("Готово"), "{}", reply.text);
+
+        // Каждый вызов ушёл на свой сервер и в порядке зависимостей; ни один не
+        // отклонён сервером, то есть идентификаторы передавались верно.
+        let expected = [
+            ("java-profiler", "java_list_processes"),
+            ("java-profiler", "java_process_info"),
+            ("java-profiler", "java_profile"),
+            ("java-profiler", "java_thread_dump"),
+            ("documents", "save_markdown"),
+            ("documents", "summarize_markdown"),
+            ("documents", "save_summary"),
+            ("scheduler", "schedule_job"),
+            ("scheduler", "schedule_reminder"),
+        ];
+        let routed: Vec<(String, String)> = journal.lock().unwrap().iter().map(|(s, t, _)| (s.clone(), t.clone())).collect();
+        let expected: Vec<(String, String)> = expected.iter().map(|(s, t)| (s.to_string(), t.to_string())).collect();
+        assert_eq!(routed, expected);
+        let shown: Vec<(String, String)> =
+            reply.tool_calls.iter().map(|c| (c.server.clone().unwrap(), c.tool.clone())).collect();
+        assert_eq!(shown, expected, "в чат выводится та же трасса");
+        assert!(reply.tool_calls.iter().all(|c| !c.is_error), "{:?}", reply.tool_calls);
+
+        let requests = requests.lock().unwrap();
+        // 7 кругов вызовов + итоговый ответ: прежний предел в 6 кругов оборвал бы флоу.
+        assert_eq!(requests.len(), 8);
+        // Модель видит карту серверов с их инструкциями.
+        let routing = requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .find(|text| text.starts_with("Подключённые MCP-серверы"))
+            .expect("в запросе должна быть карта серверов");
+        for needle in ["### java-profiler", "### documents", "### scheduler", "Начните с java_list_processes", "это один флоу"] {
+            assert!(routing.contains(needle), "{needle}: {routing}");
+        }
+        // Идентификатор, который модель передала в summarize_markdown, пришёл ей
+        // в результате save_markdown кругом раньше.
+        let last_tool_result = |request: &serde_json::Value| {
+            request["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(last_tool_result(&requests[4]).contains("doc-0000000000000abc"));
+        assert!(last_tool_result(&requests[5]).contains("sum-0000000000000def"));
+    }
+
+    #[tokio::test]
+    async fn made_up_id_is_rejected_by_the_server_and_shown_to_the_model() {
+        use serde_json::json;
+        let (base_url, requests) = mock_llm(vec![
+            // Модель пропустила save_markdown и выдумала document_id.
+            tool_call("mcp__documents__summarize_markdown", json!({ "document_id": "doc-ffffffffffffffff" })),
+            json!({ "content": "Сначала нужно сохранить отчёт." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let (mcp, journal) = orchestration_servers().await;
+        let manager = AgentManager::with_mcp(LlmClient::for_tests_at(&base_url), store.0.clone(), mcp).unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+
+        let reply = agent.handle_request("сделай краткое содержание отчёта").await.unwrap();
+        assert_eq!(journal.lock().unwrap().len(), 1);
+        let call = &reply.tool_calls[0];
+        assert_eq!((call.server.as_deref(), call.is_error), (Some("documents"), true));
+        let requests = requests.lock().unwrap();
+        let tool_message = requests[1]["messages"].as_array().unwrap().last().unwrap().clone();
+        assert!(tool_message["content"].as_str().unwrap().contains("неизвестный идентификатор"));
     }
 
     #[test]

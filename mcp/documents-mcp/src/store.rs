@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMeta {
     pub id: String,
-    /// Абсолютный путь к исходному PDF.
+    /// Абсолютный путь к исходному PDF; пусто — документ из save_markdown.
     pub source_pdf: String,
     pub source_sha256: String,
     /// Копия Markdown для человека в `out/`.
@@ -135,7 +135,7 @@ impl Store {
     }
 
     pub fn document(&self, id: &str) -> Result<(DocumentMeta, String)> {
-        self.get(id, "doc-", "document_id из pdf_to_markdown")
+        self.get(id, "doc-", "document_id из pdf_to_markdown или save_markdown")
             .and_then(|(meta, text): (DocumentMeta, String)| verify(&meta.id, &meta.sha256, &text).map(|_| (meta, text)))
     }
 

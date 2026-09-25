@@ -1,5 +1,9 @@
 //! Три шага конвейера — три отдельных MCP-инструмента.
 //!
+//! Первый шаг бывает двух видов: `pdf_to_markdown` берёт текст из PDF,
+//! `save_markdown` — из аргумента (отчёт, который агент составил сам по
+//! данным других серверов). Дальше оба идут одной дорогой: `document_id`.
+//!
 //! Цепочку собирает не сервер, а модель: она планирует три вызова, а на
 //! исполнении делает их по очереди, передавая идентификатор из ответа одного
 //! шага в аргументы следующего. Каждый шаг возвращает `input_sha256` (хэш
@@ -118,6 +122,64 @@ pub async fn pdf_to_markdown(store: &Store, path: &str) -> Result<Converted> {
     })
 }
 
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Stored {
+    /// Идентификатор Markdown-документа — его принимает summarize_markdown.
+    pub document_id: String,
+    /// Markdown-файл для человека.
+    pub markdown_path: String,
+    /// SHA-256 сохранённого Markdown.
+    pub sha256: String,
+    pub title: Option<String>,
+    pub chars: usize,
+    /// Файл с таким именем уже был и перезаписан.
+    pub overwritten: bool,
+}
+
+/// Предел размера Markdown из аргумента — это отчёт, а не книга.
+const MAX_MARKDOWN_CHARS: usize = 200_000;
+
+/// Шаг 1 (вариант без PDF): готовый Markdown → документ.
+pub async fn save_markdown(store: &Store, name: &str, markdown: &str) -> Result<Stored> {
+    let markdown = markdown.trim();
+    if markdown.is_empty() {
+        bail!("Markdown пуст — нечего сохранять");
+    }
+    let chars = markdown.chars().count();
+    if chars > MAX_MARKDOWN_CHARS {
+        bail!("Markdown слишком длинный: {chars} символов (предел {MAX_MARKDOWN_CHARS})");
+    }
+    let stem = safe_stem(name)?;
+    let markdown = format!("{markdown}\n");
+    let markdown_path = store.out().join(format!("{stem}.md"));
+    let overwritten = markdown_path.exists();
+    tokio::fs::write(&markdown_path, &markdown)
+        .await
+        .with_context(|| format!("не удалось записать {}", markdown_path.display()))?;
+
+    let title = markdown.lines().find_map(|l| l.strip_prefix("# ")).map(|t| t.trim().to_string());
+    let meta = store.put_document(&markdown, |id, sha256| DocumentMeta {
+        id,
+        // Источник — сам Markdown: хэш «исходника» совпадает с хэшем документа.
+        source_pdf: String::new(),
+        source_sha256: sha256.clone(),
+        markdown_path: markdown_path.display().to_string(),
+        stem,
+        title,
+        pages: 0,
+        chars,
+        sha256,
+    })?;
+    Ok(Stored {
+        document_id: meta.id,
+        markdown_path: meta.markdown_path,
+        sha256: meta.sha256,
+        title: meta.title,
+        chars,
+        overwritten,
+    })
+}
+
 /// Шаг 2: Markdown → краткое содержание.
 pub async fn summarize_markdown(
     store: &Store,
@@ -164,10 +226,13 @@ pub async fn save_summary(store: &Store, summary_id: &str, file_name: Option<&st
     let path = store.out().join(format!("{stem}.summary.md"));
     let overwritten = path.exists();
 
+    // Документ из save_markdown не имеет PDF: его источник — сам Markdown.
+    let source = match document.source_pdf.as_str() {
+        "" => "source: save_markdown\n".to_string(),
+        pdf => format!("source_pdf: {}\nsource_sha256: {}\n", yaml_str(pdf), document.source_sha256),
+    };
     let header = format!(
-        "---\nsource_pdf: {}\nsource_sha256: {}\nmarkdown: {}\nmarkdown_sha256: {}\nsummary_id: {}\nsummary_sha256: {}\nmethod: {}\n---\n\n",
-        yaml_str(&document.source_pdf),
-        document.source_sha256,
+        "---\n{source}markdown: {}\nmarkdown_sha256: {}\nsummary_id: {}\nsummary_sha256: {}\nmethod: {}\n---\n\n",
         yaml_str(&document.markdown_path),
         document.sha256,
         summary_meta.id,
@@ -307,6 +372,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("document_id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn markdown_from_the_agent_goes_the_same_way() {
+        let store = temp_store("markdown");
+        let report = "# Отчёт: Busy тормозит\n\n## Причина\n\n- горячий цикл в Busy.spin\n- конкуренция за lock\n";
+        let stored = save_markdown(&store, "../busy-report.md", report).await.unwrap();
+        assert!(stored.markdown_path.ends_with("out/busy-report.md"), "{}", stored.markdown_path);
+        assert_eq!(stored.title.as_deref(), Some("Отчёт: Busy тормозит"));
+        assert!(!stored.overwritten);
+
+        let summarized = summarize_markdown(&store, &Summarizer::Extractive, &stored.document_id, &options())
+            .await
+            .unwrap();
+        assert_eq!(summarized.input_sha256, stored.sha256);
+        let saved = save_summary(&store, &summarized.summary_id, None).await.unwrap();
+        assert!(saved.path.ends_with("out/busy-report.summary.md"), "{}", saved.path);
+        let file = std::fs::read_to_string(&saved.path).unwrap();
+        assert!(file.contains("source: save_markdown\n"), "{file}");
+        assert!(!file.contains("source_pdf"), "{file}");
+
+        assert!(save_markdown(&store, "busy-report", report).await.unwrap().overwritten);
+        assert!(save_markdown(&store, "empty", "  \n").await.unwrap_err().to_string().contains("пуст"));
     }
 
     #[tokio::test]

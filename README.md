@@ -81,7 +81,7 @@ cargo run -p llm-cli -- agent task Аналитик approve   # -- примен�
 cargo run -p llm-cli -- agent task Аналитик reject "план неполный, распиши шаг 3"  # -- отклоняет, этап не меняется
 ```
 
-A live smoke test against a real local model (Qwen3 via LM Studio) surfaced the actual failure mode this closes: with `tool_choice: "auto"`, a capable-enough model will often just *ignore* the tools and answer the whole task directly in plain text on the first turn, tool descriptions notwithstanding. So the first round of every exchange is sent with `tool_choice: "required"` (LLM API call `chat_with_tools`, `require_tool_call` parameter) — the model *must* call one of the two tools before it's allowed to just talk; once it has (recording a step, asking a clarifying question via `expected_action`, or proposing a transition), the next round reverts to `"auto"` so it can reply in plain text normally. Intermediate tool-call/tool-result messages exist only within that one exchange (`core::RequestMessage`, distinct from the persisted `ChatMessage`) — they're never written to the branch history or SQLite, so none of the four context-management strategies above need to know tool calling exists, and a runaway loop is capped (`MAX_TOOL_ROUNDS`) with a final tools-off call to force a reply either way.
+A live smoke test against a real local model (Qwen3 via LM Studio) surfaced the actual failure mode this closes: with `tool_choice: "auto"`, a capable-enough model will often just *ignore* the tools and answer the whole task directly in plain text on the first turn, tool descriptions notwithstanding. So the first round of every exchange is sent with `tool_choice: "required"` (LLM API call `chat_with_tools`, `require_tool_call` parameter) — the model *must* call one of the two tools before it's allowed to just talk; once it has (recording a step, asking a clarifying question via `expected_action`, or proposing a transition), the next round reverts to `"auto"` so it can reply in plain text normally. Intermediate tool-call/tool-result messages exist only within that one exchange (`core::RequestMessage`, distinct from the persisted `ChatMessage`) — they're never written to the branch history or SQLite, so none of the four context-management strategies above need to know tool calling exists, and a runaway loop is capped (`MAX_TOOL_ROUNDS`, 24 rounds — enough for a long multi-server flow, see *Orchestration* below) with a final tools-off call to force a reply either way; that call tells the model the limit was hit, so it reports which steps are done and which are left instead of pretending the flow finished.
 
 **Transition journal.** Every attempt to change the stage is recorded in SQLite (`shared_task_transitions`) with who made it (`model`/`human`), what came of it (`applied`, `proposed`, `approved`, `rejected`, `refused`) and why — including refused jumps, approvals refused because of a pause or a task invariant, and a pending proposal superseded by a manual `advance` (a human moving the stage by hand drops the model's stale proposal, so a late `approve` can't drag the task back). The last 20 entries come with `TaskState::transitions`, survive pause and restart, and are shown by `agent task <name> show`, the TUI memory screen and a collapsible "Журнал переходов" under the stage badge in the web chat.
 
@@ -279,6 +279,7 @@ cargo run -p documents-mcp         # http://127.0.0.1:8093/mcp (DOCUMENTS_MCP_AD
 |---|---|---|
 | `list_pdfs` | — | PDFs in `documents/inbox/` and results in `documents/out/` |
 | `pdf_to_markdown` | `path` — absolute, `~/…`, or just a file name from the inbox | `document_id`; writes `out/<name>.md` |
+| `save_markdown` | `name`, `markdown` — a document the agent wrote itself (e.g. a report built from other servers' results) | `document_id`; writes `out/<name>.md` — the alternative first step, the rest of the chain is the same |
 | `summarize_markdown` | `document_id`, optional `max_words` (250), `focus` | `summary_id` and the summary text |
 | `save_summary` | `summary_id`, optional `file_name` | path to `out/<name>.summary.md` |
 
@@ -329,6 +330,49 @@ llm-cli agent daemon                      # or just keep the web UI / TUI open
 ```
 
 Then ask any agent: *"Следи за JVM <pid>: раз в 30 секунд снимай занятую кучу, и напомни через 10 минут проверить отчёт"* — it calls `schedule_job(action="mcp_tool", params={"server": "java-profiler", "tool": "java_process_info", "arguments": {"pid": …}}, every="30s", extract={"heap_used_kb": …})` and `schedule_reminder`. From there the scheduler collects on its own, the reminder arrives in the duty agent's chat on time, and every 30 minutes the duty agent posts a summary like *"Busy heap: 3 runs, no errors; used grew 275 → 916 MB (+233%) — looks like a leak or a large allocation burst"*.
+
+### Orchestration: one flow across several MCP servers
+
+Each own server does one kind of thing; a real request usually needs several of them. Nothing routes on the server side: the **agent** splits the request into steps, picks a server for each one, and calls the tools in the order their data depends on, taking every id from a result it already has. What the client does to make that work (`core/src/mcp.rs`, `core/src/agent.rs`):
+
+- **A map of the servers in the prompt.** A tool description says what the tool does, not how it fits with tools of *another* server. Next to the tools the model now gets a system block listing every connected server — its `description` from `mcp.json`, its tools, and the **instructions it sent in `initialize`** (the order of its steps, which id goes where). Before, the client dropped those instructions, so the documents chain was only known from individual tool descriptions. With more than one server the block also states the flow rules: decompose first, one server per step, call in dependency order, never invent ids (`pid`, `document_id`, `summary_id`, `job_id` come only from results of calls already made), independent steps may go in one round, fix a failed call instead of skipping it, and end with what was done on each server.
+- **Room for a long flow.** A round is one model reply; a dependent chain needs a round per link. The old limit of 6 rounds cut the scenario below in half, so it is now 24. When it is hit, the model is told so and reports what is done and what is left.
+- **Routing itself** is by the qualified name `mcp__<server>__<tool>`: every call goes to its server, and the chat shows `server · tool(args) → result` rows in call order, which is the trace of the flow.
+- **The documents server accepts the agent's own text** (`save_markdown`), so a report written from profiler data can go through the same summary chain as a PDF.
+- **Second-level routing.** `scheduler`'s `mcp_tool` action calls a tool of another server by its `mcp.json` name — the agent routes to `scheduler`, and `scheduler` routes to `java-profiler` on every run.
+
+#### Scenario: "why is the Java service slow — find out, write it up, keep an eye on it"
+
+Start the three servers and the demo JVM:
+
+```bash
+cargo run -p java-profiler-mcp & cargo run -p scheduler-mcp & cargo run -p documents-mcp &
+java mcp/java-profiler-mcp/demo/Busy.java &
+```
+
+Then ask an agent (no server or tool names in the prompt — choosing them is the agent's job):
+
+> Какое-то Java-приложение на этой машине тормозит. Найди его и выясни причину: CPU, память, блокировки. Запиши отчёт с цифрами как «busy-report», сделай и сохрани его краткое содержание. Поставь мониторинг заполненности кучи этого процесса каждые 30 секунд и напомни мне через 10 минут посмотреть итоги.
+
+Expected flow — 9 calls on 3 servers, each step feeding the next:
+
+| # | Server | Tool | Input comes from |
+|---|---|---|---|
+| 1 | java-profiler | `java_list_processes` | — → `pid` of `Busy` |
+| 2 | java-profiler | `java_process_info` | `pid` (1) → heap, GC |
+| 3 | java-profiler | `java_profile` | `pid` (1) → hot methods, allocations, contention |
+| 4 | java-profiler | `java_thread_dump` | `pid` (1) → BLOCKED threads and the monitor |
+| 5 | documents | `save_markdown` | report written from 2–4 → `document_id` |
+| 6 | documents | `summarize_markdown` | `document_id` (5) → `summary_id` |
+| 7 | documents | `save_summary` | `summary_id` (6) → `out/busy-report.summary.md` |
+| 8 | scheduler | `schedule_job` | `action: mcp_tool`, `server: java-profiler`, `tool: java_process_info`, `pid` (1), `every: 30s`, `extract: {heap_used_kb: {path: heap, regex: "used (\\d+)K"}}` |
+| 9 | scheduler | `schedule_reminder` | `in: 10m` |
+
+Steps 2–3 depend only on the `pid` and may come in one round. Ten minutes later the reminder arrives (as an event for an agent on duty, or ask the agent "что с мониторингом Busy?"), and the flow closes on the scheduler: `get_events` → `get_summary(job_id)` (heap min/max/trend over the runs) → `cancel_job` → `ack_events`.
+
+With an active task (the web UI starts one on the first message) the model first puts these calls into the plan, runs them after **Утвердить**, and can re-check the files in `validation`; without a task it runs them straight away.
+
+**Checking choice and order without a model.** `core` has a scenario test (`long_flow_routes_calls_across_three_servers_in_dependency_order`): three fake MCP servers with a shared call journal and a scripted model. Every fake tool accepts only the id the previous step (on another server) returned — `summarize_markdown` rejects any `document_id` but the one `save_markdown` gave, `schedule_job` requires `server: java-profiler` and the `pid` from the process list, `save_markdown` requires profiler data in the report. The test asserts the journal is exactly the 9 calls above on the right servers in that order, none rejected; the chat trace matches the journal; the flow took 7 tool rounds (more than the old limit); the server map with each server's instructions is in the request; and each id the model passed was in the result it had just received. A second test checks that a made-up id comes back to the model as a server error, not a silent success. The same chain can be walked by hand on the real servers: `llm-cli mcp call java-profiler java_list_processes '{}'`, then `java_profile` with the pid, `documents save_markdown`, and so on.
 
 ## Installing Rust
 
@@ -499,7 +543,7 @@ mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
   scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
-  documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/markdown.rs — PDF text to Markdown, src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the three steps, demo/mcp-report.pdf — sample PDF
+  documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/markdown.rs — PDF text to Markdown, src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template

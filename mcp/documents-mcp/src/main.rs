@@ -2,9 +2,9 @@
 //!
 //! Запуск: `cargo run -p documents-mcp` — сервер слушает
 //! `http://127.0.0.1:8093/mcp` (адрес меняется переменной
-//! `DOCUMENTS_MCP_ADDR`). Три инструмента — три звена одной цепочки:
-//! `pdf_to_markdown` получает данные, `summarize_markdown` их обрабатывает,
-//! `save_summary` сохраняет результат. Цепочку собирает модель: вызывает их
+//! `DOCUMENTS_MCP_ADDR`). Три звена одной цепочки: `pdf_to_markdown` (или
+//! `save_markdown` — для текста, который агент составил сам) получает данные,
+//! `summarize_markdown` их обрабатывает, `save_summary` сохраняет результат. Цепочку собирает модель: вызывает их
 //! по очереди, передавая идентификатор из ответа одного шага следующему;
 //! данные сверяются по SHA-256 (см. [`store`], [`steps`]).
 
@@ -28,7 +28,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use steps::{Converted, Saved, Summarized};
+use steps::{Converted, Saved, Stored, Summarized};
 use store::Store;
 use summarize::{Options, Summarizer, DEFAULT_MAX_WORDS};
 
@@ -43,8 +43,17 @@ struct ConvertParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct MarkdownParams {
+    /// Имя документа без каталога, например `busy-report`: файл будет `<имя>.md`,
+    /// краткое содержание — `<имя>.summary.md`.
+    name: String,
+    /// Полный текст документа в Markdown.
+    markdown: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SummarizeParams {
-    /// document_id из ответа pdf_to_markdown.
+    /// document_id из ответа pdf_to_markdown или save_markdown.
     document_id: String,
     /// Предельная длина краткого содержания в словах, по умолчанию 250.
     #[serde(default)]
@@ -121,9 +130,20 @@ impl PipelineServer {
     }
 
     #[tool(
+        name = "save_markdown",
+        description = "Шаг 1 конвейера для текста без PDF: сохраняет готовый Markdown (например, отчёт, \
+            который вы составили по результатам инструментов других серверов) в <имя>.md в каталоге \
+            результатов и возвращает document_id — передайте его в summarize_markdown, как после \
+            pdf_to_markdown."
+    )]
+    async fn save_markdown(&self, Parameters(p): Parameters<MarkdownParams>) -> Result<Json<Stored>, String> {
+        steps::save_markdown(&self.store, &p.name, &p.markdown).await.map(Json).map_err(error_text)
+    }
+
+    #[tool(
         name = "summarize_markdown",
         description = "Шаг 2 конвейера: краткое содержание Markdown-документа по его document_id (из \
-            pdf_to_markdown): суть одним предложением и ключевые пункты. Возвращает текст и summary_id — \
+            pdf_to_markdown или save_markdown): суть одним предложением и ключевые пункты. Возвращает текст и summary_id — \
             передайте его в save_summary. Сам текст в аргументы не переносите: шаги связаны \
             идентификаторами, и input_sha256 этого шага равен sha256 предыдущего."
     )]
@@ -155,11 +175,12 @@ impl ServerHandler for PipelineServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("documents-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Конвейер обработки PDF из трёх инструментов, которые вызываются по очереди: \
-                 1) pdf_to_markdown(path) → document_id; 2) summarize_markdown(document_id) → summary_id; \
+                "Конвейер обработки документов из трёх инструментов, которые вызываются по очереди: \
+                 1) pdf_to_markdown(path) → document_id (или save_markdown(name, markdown) → document_id, \
+                 если документ — ваш собственный текст, а не PDF); 2) summarize_markdown(document_id) → summary_id; \
                  3) save_summary(summary_id) → путь к файлу. Каждый следующий шаг получает \
                  идентификатор из ответа предыдущего, а не текст; в плане назовите все три вызова и что \
-                 куда передаётся. Без пути к файлу начните с list_pdfs.",
+                 куда передаётся. PDF без пути к файлу — начните с list_pdfs.",
             )
     }
 }
