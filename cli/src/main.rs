@@ -165,6 +165,10 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("jobs") {
         return run_jobs_cli(&args[1..]).await;
     }
+    // Индекс документов: нужна только модель эмбеддингов (LLM_EMBEDDING_*).
+    if args.first().map(String::as_str) == Some("rag") {
+        return run_rag_cli(&args[1..]).await;
+    }
 
     let client = LlmClient::from_env()?;
 
@@ -230,6 +234,25 @@ async fn run_jobs_cli(args: &[String]) -> Result<()> {
     mcp.connect_all().await;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     println!("{}", llm_core::automation::run_jobs_command(&mcp, &args).await?);
+    Ok(())
+}
+
+/// `llm-cli rag ...` — индекс документов (см. llm_core::rag): те же команды,
+/// что на экране «Индекс» TUI. Ход долгих операций — в stderr одной строкой.
+async fn run_rag_cli(args: &[String]) -> Result<()> {
+    let cfg = llm_core::rag::RagConfig::from_env();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let shown = std::sync::atomic::AtomicBool::new(false);
+    let progress = |line: String| {
+        shown.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprint!("\r\x1b[2K{line}");
+        let _ = io::stderr().flush();
+    };
+    let result = llm_core::rag::run_command(&cfg, &args, &progress).await;
+    if shown.load(std::sync::atomic::Ordering::Relaxed) {
+        eprint!("\r\x1b[2K");
+    }
+    println!("{}", result?);
     Ok(())
 }
 

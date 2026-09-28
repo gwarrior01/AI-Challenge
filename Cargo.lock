@@ -475,7 +475,6 @@ dependencies = [
  "axum",
  "futures-util",
  "llm-core",
- "pdf-extract",
  "rmcp",
  "serde",
  "serde_json",
@@ -1206,11 +1205,13 @@ dependencies = [
  "anyhow",
  "futures-util",
  "http",
+ "pdf-extract",
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

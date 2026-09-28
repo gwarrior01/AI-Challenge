@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use rmcp::schemars::{self, JsonSchema};
 use serde::Serialize;
 
-use crate::markdown;
+use llm_core::pdf;
 use crate::store::{safe_stem, sha256_hex, DocumentMeta, Store, SummaryMeta};
 use crate::summarize::{Options, Summarizer};
 
@@ -84,13 +84,13 @@ pub async fn pdf_to_markdown(store: &Store, path: &str) -> Result<Converted> {
     let bytes = tokio::fs::read(&pdf_path).await.with_context(|| format!("не удалось прочитать {}", pdf_path.display()))?;
     let source_sha256 = sha256_hex(&bytes);
 
-    let (pages, extractor) = extract_pages(&pdf_path, bytes).await?;
+    let (pages, extractor) = pdf::extract_pages(&pdf_path, bytes).await?;
     if pages.iter().all(|p| p.trim().is_empty()) {
         bail!("в PDF нет текстового слоя (похоже на скан) — распознавание текста (OCR) не поддерживается");
     }
 
     let stem = safe_stem(&file_stem(&pdf_path))?;
-    let converted = markdown::pages_to_markdown(&pages, &stem);
+    let converted = pdf::pages_to_markdown(&pages, &stem);
     let markdown_path = store.out().join(format!("{stem}.md"));
     tokio::fs::write(&markdown_path, &converted.markdown)
         .await
@@ -258,42 +258,6 @@ pub async fn save_summary(store: &Store, summary_id: &str, file_name: Option<&st
     })
 }
 
-/// Текст PDF по страницам. Основной способ — `pdftotext` из poppler, если он
-/// есть в PATH: на свёрстанных документах (кернинг, разрядка) он собирает
-/// слова правильно, а `pdf-extract` вставляет пробелы внутрь слов («К ратки й
-/// обзор»). Без poppler — `pdf-extract`, чистый Rust.
-async fn extract_pages(path: &Path, bytes: Vec<u8>) -> Result<(Vec<String>, &'static str)> {
-    let output = tokio::process::Command::new("pdftotext")
-        .args(["-enc", "UTF-8"])
-        .arg(path)
-        .arg("-")
-        .kill_on_drop(true)
-        .output()
-        .await;
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // Страницы разделены \f, после последней — тоже \f.
-            let mut pages: Vec<String> = text.split('\x0C').map(str::to_string).collect();
-            if pages.len() > 1 && pages.last().is_some_and(|p| p.trim().is_empty()) {
-                pages.pop();
-            }
-            return Ok((pages, "pdftotext"));
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("не удалось разобрать PDF (pdftotext): {}", stderr.trim());
-        }
-        Err(_) => {} // pdftotext не установлен
-    }
-    // pdf-extract на повреждённых файлах иногда паникует — в отдельной задаче
-    // паника становится обычной ошибкой, а не падением сервера.
-    let pages = tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem_by_pages(&bytes))
-        .await
-        .map_err(|e| anyhow::anyhow!("разбор PDF аварийно завершился ({e}) — файл повреждён или в неподдерживаемом формате"))?
-        .map_err(|e| anyhow::anyhow!("не удалось разобрать PDF: {e}"))?;
-    Ok((pages, "pdf-extract"))
-}
 
 fn file_stem(path: &Path) -> String {
     path.file_stem().and_then(|s| s.to_str()).unwrap_or("document").to_string()

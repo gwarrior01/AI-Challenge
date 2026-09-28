@@ -374,6 +374,67 @@ With an active task (the web UI starts one on the first message) the model first
 
 **Checking choice and order without a model.** `core` has a scenario test (`long_flow_routes_calls_across_three_servers_in_dependency_order`): three fake MCP servers with a shared call journal and a scripted model. Every fake tool accepts only the id the previous step (on another server) returned — `summarize_markdown` rejects any `document_id` but the one `save_markdown` gave, `schedule_job` requires `server: java-profiler` and the `pid` from the process list, `save_markdown` requires profiler data in the report. The test asserts the journal is exactly the 9 calls above on the right servers in that order, none rejected; the chat trace matches the journal; the flow took 7 tool rounds (more than the old limit); the server map with each server's instructions is in the request; and each id the model passed was in the result it had just received. A second test checks that a made-up id comes back to the model as a server error, not a silent success. The same chain can be walked by hand on the real servers: `llm-cli mcp call java-profiler java_list_processes '{}'`, then `java_profile` with the pid, `documents save_markdown`, and so on.
 
+### RAG: document indexing
+
+`core/src/rag/` builds a local index of documents for retrieval: corpus → chunks (three strategies) → embeddings → SQLite, with metadata and document versions. The same commands run on the TUI's **F6** screen and as `llm-cli rag …`; the web UI has a **RAG** tab (below):
+
+```bash
+export LLM_EMBEDDING_MODEL=text-embedding-bge-m3   # required; URL/key fall back to LLM_API_URL/LLM_API_KEY
+llm-cli rag index            # or: index fixed | structure | sentence
+llm-cli rag search -s structure -k 5 "how are MCP calls gated by task stage"
+llm-cli rag docs             # documents, current version, git commit, chunks per strategy
+llm-cli rag versions README.md
+llm-cli rag compare          # writes rag/compare.md
+llm-cli rag add ~/Downloads/report.pdf     # vectorize one file (outside the corpus → copied to rag/uploads/)
+llm-cli rag add report.pdf fixed size=800 overlap=100   # one strategy with its own parameters
+llm-cli rag remove rag/uploads/report.pdf  # drop a document from the index (an uploaded one — with its file)
+```
+
+**Corpus.** By default the corpus is empty: the index holds only what was added explicitly — uploaded in the web UI or via `add` — and `index` re-checks just the uploads folder. `RAG_CORPUS` adds comma-separated files and folders relative to the working directory; the comparison in `rag/compare.md` was made with `RAG_CORPUS=README.md,core/src,mcp,invariants,profiles,documents/inbox`: this README (~95 KB, about 30 pages on its own), the core and the own MCP servers' Rust code, the invariant and profile files, and the PDFs (`mcp/documents-mcp/demo/mcp-report.pdf` and whatever is in the inbox). Folders are walked recursively for `.md`, `.txt`, `.rs`, `.pdf`; `target`, `testdata` and hidden folders are skipped. PDF goes through the same PDF → Markdown converter as `documents-mcp` (it moved to `core/src/pdf.rs` so both use one copy), so a PDF gets headings and is chunked like Markdown.
+
+**Chunking strategies** (`core/src/rag/chunking.rs`). A chunk is a byte range of the document, so its text is always a verbatim slice with exact start and end lines.
+
+| Strategy | How it cuts | `section` |
+|---|---|---|
+| `fixed` | 1200-character window, 200 overlap; the cut moves back to whitespace so words stay whole. Knows nothing about structure | the section the chunk starts in |
+| `structure` | Markdown/PDF by headings; Rust by top-level items (`fn`, `impl`, `struct`, …) with their doc comments and attributes, big `impl`/`mod`/`trait` blocks further by their methods. Sections under 300 characters merge with the next one (a section that is only a heading line always does); sections over 2000 are split at paragraphs, a code block stays whole | full path: `MCP: external tools for agents › Own MCP server: documents`, `impl LlmClient › fn chat`; merged siblings — `impl Foo › fn a, fn b` |
+| `sentence` | sliding window of 5 sentences with step 3 (2 overlap), capped at 1500 characters. Headings, list items, table rows are units of their own; a fenced code block is one unit (or its lines if it is long); abbreviations (`т.е.`, `e.g.`, `см.`) and `1.2` do not end a sentence. In Rust code the unit is a line (16 lines, step 12). A window does not cross a section boundary in text | the section of the window |
+| `parent` | parent-child. The **child** — 1 sentence (`child_sentences`; in Rust code `child_lines`, 3 lines) — is what gets embedded, so a match is as precise as a single sentence. The **parent** — the paragraph the child is in, with the headings right above it, at most 2000 characters (`parent_chars`; a longer paragraph becomes several parents, its sentences packed in order) — is what search hands over as context. Headings are never children on their own. Stored per chunk as `context` (+ its bytes and lines). Search keeps only the best child of each parent, so top-k is k different paragraphs, not one paragraph k times; `compare` checks the parent, since that is what the model would read | the section of the paragraph |
+
+**Parameters are chosen per document.** Every number above is only a default: `fixed` — `size`, `overlap`; `structure` — `min_chars`, `max_chars`; `sentence` — `window`, `stride`, `window_chars`, `code_window`, `code_stride`; `parent` — `child_sentences`, `child_lines`, `parent_chars` (ranges and cross-checks such as `overlap ≤ size/2`, `stride ≤ window`, chunks up to 8000 characters are in `ChunkParams` in `chunking.rs`). They are set on upload in the web UI or as `name=value` after `add`. The parameters a version was cut with are stored in the `chunkings` table and shown with its chunks. Adding the same content again with other parameters re-cuts that version in place (no new version — the document didn't change) and drops vectors nothing uses any more; with the same parameters nothing happens. A full `index` never re-cuts and never adds strategies a document didn't have: a new version of a document is cut with the strategies and parameters of its previous version; only a document new to the index gets all the requested strategies. One document can carry several cuts at once — add another strategy by uploading the same file again with it, or with **Нарезать стратегией …** in the viewer (`POST /api/rag/rechunk`, parameters from the upload form); the version stays the same, other cuts are kept, and search shows each strategy's results side by side.
+
+**Metadata of every chunk:** `chunk_id` (`README.md@v2/structure/0041` — document, version, strategy, position), `source`, `title` (first `#` heading, first `//!` line, or file name), `section`, `strategy`, start/end line and byte, length in characters, token estimate, `content_sha256`, the document version (`doc_version`, the file's `sha256`, `git_commit`, uncommitted-changes flag) and `embedding_model`.
+
+**Versions.** On every `index` each file's SHA-256 is compared with the current version of that document. Changed → a new version N+1 is added and chunked, the previous one becomes `superseded`: it leaves search but stays in the index — `search --source README.md --version 1 …` still searches it — until `prune` deletes it. A file gone from the corpus becomes `removed`. Each version records the last git commit that touched the file (`git log -1 -- <file>`) and whether the working copy has uncommitted changes, so it is clear which state of the document the vectors were made from. Vectors are stored by a key of *model + chunk text*, so a new version only embeds the chunks whose text actually changed; `index` is resumable — vectors are saved per batch, a version's chunks in one transaction.
+
+**Embeddings** (`core/src/rag/embed.rs`) — `POST {url}/embeddings` of any OpenAI-compatible server (LM Studio, Ollama, OpenAI). The model is only taken from `LLM_EMBEDDING_MODEL`, never defaulted: vectors of different models are not comparable, so an index built by one model refuses to be searched or extended with another (`reset` and re-index). Vectors are L2-normalized; search is cosine similarity by brute force over the strategy's chunks — a few thousand vectors take milliseconds, no FAISS needed.
+
+**Index** (`core/src/rag/store.rs`, `rag/index.db`, git-ignored) — one SQLite file:
+
+| Table | Holds |
+|---|---|
+| `documents` | `source` (path in the corpus — the document's id), `kind` (`markdown` / `rust` / `text`) |
+| `versions` | `version` 1, 2, …, `title`, file `sha256`, `git_commit`, `git_dirty`, `bytes`, `mtime`, `indexed_at`, `status` (`current` / `superseded` / `removed`) and the full `text` the chunks were cut from (for the document map; an index built before this column existed is migrated in place, its old versions just have no map) |
+| `chunks` | `chunk_id`, version, `strategy`, `ord`, `section`, start/end line and byte, `char_len`, `tokens_est`, `content_sha256`, `vector_key`, `embedding_model`, `clean_end` / `splits_code` flags, `text` (what is embedded); for `parent` also `context` — the parent paragraph — with its start/end byte and line (columns added in place to an older index) |
+| `chunkings` | per version and strategy: the parameters it was cut with (JSON), when |
+| `vectors` | `vector_key` (sha256 of model + prefix + text) → `vector`, a BLOB of little-endian f32, L2-normalized; bge-m3: 1024 × 4 = 4 KB each |
+| `meta` | model and dimension of the index, last indexing time, the last run and last full build of each strategy |
+
+**Uploads.** `rag/uploads/` (`RAG_UPLOADS`, git-ignored) is always part of the corpus, whatever `RAG_CORPUS` says — otherwise the next full `index` would take uploaded files for deleted ones. Uploading a file with the same name again makes it the document's next version. `add <path>` indexes a file that is inside the corpus in place and copies any other file into `rag/uploads/`; `remove` deletes all versions, chunks and now-unreferenced vectors of a document, and for an uploaded one the file too (a corpus file stays on disk, so the next full `index` brings it back — the command says so).
+
+**Web: the RAG tab** (`web/src/rag.rs`, `/api/rag/*`):
+
+- **Upload** — drag a `.md`/`.txt`/`.rs`/`.pdf` (up to 50 MB) onto the drop zone, pick **one** strategy and edit its parameters (the fields come with the defaults and ranges from the server; a wrong combination disables the button and says why; «вернуть по умолчанию» resets them), **Векторизовать**. The body of `POST /api/rag/upload?name=…&strategy=fixed&size=800&overlap=100` is the file itself; indexing runs in the background (one job per server), the page polls `GET /api/rag/job` and shows the file name with a progress bar from `«parent: эмбеддинги 32/120 (text-embedding-bge-m3)»`, then how many vectors were saved (new and from the cache) and chunks cut, and opens the document. Documents are shown by file name; the full path is in the tooltip. **Проиндексировать корпус** runs a full `index` the same way.
+- **Browsing the index** — the overview (model, dimension, documents, versions, vectors, file size, per-strategy chunk counts and lengths), the document list (version, status, uploaded, chunks per strategy, filter by path), and for the selected document: version picker (superseded versions stay browsable), strategy switch, and two views:
+  - the line above both views shows the parameter values of the selected strategy's cut (highlighted when they differ from the defaults); strategies the version wasn't cut with are dimmed, and choosing one offers to cut the document with it right there;
+  - for `parent`, every chunk card and search hit also shows the parent that goes into the context, with the matched child highlighted in it; on the map children are shaded strongly and the rest of their parent lightly, one color per parent; hovering a child pops up its parent (the text that goes into the context) with the child highlighted, and picking a child frames its whole parent;
+  - **Карта документа** — the full text of the version with every chunk shaded (alternating colors), overlaps hatched, `#N` at each chunk start, gaps left plain; clicking text selects the chunk (clicking an overlap again cycles through the chunks covering it) and links to it in the list;
+  - **Чанки** — cards with `chunk_id`, section path, lines, length, token estimate, the "обрыв фразы"/"разрез кода" flags, text (click to expand), and **Вектор** — dimension, norm and first values of the stored vector; 50 per page.
+- **Search** — a query over current versions, top-k per strategy side by side with scores (only strategies something is cut with); clicking a hit opens that chunk on the document map.
+- **Remove** — **Удалить из индекса** (asks for a second click), same as `remove`.
+
+**Comparison** (`compare`, report in [`rag/compare.md`](rag/compare.md)). Chunk statistics per strategy — count, length min/median/p95/max, how many chunks end mid-sentence, how many cut a code block, how many have a section, embedding time — and retrieval quality on 14 control questions from `rag/eval.json`: each names a fragment of the answer and the document it was taken from; a chunk counts as found if it contains the whole fragment — from any document, since the same fact in a code doc comment is a right answer too. Embedding time and count are taken from the last full build of each strategy. The report gives hit@1/3/5, MRR@5, a per-question table and the questions where the strategies disagreed, with each strategy's top chunk.
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -406,6 +467,11 @@ Optional:
 - `LLM_SLIDING_WINDOW_SIZE` — optional. How many of the most recent user messages (exchanges) named agents keep when their `context_strategy` is `sliding-window` or `facts` (see above) — an individual agent can override this via `--window-size`/the web UI's window-size field. Read once per process and cached; if unset, empty, or not a positive integer, defaults to `6`.
 - `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` — optional, but both must be set together to turn on the cost *estimate* for named agents when the provider doesn't send a real `usage.cost` (see "Cost tracking for named agents" above): price per 1,000,000 input/output tokens, in whatever currency `LLM_PRICE_CURRENCY` names. If either is unset or not a non-negative number, no estimate is computed — cost is then shown only where the provider supplies `usage.cost` directly, or not at all.
 - `LLM_PRICE_CURRENCY` — optional. Currency symbol/code shown next to cost figures (both real and estimated, see above), e.g. `$`, `€`, `₽`. Defaults to `$`.
+- `LLM_EMBEDDING_MODEL` — required only for the document index (see "RAG: document indexing" above): the embedding model, e.g. `text-embedding-bge-m3` in LM Studio. No default on purpose — vectors of different models can't be mixed.
+- `LLM_EMBEDDING_API_URL` / `LLM_EMBEDDING_API_KEY` — optional. Where to send `/embeddings`, if not the chat API (`LLM_API_URL`/`LLM_API_KEY` are used otherwise).
+- `LLM_EMBEDDING_BATCH` — optional. Texts per `/embeddings` request, default `32`.
+- `LLM_EMBEDDING_DOC_PREFIX` / `LLM_EMBEDDING_QUERY_PREFIX` — optional. Prefixes for models that expect them (`search_document: ` / `search_query: ` for nomic, `passage: ` / `query: ` for e5); bge-m3 needs none.
+- `RAG_CORPUS`, `RAG_DB_PATH`, `RAG_EVAL`, `RAG_REPORT`, `RAG_UPLOADS` — optional. The corpus (comma-separated paths, empty by default — only uploads; see above), the index file (`rag/index.db`), the control questions (`rag/eval.json`), the comparison report (`rag/compare.md`) and the folder for uploaded documents (`rag/uploads`, always indexed).
 
 Set them directly in your shell:
 
@@ -537,15 +603,16 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs)
-cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents and `mcp` subcommand for MCP servers
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI)
+cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents, `mcp` subcommand for MCP servers and `rag` subcommand for the document index
 mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
   scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
-  documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/markdown.rs — PDF text to Markdown, src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
-web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page
+  documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
+web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page, src/rag.rs: the RAG tab's API
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template
+rag/              — eval.json — control questions for comparing chunking strategies, compare.md — the comparison report (index.db — the index itself, uploads/ — uploaded documents; both git-ignored)
 invariants/       — hard invariant markdown files (see "Invariants: hard rules the assistant refuses to break" above), one per rule — this repo ships stack.md/storage.md/secrets.md as filled-in examples
 ```

@@ -1790,6 +1790,388 @@
     padding: 3px 8px;
   }
 
+  /* ---------- Вкладка «RAG» ---------- */
+
+  #view-rag {
+    padding: 16px 24px;
+    gap: 12px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+
+  .rag-top {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+  }
+
+  .rag-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .rag-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .rag-card h4 { margin: 0; font-size: 13px; }
+  .rag-actions { display: flex; gap: 6px; }
+  .rag-actions .settings-btn { font-size: 11px; padding: 4px 9px; }
+
+  .rag-stats { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); }
+  .rag-stats b { color: var(--text); font-weight: 600; }
+
+  .rag-drop {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .rag-drop:hover, .rag-drop.over { border-color: var(--accent); background: rgba(108, 141, 255, 0.06); }
+  .rag-drop.has-file { color: var(--text); border-style: solid; }
+
+  .rag-upload-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  /* Подпись, поле и подсказка каждого параметра — в общих строках сетки
+     (subgrid): поля стоят на одной линии, даже если подписи разной длины. */
+  .rag-params { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); column-gap: 8px; row-gap: 3px; }
+  .rag-param { display: grid; grid-row: span 3; grid-template-rows: subgrid; align-items: end; margin-bottom: 5px; }
+  .rag-param small { align-self: start; }
+  .rag-param span { color: var(--muted); font-size: 11px; line-height: 1.3; }
+  .rag-param input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    width: 100%;
+  }
+  .rag-param input:focus { outline: none; border-color: var(--accent); }
+  .rag-param.changed input { border-color: rgba(108, 141, 255, 0.6); }
+  .rag-param.invalid input { border-color: var(--error); }
+  .rag-param small { color: var(--muted); font-size: 10.5px; }
+  .rag-params-foot { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+  .rag-params-foot:has(#rag-params-reset[hidden]):has(#rag-params-desc:empty) { display: none; }
+  .rag-params-foot .card-hint.bad { color: var(--error); }
+  .rag-link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 11px; padding: 0; }
+
+  .rag-primary {
+    margin-left: auto;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    border: none;
+    border-radius: 8px;
+    color: #fff;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  .rag-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .rag-job { display: flex; flex-direction: column; gap: 6px; }
+  .rag-job[hidden], .rag-bar[hidden] { display: none; }
+  .rag-job-line { display: flex; justify-content: space-between; gap: 10px; }
+  .rag-bar { height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+  .rag-bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.3s ease; }
+  .rag-bar-fill.indeterminate { width: 30%; animation: rag-slide 1.2s ease-in-out infinite; }
+  @keyframes rag-slide { from { transform: translateX(-100%); } to { transform: translateX(330%); } }
+  .rag-job-summary {
+    margin: 0;
+    max-height: 64px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .rag-job.error .rag-job-summary { color: var(--error); }
+
+  .rag-search { display: flex; gap: 8px; }
+  .rag-search input, .rag-search select, #rag-docs-filter, .rag-detail select {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 7px 10px;
+    font-size: 12px;
+  }
+  .rag-search input { flex: 1; min-width: 0; }
+  .rag-search input:focus, #rag-docs-filter:focus { outline: none; border-color: var(--accent); }
+  .rag-search .rag-primary { margin-left: 0; }
+
+  .rag-layout {
+    flex: 1 0 560px;
+    min-height: 560px;
+    display: grid;
+    grid-template-columns: 300px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .rag-docs {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+  }
+  .rag-docs-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-right: 2px;
+  }
+  .rag-doc {
+    text-align: left;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 7px 9px;
+    color: var(--text);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+  }
+  .rag-doc:hover { border-color: var(--accent); }
+  .rag-doc.active { border-color: var(--accent); background: var(--panel-2); }
+  .rag-doc-source { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .rag-doc-meta { display: flex; flex-wrap: wrap; gap: 4px; color: var(--muted); }
+
+  .rag-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 6px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 10.5px;
+    white-space: nowrap;
+  }
+  .rag-tag.ok { color: var(--ok); border-color: rgba(74, 222, 128, 0.35); }
+  .rag-tag.warn { color: var(--warn); border-color: rgba(251, 191, 36, 0.35); }
+  .rag-tag.bad { color: var(--error); border-color: rgba(255, 107, 107, 0.35); }
+  .rag-tag.accent { color: var(--accent); border-color: rgba(108, 141, 255, 0.4); }
+
+  .rag-detail {
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .rag-empty { margin: auto; max-width: 420px; text-align: center; line-height: 1.6; }
+
+  .rag-doc-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+  .rag-doc-head h3 { margin: 0 0 4px; font-size: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .rag-doc-head .card-hint { font-size: 12px; }
+  .rag-danger {
+    background: transparent;
+    border: 1px solid rgba(255, 107, 107, 0.45);
+    color: var(--error);
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .rag-danger:hover { background: rgba(255, 107, 107, 0.1); }
+
+  .rag-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .rag-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .rag-seg button {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 5px 11px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .rag-seg button + button { border-left: 1px solid var(--border); }
+  .rag-seg button.active { background: var(--panel-2); color: var(--text); }
+  .rag-seg.mono button { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .rag-seg button.dim { opacity: 0.4; }
+  .rag-chunking code { color: var(--text); }
+  .rag-chunking { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .rag-rechunk { font-size: 11px; padding: 4px 10px; }
+
+  .rag-chunk {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .rag-chunk.focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .rag-chunk-meta { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; color: var(--muted); }
+  .rag-chunk-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+  .rag-chunk-section { color: var(--accent); }
+  .rag-chunk-text {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    max-height: 8.5em;
+    overflow: hidden;
+    cursor: pointer;
+    position: relative;
+  }
+  .rag-chunk-text.open { max-height: none; }
+  .rag-chunk-text:not(.open)::after {
+    content: '';
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 2.5em;
+    background: linear-gradient(transparent, var(--bg));
+  }
+  .rag-chunk-actions { display: flex; gap: 6px; }
+  .rag-chunk-actions .settings-btn { font-size: 11px; padding: 3px 8px; }
+  .rag-vector { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); font-size: 11px; word-break: break-all; }
+
+  .rag-pager { display: flex; align-items: center; gap: 10px; justify-content: center; }
+  .rag-pager .settings-btn { font-size: 11px; padding: 4px 10px; }
+
+  .rag-map {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.65;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+  }
+  .rag-seg-a { background: rgba(108, 141, 255, 0.17); }
+  .rag-seg-b { background: rgba(138, 92, 246, 0.24); }
+  .rag-seg-overlap {
+    background: repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.30) 0 4px, rgba(251, 191, 36, 0.10) 4px 8px);
+  }
+  .rag-seg-pa { background: rgba(108, 141, 255, 0.09); box-shadow: inset 0 -1px 0 rgba(108, 141, 255, 0.45); }
+  .rag-seg-pb { background: rgba(138, 92, 246, 0.12); box-shadow: inset 0 -1px 0 rgba(138, 92, 246, 0.55); }
+  .rag-map span[data-chunks], .rag-map span[data-group] { cursor: pointer; border-radius: 2px; }
+  .rag-map span.parent-hover { background-color: rgba(251, 191, 36, 0.10); box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.30); }
+  .rag-parent-pop {
+    position: fixed;
+    z-index: 50;
+    max-width: min(560px, calc(100vw - 16px));
+    max-height: min(420px, 60vh);
+    overflow: hidden;
+    background: var(--panel-2);
+    border: 1px solid rgba(251, 191, 36, 0.55);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    padding: 10px 12px;
+    pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .rag-parent-pop[hidden] { display: none; }
+  .rag-parent-pop-head { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); }
+  .rag-parent-pop-head span:last-child { color: var(--warn); }
+  .rag-parent-pop pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--text);
+    overflow: hidden;
+  }
+  .rag-parent-pop mark { background: rgba(251, 191, 36, 0.30); color: inherit; border-radius: 2px; }
+  .rag-map span.parent-picked { background-color: rgba(251, 191, 36, 0.14); box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.35); }
+  .rag-map span.picked { outline: 1px solid var(--accent); background: rgba(108, 141, 255, 0.40); }
+  .rag-ord {
+    display: inline-block;
+    font-size: 9.5px;
+    line-height: 1.2;
+    padding: 0 4px;
+    margin-right: 2px;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    vertical-align: 1px;
+    user-select: none;
+  }
+  .rag-map-info { color: var(--muted); min-height: 1.4em; }
+
+  .rag-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+  .rag-results h5 { margin: 0 0 6px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .rag-hit {
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--bg);
+    padding: 7px 9px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .rag-hit:hover { border-color: var(--accent); }
+  .rag-hit.visited { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  /* Возврат к выдаче поиска: заметная кнопка, закреплённая вверху панели
+     документа — видна и при прокрутке длинной карты. */
+  .rag-back {
+    position: sticky;
+    top: -14px;
+    z-index: 5;
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin: -14px 0 0 -14px;
+    padding: 9px 16px;
+    max-width: calc(100% + 14px);
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    border: none;
+    border-radius: 0 0 10px 0;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rag-back:hover { filter: brightness(1.12); }
+  .rag-hit-score { font-variant-numeric: tabular-nums; color: var(--ok); font-weight: 600; }
+  .rag-hit-text { color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .rag-hit-context { font-size: 11px; line-height: 1.45; color: var(--muted); border-left: 2px solid rgba(251, 191, 36, 0.5); padding-left: 7px; }
+  .rag-hit-context b { color: var(--warn); font-weight: 500; }
+  .rag-context { border-left: 2px solid rgba(251, 191, 36, 0.5); padding-left: 9px; display: flex; flex-direction: column; gap: 4px; }
+  .rag-context-head { color: var(--warn); font-size: 11px; }
+  .rag-context-mark, .rag-context mark { background: rgba(251, 191, 36, 0.28); color: inherit; border-radius: 2px; padding: 0 2px; }
+
+  @media (max-width: 900px) {
+    .rag-top, .rag-layout { grid-template-columns: 1fr; }
+    #view-rag { overflow-y: auto; }
+  }
+
   /* ---------- Вкладка «MCP» ---------- */
 
   #view-mcp {
@@ -2184,6 +2566,7 @@
   <button type="button" class="tab-btn" id="tab-agents" data-view="view-agents">Агенты</button>
   <button type="button" class="tab-btn" id="tab-mcp" data-view="view-mcp">MCP</button>
   <button type="button" class="tab-btn" id="tab-schedule" data-view="view-schedule">Расписание</button>
+  <button type="button" class="tab-btn" id="tab-rag" data-view="view-rag">RAG</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -2342,6 +2725,69 @@
     <ul class="memory-kv-list" id="all-schedule-list"></ul>
   </div>
   <span class="field-error" id="schedule-error" hidden></span>
+</div>
+
+<div class="view" id="view-rag" hidden>
+  <div class="rag-top">
+    <section class="rag-card rag-overview">
+      <div class="rag-card-head">
+        <h4>Индекс</h4>
+        <div class="rag-actions">
+          <button type="button" class="settings-btn" id="rag-refresh" title="Перечитать индекс">↻ Обновить</button>
+          <button type="button" class="settings-btn" id="rag-index-all" title="Проиндексировать весь корпус: новые версии изменённых файлов и недостающие чанки">Проиндексировать корпус</button>
+        </div>
+      </div>
+      <div id="rag-overview" class="rag-overview-body card-hint">загрузка…</div>
+    </section>
+    <section class="rag-card rag-upload">
+      <div class="rag-card-head"><h4>Векторизовать документ</h4></div>
+      <label class="rag-drop" id="rag-drop">
+        <input type="file" id="rag-file" accept=".md,.markdown,.txt,.rs,.pdf" hidden>
+        <span id="rag-drop-text">Перетащите файл сюда или <u>выберите</u> · .md, .txt, .rs, .pdf, до 50 МБ</span>
+      </label>
+      <div class="rag-upload-row">
+        <span class="card-hint">Разбиение на чанки:</span>
+        <div class="rag-seg mono" id="rag-upload-strategy">
+          <button type="button" data-s="fixed">fixed</button>
+          <button type="button" data-s="structure" class="active">structure</button>
+          <button type="button" data-s="sentence">sentence</button>
+          <button type="button" data-s="parent" title="Parent-child: векторизуется предложение, в контекст идёт весь абзац">parent</button>
+        </div>
+        <button type="button" class="rag-primary" id="rag-upload-btn" disabled>Векторизовать</button>
+      </div>
+      <div class="rag-params" id="rag-params"></div>
+      <div class="rag-params-foot">
+        <span class="card-hint" id="rag-params-desc"></span>
+        <button type="button" class="rag-link" id="rag-params-reset" hidden>вернуть по умолчанию</button>
+      </div>
+      <div class="rag-job" id="rag-job" hidden>
+        <div class="rag-job-line"><span id="rag-job-title"></span><span id="rag-job-progress" class="card-hint"></span></div>
+        <div class="rag-bar"><div class="rag-bar-fill" id="rag-bar-fill"></div></div>
+        <pre class="rag-job-summary" id="rag-job-summary" hidden></pre>
+      </div>
+    </section>
+  </div>
+
+  <form class="rag-search" id="rag-search-form">
+    <input type="text" id="rag-search-input" placeholder="Поиск по индексу: вопрос или фраза — выдача по каждой стратегии" autocomplete="off">
+    <select id="rag-search-k" title="Сколько чанков на стратегию">
+      <option value="3">топ-3</option>
+      <option value="5" selected>топ-5</option>
+      <option value="10">топ-10</option>
+    </select>
+    <button type="submit" class="rag-primary">Найти</button>
+  </form>
+  <span class="field-error" id="rag-error" hidden></span>
+
+  <div class="rag-layout">
+    <aside class="rag-docs">
+      <input type="text" id="rag-docs-filter" placeholder="Фильтр по пути" autocomplete="off">
+      <div class="rag-docs-list" id="rag-docs-list"></div>
+    </aside>
+    <main class="rag-detail" id="rag-detail">
+      <div class="rag-empty card-hint">Выберите документ слева — будут видны его версии, чанки каждой стратегии и карта нарезки. Или найдите что-нибудь поиском.</div>
+    </main>
+  </div>
 </div>
 
 <div class="view" id="view-agents" hidden>
@@ -5946,6 +6392,872 @@ function renderMcpDetail(server) {
 mcpReloadBtn.addEventListener('click', () => mcpAction('/api/mcp/reload'));
 document.getElementById('tab-mcp').addEventListener('click', loadMcp);
 loadMcp();
+
+/* ---------- Вкладка «RAG» ---------- */
+// Индекс документов (см. llm_core::rag): загрузка и векторизация файла,
+// документы с версиями, чанки каждой стратегии, карта нарезки, поиск.
+
+const RAG_STRATEGIES = ['fixed', 'structure', 'sentence', 'parent'];
+const RAG_PAGE = 50;
+const rag = {
+  docs: [],
+  selected: null,     // source выбранного документа
+  versions: [],
+  version: null,      // номер версии; null — последняя
+  strategy: 'structure',
+  mode: 'map',        // 'map' | 'chunks'
+  offset: 0,
+  focus: null,        // chunk_id, который надо показать
+  file: null,
+  // Форма загрузки: стратегия, схема параметров (с сервера), введённые значения.
+  uploadStrategy: 'structure',
+  paramSpecs: {},
+  paramValues: {},
+  jobId: 0,
+  polling: null,
+  confirmRemove: false,
+};
+const ragEl = (id) => document.getElementById(id);
+const ragErrorEl = ragEl('rag-error');
+const ragDetailEl = ragEl('rag-detail');
+
+// Имя файла вместо пути (путь — во всплывающей подсказке).
+function ragName(source) {
+  return String(source).split('/').pop();
+}
+
+// chunk_id с именем файла вместо пути: «отчёт.pdf@v1/parent/0004».
+function ragShortId(chunkId) {
+  const at = chunkId.indexOf('@');
+  return at < 0 ? chunkId : ragName(chunkId.slice(0, at)) + chunkId.slice(at);
+}
+
+function ragShowError(message) {
+  ragErrorEl.textContent = message;
+  ragErrorEl.hidden = !message;
+}
+
+async function ragGet(url, options) {
+  const res = await fetch(url, options);
+  const data = await res.json();
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+function ragBytes(n) {
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' МБ';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' КБ';
+  return n + ' Б';
+}
+
+function ragCounts(chunks) {
+  const map = Object.fromEntries(chunks || []);
+  return RAG_STRATEGIES.map((s) => `${s} ${map[s] ?? '—'}`).join(' · ');
+}
+
+function ragStatusTag(status) {
+  if (status === 'current') return '<span class="rag-tag ok">действующая</span>';
+  if (status === 'superseded') return '<span class="rag-tag warn">заменена</span>';
+  return `<span class="rag-tag bad">${escapeHtml(status === 'removed' ? 'нет в корпусе' : status)}</span>`;
+}
+
+function ragGitTag(v) {
+  if (!v.git_commit) return '<span class="rag-tag" title="Файл вне git или не закоммичен ни разу">git —</span>';
+  const dirty = v.git_dirty ? '+изм.' : '';
+  return `<span class="rag-tag" title="Последний коммит, менявший файл${v.git_dirty ? '; в рабочей копии есть незакоммиченные изменения' : ''}: ${escapeHtml(v.git_commit)}">git ${escapeHtml(v.git_commit.slice(0, 8))}${dirty}</span>`;
+}
+
+async function loadRagOverview() {
+  const el = ragEl('rag-overview');
+  try {
+    const o = await ragGet('/api/rag/overview');
+    const firstLoad = !Object.keys(rag.paramSpecs).length;
+    o.strategies.forEach((s) => { rag.paramSpecs[s.strategy] = s.params; });
+    if (firstLoad) renderRagParams();
+    el.innerHTML = `
+      <div class="rag-stats">
+        <span>модель <b>${escapeHtml(o.model || 'не задана')}</b>${o.dim ? ` · <b>${o.dim}</b> измерений` : ''}</span>
+        <span>документов <b>${o.documents}</b></span>
+        <span>версий <b>${o.versions}</b></span>
+        <span>векторов <b>${o.vectors}</b></span>
+        <span>SQLite <code>${escapeHtml(o.db_path)}</code> · <b>${ragBytes(o.db_bytes)}</b></span>
+        ${o.indexed_at ? `<span>обновлён <b>${escapeHtml(o.indexed_at)}</b></span>` : ''}
+      </div>`;
+  } catch (e) {
+    el.textContent = String(e.message || e);
+  }
+}
+
+async function loadRagDocs() {
+  try {
+    rag.docs = await ragGet('/api/rag/docs');
+    renderRagDocs();
+  } catch (e) {
+    ragEl('rag-docs-list').innerHTML = `<div class="card-hint">${escapeHtml(String(e.message || e))}</div>`;
+  }
+}
+
+function renderRagDocs() {
+  const filter = ragEl('rag-docs-filter').value.trim().toLowerCase();
+  const docs = rag.docs.filter((d) => !filter || d.source.toLowerCase().includes(filter) || (d.title || '').toLowerCase().includes(filter));
+  // Загруженные — первыми.
+  docs.sort((a, b) => (b.uploaded - a.uploaded) || a.source.localeCompare(b.source));
+  ragEl('rag-docs-list').innerHTML = docs.length
+    ? docs
+        .map((d) => `
+      <button type="button" class="rag-doc${d.source === rag.selected ? ' active' : ''}" data-source="${escapeHtml(d.source)}" title="${escapeHtml(d.title || '')}">
+        <span class="rag-doc-source" title="${escapeHtml(d.source)}">${escapeHtml(ragName(d.source))}</span>
+        <span class="rag-doc-meta">
+          <span class="rag-tag accent">v${d.version}</span>
+          ${d.status !== 'current' ? ragStatusTag(d.status) : ''}
+          ${d.uploaded ? '<span class="rag-tag ok">загружен</span>' : ''}
+          <span>${ragCounts(d.chunks)}</span>
+        </span>
+      </button>`)
+        .join('')
+    : `<div class="card-hint">${rag.docs.length ? 'Ничего не подходит под фильтр.' : 'Индекс пуст — загрузите документ или проиндексируйте корпус.'}</div>`;
+  ragEl('rag-docs-list').querySelectorAll('.rag-doc').forEach((btn) => {
+    btn.addEventListener('click', () => selectRagDoc(btn.dataset.source));
+  });
+}
+
+async function selectRagDoc(source, opts = {}) {
+  ragShowError('');
+  rag.selected = source;
+  rag.version = opts.version ?? null;
+  if (opts.strategy) rag.strategy = opts.strategy;
+  if (opts.mode) rag.mode = opts.mode;
+  rag.focus = opts.focus ?? null;
+  rag.offset = 0;
+  rag.confirmRemove = false;
+  rag.fromSearch = !!opts.fromSearch;
+  renderRagDocs();
+  try {
+    rag.versions = await ragGet('/api/rag/versions?source=' + encodeURIComponent(source));
+    // При открытии документа без явной стратегии — стратегия, которой он
+    // нарезан (если текущей нет). Выбор пользователя дальше не меняется.
+    const cut = (ragCurrentVersion().chunkings || []).map((c) => c.strategy);
+    if (!opts.strategy && cut.length && !cut.includes(rag.strategy)) rag.strategy = cut[0];
+  } catch (e) {
+    ragDetailEl.innerHTML = `<div class="rag-empty card-hint">${escapeHtml(String(e.message || e))}</div>`;
+    return;
+  }
+  renderRagDetail();
+}
+
+function ragCurrentVersion() {
+  return rag.versions.find((v) => v.version === rag.version) || rag.versions[0];
+}
+
+function renderRagDetail() {
+  const v = ragCurrentVersion();
+  const cut = (v.chunkings || []).map((c) => c.strategy);
+  const versionOptions = rag.versions
+    .map((x) => `<option value="${x.version}"${x.version === v.version ? ' selected' : ''}>v${x.version} · ${x.status === 'current' ? 'действующая' : x.status === 'superseded' ? 'заменена' : 'нет в корпусе'} · ${escapeHtml(x.indexed_at_text)}</option>`)
+    .join('');
+  const uploaded = rag.docs.find((d) => d.source === rag.selected)?.uploaded;
+  ragDetailEl.innerHTML = `
+    ${rag.fromSearch && rag.lastSearch ? `<button type="button" class="rag-back" id="rag-back" title="«${escapeHtml(rag.lastSearch.query)}» · топ-${rag.lastSearch.k}">← К результатам поиска</button>` : ''}
+    <div class="rag-doc-head">
+      <div>
+        <h3 title="${escapeHtml(v.source)}">${escapeHtml(ragName(v.source))}</h3>
+        <div class="card-hint">${escapeHtml(v.title || '')}</div>
+        <div class="rag-doc-meta" style="margin-top:6px">
+          ${ragStatusTag(v.status)} ${ragGitTag(v)}
+          <span class="rag-tag">${escapeHtml(v.kind)}</span>
+          <span class="rag-tag">${ragBytes(v.bytes)}</span>
+          <span class="rag-tag" title="SHA-256 содержимого файла этой версии">sha256 ${escapeHtml(v.sha256.slice(0, 12))}</span>
+          <span class="rag-tag">чанки: ${ragCounts(v.chunks)}</span>
+        </div>
+      </div>
+      <button type="button" class="rag-danger" id="rag-remove" title="${uploaded ? 'Удалить документ из индекса вместе с загруженным файлом' : 'Удалить документ из индекса (файл корпуса останется — полная индексация вернёт его)'}">Удалить из индекса</button>
+    </div>
+    <div class="rag-controls">
+      <select id="rag-version" title="Версия документа">${versionOptions}</select>
+      <div class="rag-seg mono" id="rag-strategy-seg">
+        ${RAG_STRATEGIES.map((s) => `<button type="button" data-s="${s}" class="${s === rag.strategy ? 'active' : ''}${cut.includes(s) ? '' : ' dim'}" ${cut.includes(s) ? '' : 'title="Версия не нарезана этой стратегией"'}>${s}</button>`).join('')}
+      </div>
+      <div class="rag-seg" id="rag-mode-seg">
+        <button type="button" data-m="map" class="${rag.mode === 'map' ? 'active' : ''}">Карта документа</button>
+        <button type="button" data-m="chunks" class="${rag.mode === 'chunks' ? 'active' : ''}">Чанки</button>
+      </div>
+    </div>
+    <div class="rag-chunking card-hint" id="rag-chunking">${ragChunkingLine(v)}</div>
+    <div id="rag-content"><div class="card-hint">загрузка…</div></div>`;
+
+  ragEl('rag-version').addEventListener('change', (e) => {
+    rag.version = Number(e.target.value);
+    rag.offset = 0;
+    rag.focus = null;
+    renderRagDetail();
+  });
+  ragEl('rag-strategy-seg').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+    rag.strategy = b.dataset.s;
+    rag.offset = 0;
+    rag.focus = null;
+    renderRagDetail();
+  }));
+  ragEl('rag-mode-seg').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+    rag.mode = b.dataset.m;
+    renderRagDetail();
+  }));
+  ragEl('rag-remove').addEventListener('click', ragRemoveSelected);
+  const backBtn = ragEl('rag-back');
+  if (backBtn) backBtn.addEventListener('click', ragBackToSearch);
+  const rechunkBtn = ragEl('rag-rechunk');
+  if (rechunkBtn) {
+    // Не нарезан — показывать нечего, только предложение нарезать.
+    ragEl('rag-content').innerHTML = '';
+    rechunkBtn.disabled = !!rag.polling;
+    rechunkBtn.addEventListener('click', () => ragRechunk(rag.selected, rag.strategy));
+    return;
+  }
+  if (rag.mode === 'map') loadRagMap(); else loadRagChunks();
+}
+
+function ragChunkingLine(v) {
+  const c = (v.chunkings || []).find((x) => x.strategy === rag.strategy);
+  if (!c) {
+    return `Документ не нарезан стратегией <code>${rag.strategy}</code>.
+      <button type="button" class="settings-btn rag-rechunk" id="rag-rechunk">Нарезать стратегией ${rag.strategy}</button>
+      <span class="card-hint">параметры — из формы «Векторизовать документ» для ${rag.strategy}</span>`;
+  }
+  const specs = rag.paramSpecs[rag.strategy] || [];
+  const custom = specs.filter((p) => c.params[p.name] !== undefined && c.params[p.name] !== p.default);
+  const values = Object.entries(c.params).map(([k, val]) => `${k}=${val}`).join(' · ');
+  // Только значения параметров, без описания стратегии.
+  return `<span class="rag-tag${custom.length ? ' accent' : ''}" title="${escapeHtml(c.description)}${custom.length ? ' · отличается от параметров по умолчанию' : ''}">${escapeHtml(values)}</span>`;
+}
+
+function ragChunkParams() {
+  const v = ragCurrentVersion();
+  return `source=${encodeURIComponent(rag.selected)}&version=${v.version}&strategy=${rag.strategy}`;
+}
+
+async function loadRagChunks() {
+  const content = ragEl('rag-content');
+  try {
+    const page = await ragGet(`/api/rag/chunks?${ragChunkParams()}&offset=${rag.offset}&limit=${RAG_PAGE}`);
+    renderRagChunks(page);
+  } catch (e) {
+    content.innerHTML = `<div class="card-hint">${escapeHtml(String(e.message || e))}</div>`;
+  }
+}
+
+function renderRagChunks(page) {
+  const content = ragEl('rag-content');
+  if (!page.total) {
+    content.innerHTML = `<div class="card-hint">У этой версии нет чанков стратегии <code>${escapeHtml(page.strategy)}</code> — она не выбиралась при векторизации.</div>`;
+    return;
+  }
+  const from = page.offset + 1;
+  const to = page.offset + page.items.length;
+  const pager = page.total > RAG_PAGE
+    ? `<div class="rag-pager">
+        <button type="button" class="settings-btn" data-dir="-1" ${page.offset === 0 ? 'disabled' : ''}>← назад</button>
+        <span class="card-hint">${from}–${to} из ${page.total}</span>
+        <button type="button" class="settings-btn" data-dir="1" ${to >= page.total ? 'disabled' : ''}>вперёд →</button>
+      </div>`
+    : `<div class="card-hint">Чанков: ${page.total}</div>`;
+  content.innerHTML = pager + page.items.map((c) => ragChunkCard(c, page.version.kind)).join('') + (page.total > RAG_PAGE ? pager : '');
+  content.querySelectorAll('.rag-pager button').forEach((b) => b.addEventListener('click', () => {
+    rag.offset = Math.max(0, rag.offset + Number(b.dataset.dir) * RAG_PAGE);
+    rag.focus = null;
+    loadRagChunks();
+    ragDetailEl.scrollTop = 0;
+  }));
+  content.querySelectorAll('.rag-chunk-text').forEach((pre) => pre.addEventListener('click', () => pre.classList.toggle('open')));
+  content.querySelectorAll('[data-vector]').forEach((b) => b.addEventListener('click', () => ragShowVector(b)));
+  content.querySelectorAll('[data-onmap]').forEach((b) => b.addEventListener('click', () => {
+    rag.mode = 'map';
+    rag.focus = b.dataset.onmap;
+    renderRagDetail();
+  }));
+  if (rag.focus) {
+    const el = content.querySelector(`[data-chunk="${CSS.escape(rag.focus)}"]`);
+    if (el) {
+      el.classList.add('focus');
+      el.querySelector('.rag-chunk-text').classList.add('open');
+      el.scrollIntoView({ block: 'center' });
+    }
+  }
+}
+
+function ragChunkCard(c, kind) {
+  const flags = [];
+  if (kind !== 'rust' && !c.clean_end) flags.push('<span class="rag-tag warn" title="Чанк кончается не на конце предложения, абзаца или блока">обрыв фразы</span>');
+  if (c.splits_code) flags.push('<span class="rag-tag warn" title="В чанке нечётное число ``` или не сходятся { и }">разрез кода</span>');
+  return `
+    <div class="rag-chunk" data-chunk="${escapeHtml(c.chunk_id)}">
+      <div class="rag-chunk-meta">
+        <span class="rag-chunk-id" title="${escapeHtml(c.chunk_id)}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span>
+        <span class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</span>
+        <span>строки ${c.start_line}–${c.end_line}</span>
+        <span>${c.char_len} симв. · ≈${c.tokens_est} ток.</span>
+        ${flags.join('')}
+      </div>
+      <pre class="rag-chunk-text" title="Нажмите, чтобы развернуть">${escapeHtml(c.text)}</pre>
+      ${c.context ? `
+      <div class="rag-context">
+        <div class="rag-context-head">в контекст — родитель · строки ${c.context_start_line}–${c.context_end_line} · ${c.context.length} симв. · <span class="rag-context-mark">найденный ребёнок</span></div>
+        <pre class="rag-chunk-text">${ragMarkChild(c.context, c.text)}</pre>
+      </div>` : ''}
+      <div class="rag-chunk-actions">
+        <button type="button" class="settings-btn" data-vector="${escapeHtml(c.chunk_id)}">Вектор</button>
+        <button type="button" class="settings-btn" data-onmap="${escapeHtml(c.chunk_id)}">На карте</button>
+        <span class="card-hint" title="SHA-256 текста чанка · модель эмбеддинга">sha ${escapeHtml(c.content_sha256.slice(0, 10))} · ${escapeHtml(c.embedding_model)}</span>
+      </div>
+    </div>`;
+}
+
+// Текст родителя с выделенным в нём ребёнком.
+function ragMarkChild(context, child) {
+  const i = context.indexOf(child);
+  if (i < 0) return escapeHtml(context);
+  return escapeHtml(context.slice(0, i)) + '<mark>' + escapeHtml(child) + '</mark>' + escapeHtml(context.slice(i + child.length));
+}
+
+async function ragShowVector(btn) {
+  const card = btn.closest('.rag-chunk');
+  let box = card.querySelector('.rag-vector');
+  if (box) { box.remove(); return; }
+  box = document.createElement('div');
+  box.className = 'rag-vector';
+  box.textContent = 'загрузка…';
+  card.appendChild(box);
+  try {
+    const d = await ragGet('/api/rag/chunk?id=' + encodeURIComponent(btn.dataset.vector));
+    box.textContent = d.vector
+      ? `вектор: ${d.vector.dim} измерений · норма ${d.vector.norm.toFixed(4)} · [${d.vector.head.map((x) => x.toFixed(4)).join(', ')}, …] · ключ ${d.chunk.vector_key.slice(0, 16)}…`
+      : 'вектора нет';
+  } catch (e) {
+    box.textContent = String(e.message || e);
+  }
+}
+
+async function loadRagMap() {
+  const content = ragEl('rag-content');
+  try {
+    const map = await ragGet(`/api/rag/map?${ragChunkParams()}`);
+    renderRagMap(map);
+  } catch (e) {
+    content.innerHTML = `<div class="card-hint">${escapeHtml(String(e.message || e))}</div>`;
+  }
+}
+
+// Карта: текст версии, разрезанный по всем границам чанков. Каждый кусок
+// знает, какие чанки его покрывают: один — фон по чётности номера чанка,
+// несколько — штриховка перекрытия, ни одного — пробелы между чанками.
+function renderRagMap(map) {
+  const content = ragEl('rag-content');
+  if (map.text == null) {
+    content.innerHTML = '<div class="card-hint">Эта версия проиндексирована до того, как индекс начал хранить текст документа, — карта недоступна. Смотрите «Чанки» или переиндексируйте документ.</div>';
+    return;
+  }
+  if (!map.chunks.length) {
+    content.innerHTML = `<div class="card-hint">У этой версии нет чанков стратегии <code>${escapeHtml(map.strategy)}</code>.</div>`;
+    return;
+  }
+  const text = map.text;
+  const chunks = map.chunks;
+  const isParent = chunks.some((c) => c.parent);
+  // Родители (parent-child): границы и номер — у детей одного родителя общий.
+  const parents = [];
+  chunks.forEach((c) => {
+    if (c.parent && !parents[c.group]) parents[c.group] = { start: c.parent[0], end: c.parent[1] };
+  });
+  const points = new Set([0, text.length]);
+  chunks.forEach((c) => { points.add(c.start); points.add(c.end); });
+  parents.forEach((p) => { if (p) { points.add(p.start); points.add(p.end); } });
+  const sorted = [...points].sort((a, b) => a - b);
+  const startsAt = new Map();
+  chunks.forEach((c, i) => {
+    if (!startsAt.has(c.start)) startsAt.set(c.start, []);
+    startsAt.get(c.start).push(i);
+  });
+  let html = '';
+  for (let p = 0; p < sorted.length - 1; p++) {
+    const a = sorted[p];
+    const b = sorted[p + 1];
+    (startsAt.get(a) || []).forEach((i) => { html += `<span class="rag-ord" title="${escapeHtml(chunks[i].chunk_id)}">#${chunks[i].ord}</span>`; });
+    const covering = [];
+    for (let i = 0; i < chunks.length; i++) {
+      if (chunks[i].start <= a && chunks[i].end >= b) covering.push(i);
+    }
+    const piece = escapeHtml(text.slice(a, b));
+    const group = isParent ? parents.findIndex((p) => p && p.start <= a && p.end >= b) : -1;
+    const groupAttr = group >= 0 ? ` data-group="${group}"` : '';
+    if (!covering.length) {
+      // Часть родителя, которая не вошла ни в одного ребёнка (заголовок, пробелы).
+      html += group >= 0 ? `<span class="${group % 2 === 0 ? 'rag-seg-pa' : 'rag-seg-pb'}"${groupAttr}>${piece}</span>` : piece;
+      continue;
+    }
+    const parity = isParent && group >= 0 ? group : chunks[covering[0]].ord;
+    const cls = covering.length > 1 ? 'rag-seg-overlap' : (parity % 2 === 0 ? 'rag-seg-a' : 'rag-seg-b');
+    const title = covering.map((i) => `#${chunks[i].ord} ${chunks[i].section || ''}`).join('\n');
+    const titleAttr = isParent ? '' : ` title="${escapeHtml(title)}"`;
+    html += `<span class="${cls}" data-chunks="${covering.join(',')}"${groupAttr}${titleAttr}>${piece}</span>`;
+  }
+  content.innerHTML = `
+    <div class="rag-map-info" id="rag-map-info"></div>
+    <pre class="rag-map" id="rag-map">${html}</pre>
+    ${isParent ? '<div class="rag-parent-pop" id="rag-parent-pop" hidden></div>' : ''}`;
+
+  const mapEl = ragEl('rag-map');
+  if (isParent) ragParentHover(mapEl, ragEl('rag-parent-pop'), text, chunks);
+  let lastPick = { segment: null, index: -1 };
+  const pick = (chunkIndex) => {
+    mapEl.querySelectorAll('span.picked, span.parent-picked').forEach((s) => s.classList.remove('picked', 'parent-picked'));
+    const c = chunks[chunkIndex];
+    // Parent-child: весь родитель выбранного ребёнка — рамкой.
+    if (c.group != null) {
+      mapEl.querySelectorAll(`span[data-group="${c.group}"]`).forEach((s) => s.classList.add('parent-picked'));
+    }
+    const spans = [...mapEl.querySelectorAll('span[data-chunks]')].filter((s) => s.dataset.chunks.split(',').map(Number).includes(chunkIndex));
+    spans.forEach((s) => s.classList.add('picked'));
+    ragEl('rag-map-info').innerHTML = `
+      <span class="rag-chunk-id" title="${escapeHtml(c.chunk_id)}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span> ·
+      <span class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</span> ·
+      строки ${c.start_line}–${c.end_line} · ${c.char_len} симв. ·
+      ${c.parent ? `в контекст — родитель, ${c.parent[1] - c.parent[0]} симв. · ` : ''}
+      <a href="#" id="rag-map-to-list">открыть в списке чанков</a>`;
+    ragEl('rag-map-to-list').addEventListener('click', (e) => {
+      e.preventDefault();
+      rag.mode = 'chunks';
+      rag.offset = Math.floor(c.ord / RAG_PAGE) * RAG_PAGE;
+      rag.focus = c.chunk_id;
+      renderRagDetail();
+    });
+    return spans[0];
+  };
+  mapEl.addEventListener('click', (e) => {
+    let span = e.target.closest('span[data-chunks]');
+    if (!span) {
+      // Клик по части родителя вне детей — выбрать его первого ребёнка.
+      const part = e.target.closest('span[data-group]');
+      if (!part) return;
+      const first = chunks.findIndex((c) => c.group === Number(part.dataset.group));
+      if (first >= 0) pick(first);
+      return;
+    }
+    // Повторный клик по перекрытию переключает на следующий чанк.
+    const list = span.dataset.chunks.split(',').map(Number);
+    const next = lastPick.segment === span ? (lastPick.index + 1) % list.length : 0;
+    lastPick = { segment: span, index: next };
+    pick(list[next]);
+  });
+  if (rag.focus) {
+    const i = chunks.findIndex((c) => c.chunk_id === rag.focus);
+    if (i >= 0) {
+      const first = pick(i);
+      if (first) first.scrollIntoView({ block: 'center' });
+    }
+  }
+}
+
+// Parent-child на карте: при наведении на ребёнка — карточка с его
+// родителем (то, что уйдёт в контекст) у курсора, ребёнок в ней подсвечен,
+// а весь родитель на карте обведён.
+function ragParentHover(mapEl, pop, text, chunks) {
+  let current = -1;
+  const clear = () => {
+    mapEl.querySelectorAll('span.parent-hover').forEach((s) => s.classList.remove('parent-hover'));
+  };
+  const hide = () => {
+    pop.hidden = true;
+    current = -1;
+    clear();
+  };
+  const place = (e) => {
+    const gap = 16;
+    const w = pop.offsetWidth;
+    const h = pop.offsetHeight;
+    let x = e.clientX + gap;
+    let y = e.clientY + gap;
+    if (x + w > window.innerWidth - 8) x = Math.max(8, e.clientX - w - gap);
+    if (y + h > window.innerHeight - 8) y = Math.max(8, e.clientY - h - gap);
+    pop.style.left = `${x}px`;
+    pop.style.top = `${y}px`;
+  };
+  mapEl.addEventListener('mousemove', (e) => {
+    const span = e.target.closest('span[data-chunks], span[data-group]');
+    if (!span) { hide(); return; }
+    // Над ребёнком — он сам; над частью родителя вне детей — первый ребёнок.
+    const index = span.dataset.chunks != null
+      ? Number(span.dataset.chunks.split(',')[0])
+      : chunks.findIndex((c) => c.group === Number(span.dataset.group));
+    const c = chunks[index];
+    if (!c || !c.parent) { hide(); return; }
+    if (index !== current) {
+      current = index;
+      clear();
+      mapEl.querySelectorAll(`span[data-group="${c.group}"]`).forEach((s) => s.classList.add('parent-hover'));
+      const [ps, pe] = c.parent;
+      const before = text.slice(ps, Math.max(ps, c.start));
+      const child = text.slice(Math.max(ps, c.start), Math.min(pe, c.end));
+      const after = text.slice(Math.min(pe, c.end), pe);
+      pop.innerHTML = `
+        <div class="rag-parent-pop-head">
+          <span>ребёнок <b>#${c.ord}</b> · строки ${c.start_line}–${c.end_line} · ${c.char_len} симв. — векторизуется</span>
+          <span>родитель · ${pe - ps} симв. — уходит в контекст</span>
+        </div>
+        <pre>${escapeHtml(before)}<mark>${escapeHtml(child)}</mark>${escapeHtml(after)}</pre>`;
+      pop.hidden = false;
+    }
+    place(e);
+  });
+  mapEl.addEventListener('mouseleave', hide);
+}
+
+// Параметры стратегии из формы загрузки (введённые или по умолчанию).
+function ragFormParams(strategy) {
+  const values = rag.paramValues[strategy] || {};
+  const params = {};
+  (rag.paramSpecs[strategy] || []).forEach((p) => { params[p.name] = Number(values[p.name] ?? p.default); });
+  return params;
+}
+
+// Нарезать уже проиндексированный документ стратегией — в фоне, ход в
+// блоке задачи; по готовности документ открывается на этой стратегии.
+async function ragRechunk(source, strategy) {
+  ragShowError('');
+  try {
+    const data = await ragGet('/api/rag/rechunk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, strategy, params: ragFormParams(strategy) }),
+    });
+    rag.jobStrategy = data.strategy;
+    ragWatchJob(data.job);
+    const btn = ragEl('rag-rechunk');
+    if (btn) btn.disabled = true;
+  } catch (e) {
+    ragShowError(String(e.message || e));
+  }
+}
+
+async function ragRemoveSelected() {
+  const btn = ragEl('rag-remove');
+  if (!rag.confirmRemove) {
+    rag.confirmRemove = true;
+    btn.textContent = 'Точно удалить? Нажмите ещё раз';
+    setTimeout(() => {
+      if (rag.confirmRemove && btn.isConnected) {
+        rag.confirmRemove = false;
+        btn.textContent = 'Удалить из индекса';
+      }
+    }, 4000);
+    return;
+  }
+  rag.confirmRemove = false;
+  try {
+    const data = await ragGet('/api/rag/docs?source=' + encodeURIComponent(rag.selected), { method: 'DELETE' });
+    // Итог векторизации удалённого документа больше не нужен.
+    if (rag.jobSource === rag.selected && !rag.polling) ragEl('rag-job').hidden = true;
+    rag.selected = null;
+    ragDetailEl.innerHTML = `<div class="rag-empty card-hint">${escapeHtml(data.summary)}</div>`;
+    await Promise.all([loadRagDocs(), loadRagOverview()]);
+  } catch (e) {
+    ragShowError(String(e.message || e));
+  }
+}
+
+// ----- Поиск
+
+ragEl('rag-search-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const query = ragEl('rag-search-input').value.trim();
+  if (!query) return;
+  ragShowError('');
+  rag.selected = null;
+  renderRagDocs();
+  ragDetailEl.innerHTML = '<div class="card-hint">поиск…</div>';
+  try {
+    const data = await ragGet('/api/rag/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, k: Number(ragEl('rag-search-k').value) }),
+    });
+    // Выдача запоминается: из открытого по ней документа можно вернуться.
+    rag.lastSearch = { query, k: Number(ragEl('rag-search-k').value), results: data.results, scroll: 0, visited: null };
+    renderRagSearch(query, data.results);
+  } catch (err) {
+    ragDetailEl.innerHTML = `<div class="rag-empty card-hint">${escapeHtml(String(err.message || err))}</div>`;
+  }
+});
+
+function renderRagSearch(query, results) {
+  const columns = results
+    .map((r) => `
+      <div>
+        <h5>${escapeHtml(r.strategy)}</h5>
+        ${r.hits.length ? r.hits.map((h, i) => {
+          const c = h.hit.chunk;
+          const v = h.hit.version;
+          return `
+          <div class="rag-hit" data-source="${escapeHtml(v.source)}" data-version="${v.version}" data-strategy="${escapeHtml(r.strategy)}" data-chunk="${escapeHtml(c.chunk_id)}">
+            <div class="rag-chunk-meta">
+              <span class="rag-hit-score">${i + 1}. ${h.score.toFixed(3)}</span>
+              <span class="rag-chunk-id" title="${escapeHtml(v.source)}">${escapeHtml(ragName(v.source))}</span>
+              <span>v${v.version} · строки ${c.start_line}–${c.end_line}</span>
+            </div>
+            <div class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</div>
+            <div class="rag-hit-text">${escapeHtml(c.text.replace(/\s+/g, ' ').slice(0, 260))}${c.text.length > 260 ? '…' : ''}</div>
+            ${c.context ? `<div class="rag-hit-context"><b>в контекст — родитель, строки ${c.context_start_line}–${c.context_end_line}:</b> ${escapeHtml(c.context.replace(/\s+/g, ' ').slice(0, 320))}${c.context.length > 320 ? '…' : ''}</div>` : ''}
+          </div>`;
+        }).join('') : '<div class="card-hint">ничего не найдено</div>'}
+      </div>`)
+    .join('');
+  ragDetailEl.innerHTML = `
+    <div class="card-hint">Запрос: <b>${escapeHtml(query)}</b> · косинусная близость по действующим версиям · нажмите на результат, чтобы увидеть его на карте документа</div>
+    <div class="rag-results">${columns}</div>`;
+  ragDetailEl.querySelectorAll('.rag-hit').forEach((el) => el.addEventListener('click', () => {
+    if (rag.lastSearch) {
+      rag.lastSearch.scroll = ragDetailEl.scrollTop;
+      rag.lastSearch.visited = `${el.dataset.strategy}|${el.dataset.chunk}`;
+    }
+    selectRagDoc(el.dataset.source, {
+      version: Number(el.dataset.version),
+      strategy: el.dataset.strategy,
+      mode: 'map',
+      focus: el.dataset.chunk,
+      fromSearch: true,
+    });
+  }));
+  // Результат, который открывали последним, — отмечен.
+  const visited = rag.lastSearch && rag.lastSearch.visited;
+  if (visited) {
+    const [strategy, chunk] = visited.split('|');
+    const el = [...ragDetailEl.querySelectorAll('.rag-hit')].find((h) => h.dataset.strategy === strategy && h.dataset.chunk === chunk);
+    if (el) el.classList.add('visited');
+  }
+}
+
+// Назад к выдаче, из которой открыт документ: без нового запроса, на ту же
+// прокрутку.
+function ragBackToSearch() {
+  const last = rag.lastSearch;
+  if (!last) return;
+  rag.selected = null;
+  rag.fromSearch = false;
+  renderRagDocs();
+  ragEl('rag-search-input').value = last.query;
+  renderRagSearch(last.query, last.results);
+  ragDetailEl.scrollTop = last.scroll;
+}
+
+// ----- Загрузка и фоновая индексация
+
+const ragDropEl = ragEl('rag-drop');
+const ragFileEl = ragEl('rag-file');
+
+function ragSetFile(file) {
+  rag.file = file || null;
+  ragEl('rag-drop-text').textContent = rag.file
+    ? `${rag.file.name} · ${ragBytes(rag.file.size)} — нажмите «Векторизовать»`
+    : 'Перетащите файл сюда или выберите · .md, .txt, .rs, .pdf, до 50 МБ';
+  ragDropEl.classList.toggle('has-file', !!rag.file);
+  ragUpdateUploadBtn();
+}
+
+// Поля параметров выбранной стратегии: значения по умолчанию с сервера,
+// диапазоны — оттуда же. Введённое помнится по стратегии, пока страница открыта.
+function renderRagParams() {
+  const specs = rag.paramSpecs[rag.uploadStrategy] || [];
+  const values = (rag.paramValues[rag.uploadStrategy] ||= {});
+  ragEl('rag-params').innerHTML = specs
+    .map((p) => `
+      <label class="rag-param" data-name="${p.name}">
+        <span>${escapeHtml(p.label)}</span>
+        <input type="number" min="${p.min}" max="${p.max}" step="1" value="${values[p.name] ?? p.default}" data-name="${p.name}">
+        <small>${p.name} · ${p.min}–${p.max}</small>
+      </label>`)
+    .join('');
+  ragEl('rag-params').querySelectorAll('input').forEach((input) => input.addEventListener('input', () => {
+    values[input.dataset.name] = input.value;
+    ragCheckParams();
+  }));
+  ragCheckParams();
+}
+
+// Значения формы → параметры; ошибка — та же проверка, что на сервере
+// (диапазоны и связи между параметрами).
+function ragReadParams() {
+  const specs = rag.paramSpecs[rag.uploadStrategy] || [];
+  const params = {};
+  let error = '';
+  specs.forEach((p) => {
+    const input = ragEl('rag-params').querySelector(`input[data-name="${p.name}"]`);
+    const raw = input ? input.value.trim() : '';
+    const v = Number(raw);
+    const label = input && input.closest('.rag-param');
+    const bad = raw === '' || !Number.isInteger(v) || v < p.min || v > p.max;
+    if (label) {
+      label.classList.toggle('invalid', bad);
+      label.classList.toggle('changed', !bad && v !== p.default);
+    }
+    if (bad && !error) error = `${p.label}: целое от ${p.min} до ${p.max}`;
+    params[p.name] = v;
+  });
+  if (!error) {
+    if (rag.uploadStrategy === 'fixed' && params.overlap * 2 > params.size) error = 'перекрытие — не больше половины окна';
+    if (rag.uploadStrategy === 'structure' && params.min_chars > params.max_chars) error = 'порог слияния больше порога деления';
+    if (rag.uploadStrategy === 'sentence' && params.stride > params.window) error = 'сдвиг больше окна — между окнами были бы пропуски';
+    if (rag.uploadStrategy === 'sentence' && params.code_stride > params.code_window) error = 'в коде: сдвиг больше окна';
+  }
+  return { params, error };
+}
+
+function ragCheckParams() {
+  const { params, error } = ragReadParams();
+  const desc = ragEl('rag-params-desc');
+  desc.textContent = error;
+  desc.classList.toggle('bad', !!error);
+  const specs = rag.paramSpecs[rag.uploadStrategy] || [];
+  ragEl('rag-params-reset').hidden = specs.every((p) => params[p.name] === p.default);
+  ragUpdateUploadBtn();
+}
+
+ragEl('rag-upload-strategy').querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+  rag.uploadStrategy = b.dataset.s;
+  ragEl('rag-upload-strategy').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+  renderRagParams();
+}));
+ragEl('rag-params-reset').addEventListener('click', () => {
+  rag.paramValues[rag.uploadStrategy] = {};
+  renderRagParams();
+});
+
+function ragUpdateUploadBtn() {
+  const paramsOk = !Object.keys(rag.paramSpecs).length || !ragReadParams().error;
+  ragEl('rag-upload-btn').disabled = !rag.file || !paramsOk || !!rag.polling;
+  ragEl('rag-index-all').disabled = !!rag.polling;
+}
+
+ragFileEl.addEventListener('change', () => ragSetFile(ragFileEl.files[0]));
+['dragenter', 'dragover'].forEach((ev) => ragDropEl.addEventListener(ev, (e) => { e.preventDefault(); ragDropEl.classList.add('over'); }));
+['dragleave', 'drop'].forEach((ev) => ragDropEl.addEventListener(ev, (e) => { e.preventDefault(); ragDropEl.classList.remove('over'); }));
+ragDropEl.addEventListener('drop', (e) => ragSetFile(e.dataTransfer.files[0]));
+
+ragEl('rag-upload-btn').addEventListener('click', async () => {
+  if (!rag.file) return;
+  ragShowError('');
+  const { params, error } = ragReadParams();
+  if (error) { ragShowError(error); return; }
+  const query = new URLSearchParams({ name: rag.file.name, strategy: rag.uploadStrategy });
+  Object.entries(params).forEach(([k, v]) => query.set(k, String(v)));
+  ragEl('rag-upload-btn').disabled = true;
+  try {
+    const data = await ragGet(`/api/rag/upload?${query}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: rag.file,
+    });
+    ragSetFile(null);
+    ragFileEl.value = '';
+    rag.jobStrategy = data.strategy;
+    ragWatchJob(data.job);
+  } catch (e) {
+    ragShowError(String(e.message || e));
+    ragUpdateUploadBtn();
+  }
+});
+
+ragEl('rag-index-all').addEventListener('click', async () => {
+  ragShowError('');
+  try {
+    const data = await ragGet('/api/rag/index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategies: [] }),
+    });
+    ragWatchJob(data.job);
+  } catch (e) {
+    ragShowError(String(e.message || e));
+  }
+});
+
+function ragRenderJob(job) {
+  const box = ragEl('rag-job');
+  if (!job.id) { box.hidden = true; return; }
+  box.hidden = false;
+  box.classList.toggle('error', !!job.error);
+  // Идёт — имя файла и ход эмбеддингов; готово — сколько векторов сохранено.
+  ragEl('rag-job-title').textContent = job.running
+    ? job.title
+    : job.error ? job.title + ' — ошибка' : `${job.source ? ragName(job.source) : job.title}: ${job.summary || 'готово'}`;
+  ragEl('rag-job-progress').textContent = job.running ? job.progress : '';
+  const bar = box.querySelector('.rag-bar');
+  bar.hidden = !job.running;
+  const fill = ragEl('rag-bar-fill');
+  const m = job.running && /(\d+)\/(\d+)/.exec(job.progress || '');
+  fill.classList.toggle('indeterminate', job.running && !m);
+  fill.style.width = m ? `${Math.round((Number(m[1]) / Number(m[2])) * 100)}%` : '';
+  const summary = ragEl('rag-job-summary');
+  summary.hidden = !job.error;
+  summary.textContent = job.error || '';
+}
+
+async function ragPollJob(expectId) {
+  if (expectId == null) return;
+  // Опросы не накладываются: иначе поздний ответ «идёт» мог прийти после
+  // ответа «готово» и снова показать завершённую задачу.
+  if (rag.pollBusy) return;
+  rag.pollBusy = true;
+  let job;
+  try {
+    job = await ragGet('/api/rag/job');
+  } catch (e) {
+    return;
+  } finally {
+    rag.pollBusy = false;
+  }
+  if (job.running && rag.finishedJob === job.id) return;
+  if (job.id !== expectId) return;
+  rag.jobSource = job.source;
+  ragRenderJob(job);
+  if (job.running) return;
+  rag.finishedJob = job.id;
+  clearInterval(rag.polling);
+  rag.polling = null;
+  ragUpdateUploadBtn();
+  if (expectId && job.id === expectId) {
+    await Promise.all([loadRagDocs(), loadRagOverview()]);
+    // Документ открывается сам только после своей загрузки/нарезки — чужая
+    // или начатая до перезагрузки задача не перебивает то, что открыто.
+    if (job.source && !job.error && rag.ownJob === job.id) {
+      selectRagDoc(job.source, { mode: 'map', strategy: rag.jobStrategy || rag.strategy });
+    }
+  }
+}
+
+function ragWatchJob(id, own = true) {
+  if (own) rag.ownJob = id;
+  clearInterval(rag.polling);
+  rag.polling = setInterval(() => ragPollJob(id), 1000);
+  ragUpdateUploadBtn();
+  ragPollJob(id);
+}
+
+ragEl('rag-docs-filter').addEventListener('input', renderRagDocs);
+ragEl('rag-refresh').addEventListener('click', () => {
+  loadRagOverview();
+  loadRagDocs();
+  if (rag.selected) selectRagDoc(rag.selected, { version: rag.version, focus: rag.focus, fromSearch: rag.fromSearch });
+});
+
+async function openRagTab() {
+  loadRagOverview();
+  loadRagDocs();
+  // Индексация, начатая до перезагрузки страницы, — показать её ход.
+  try {
+    const job = await ragGet('/api/rag/job');
+    // Итог прошлой задачи (до перезагрузки страницы) не показывается —
+    // только идущая сейчас индексация.
+    if (job.running && !rag.polling) ragWatchJob(job.id, false);
+  } catch (e) { /* покажется при следующем открытии */ }
+}
+ragEl('tab-rag').addEventListener('click', openRagTab);
 </script>
 </body>
 </html>
