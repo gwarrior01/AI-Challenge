@@ -1,0 +1,72 @@
+[
+  {
+    "question": "Что происходит с плановым запуском агента, если агент занят другим запросом или у него активная задача?",
+    "source": "README.md",
+    "expect": "skipped, not queued"
+  },
+  {
+    "question": "На каком адресе по умолчанию слушает MCP-сервер планировщика?",
+    "source": "README.md",
+    "expect": "http://127.0.0.1:8092/mcp"
+  },
+  {
+    "question": "Почему у сервера documents в конфигурации MCP такой большой таймаут?",
+    "source": "README.md",
+    "expect": "\"timeout_sec\": 1800"
+  },
+  {
+    "question": "Какие представления jfr view профилировщик Java возвращает по умолчанию?",
+    "source": "README.md",
+    "expect": "`hot-methods`, `allocation-by-class`, `contention-by-site`, `gc-pauses`"
+  },
+  {
+    "question": "Как documents-mcp делает краткое содержание длинного документа?",
+    "source": "README.md",
+    "expect": "~12 000-character chunks"
+  },
+  {
+    "question": "Выполняются ли инструменты MCP, пока задача на этапе планирования?",
+    "source": "README.md",
+    "expect": "In `planning` the tools are offered but not run"
+  },
+  {
+    "question": "Сколько последних сообщений держит агент со стратегией sliding-window, если размер окна не задан?",
+    "source": "core/src/context.rs",
+    "expect": "DEFAULT_SLIDING_WINDOW_SIZE: usize = 6"
+  },
+  {
+    "question": "Какой минимальный интервал у планового запуска агента?",
+    "source": "core/src/automation.rs",
+    "expect": "MIN_INTERVAL: Duration = Duration::from_secs(30)"
+  },
+  {
+    "question": "Сколько ждать ответа инструмента MCP, прежде чем вызов считается неудачным?",
+    "source": "core/src/mcp.rs",
+    "expect": "CALL_TIMEOUT: Duration = Duration::from_secs(120)"
+  },
+  {
+    "question": "Что будет, если не задать адрес LLM API в переменных окружения?",
+    "source": "core/src/lib.rs",
+    "expect": "не задана переменная окружения LLM_API_URL"
+  },
+  {
+    "question": "Как при конвертации PDF в Markdown определяется, что строка — заголовок?",
+    "source": "core/src/pdf.rs",
+    "expect": "блок из одной короткой строки без точки в конце — заголовок"
+  },
+  {
+    "question": "Насколько сократилось время разбора инцидента после перехода на MCP-инструменты?",
+    "source": "mcp/documents-mcp/demo/mcp-report.pdf",
+    "expect": "сократилось с 40 до 12 минут"
+  },
+  {
+    "question": "Какую базу данных требует инвариант хранения?",
+    "source": "invariants/storage.md",
+    "expect": "БД - Postgres"
+  },
+  {
+    "question": "Насколько качество среды влияет на успешность одной и той же модели?",
+    "source": "documents/inbox/new.pdf",
+    "expect": "разницу в 22 процентных пункта"
+  }
+]

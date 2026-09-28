@@ -35,6 +35,10 @@ pub use mcp::{McpManager, McpServerInfo, McpStatus, McpToolInfo};
 pub mod pricing;
 pub use pricing::Pricing;
 
+pub mod pdf;
+
+pub mod rag;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

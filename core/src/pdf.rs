@@ -1,4 +1,7 @@
-//! Текст страниц PDF → Markdown.
+//! Текст PDF → Markdown: извлечение текста по страницам ([`extract_pages`])
+//! и восстановление структуры ([`pages_to_markdown`]). Общий для
+//! `documents-mcp` (шаг `pdf_to_markdown`) и индексации документов
+//! ([`crate::rag`]).
 //!
 //! `pdf-extract` отдаёт текст страницы как есть: строки вёрстки через `\n`,
 //! блоки (абзацы, заголовки) через пустую строку. Разметки в PDF нет, поэтому
@@ -18,6 +21,9 @@
 //! - маркеры списков (`•`, `●`, `▪`, `–` …) становятся `- `.
 
 use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{bail, Result};
 
 /// Результат конвертации: Markdown и заголовок документа (первый заголовок,
 /// если он нашёлся).
@@ -35,6 +41,43 @@ enum Block {
 
 const MAX_HEADING_CHARS: usize = 90;
 const BULLETS: &[char] = &['•', '●', '▪', '◦', '■', '□', '–', '—', '·', '*', '-', '‣'];
+
+/// Текст PDF по страницам. Основной способ — `pdftotext` из poppler, если он
+/// есть в PATH: на свёрстанных документах (кернинг, разрядка) он собирает
+/// слова правильно, а `pdf-extract` вставляет пробелы внутрь слов («К ратки й
+/// обзор»). Без poppler — `pdf-extract`, чистый Rust.
+pub async fn extract_pages(path: &Path, bytes: Vec<u8>) -> Result<(Vec<String>, &'static str)> {
+    let output = tokio::process::Command::new("pdftotext")
+        .args(["-enc", "UTF-8"])
+        .arg(path)
+        .arg("-")
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // Страницы разделены \f, после последней — тоже \f.
+            let mut pages: Vec<String> = text.split('\x0C').map(str::to_string).collect();
+            if pages.len() > 1 && pages.last().is_some_and(|p| p.trim().is_empty()) {
+                pages.pop();
+            }
+            return Ok((pages, "pdftotext"));
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("не удалось разобрать PDF (pdftotext): {}", stderr.trim());
+        }
+        Err(_) => {} // pdftotext не установлен
+    }
+    // pdf-extract на повреждённых файлах иногда паникует — в отдельной задаче
+    // паника становится обычной ошибкой, а не падением сервера.
+    let pages = tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem_by_pages(&bytes))
+        .await
+        .map_err(|e| anyhow::anyhow!("разбор PDF аварийно завершился ({e}) — файл повреждён или в неподдерживаемом формате"))?
+        .map_err(|e| anyhow::anyhow!("не удалось разобрать PDF: {e}"))?;
+    Ok((pages, "pdf-extract"))
+}
 
 pub fn pages_to_markdown(pages: &[String], fallback_title: &str) -> Converted {
     let page_lines: Vec<Vec<String>> = pages.iter().map(|p| normalize_lines(p)).collect();

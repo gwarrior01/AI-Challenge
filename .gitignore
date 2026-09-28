@@ -13,3 +13,8 @@ scheduler.db-journal
 scheduler.db-wal
 scheduler.db-shm
 documents/
+rag/index.db
+rag/index.db-journal
+rag/index.db-wal
+rag/index.db-shm
+rag/uploads/

@@ -8,7 +8,6 @@
 //! по очереди, передавая идентификатор из ответа одного шага следующему;
 //! данные сверяются по SHA-256 (см. [`store`], [`steps`]).
 
-mod markdown;
 mod steps;
 mod store;
 mod summarize;

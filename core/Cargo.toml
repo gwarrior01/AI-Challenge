@@ -19,6 +19,9 @@ rmcp = { version = "3.4", default-features = false, features = [
     "reqwest",
 ] }
 http = "1"
+# Текст PDF для documents-mcp и индексации документов (см. src/pdf.rs).
+pdf-extract = "0.12"
+sha2 = "0.10"
 futures-util = "0.3"
 
 [dev-dependencies]

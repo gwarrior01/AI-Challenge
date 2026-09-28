@@ -1,5 +1,7 @@
 //! Веб-интерфейс LLM-агента (axum): чат в браузере со счётчиком токенов на запрос и за сессию.
 
+mod rag;
+
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
@@ -23,6 +25,8 @@ struct AppState {
     /// жизненный цикл (запущен/остановлен), запросы обрабатывает сам агент, а не
     /// прямой вызов клиента.
     agents: Arc<AgentManager>,
+    /// Фоновая индексация вкладки «RAG» (см. rag.rs) — одна на сервер.
+    rag_job: rag::SharedJob,
 }
 
 #[derive(Deserialize)]
@@ -1201,6 +1205,7 @@ async fn main() -> Result<()> {
         analysis_model: Arc::new(analysis_model),
         index_html: Arc::new(index_html),
         agents,
+        rag_job: Default::default(),
     };
 
     let app = Router::new()
@@ -1260,6 +1265,7 @@ async fn main() -> Result<()> {
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/:name/:action", post(set_mcp_enabled))
         .route("/api/mcp/:name/tools/:tool", post(call_mcp_tool))
+        .merge(rag::routes())
         .with_state(state);
 
     let port = std::env::var("PORT").ok().and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(8080);

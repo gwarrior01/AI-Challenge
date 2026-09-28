@@ -76,6 +76,17 @@
 //! `jobs list all`), и плановые запуски всех агентов — кто присылает сводки
 //! (`schedule on|off|run|remove <id>`; добавляются на экране памяти агента).
 //!
+//! ## Индекс документов (F6 с любого экрана)
+//!
+//! Локальный индекс для RAG (см. llm_core::rag): `index [стратегия|all]`
+//! разбивает корпус на чанки (fixed, structure, sentence, parent) и получает эмбеддинги,
+//! `add <путь> [стратегия] [параметр=значение …]` векторизует один файл
+//! (вне корпуса — копией в папку загрузок) с выбранными параметрами
+//! нарезки (`add отчёт.pdf fixed size=800 overlap=100`), `remove <путь>` удаляет документ из индекса,
+//! `search`, `docs`, `versions <путь>`, `compare`, `prune`, `reset` — те же
+//! команды, что `llm-cli rag …`. Команды выполняются в фоне, ход индексации
+//! виден в строке статуса, экран можно покинуть.
+//!
 //! ## MCP (F4 с любого экрана)
 //!
 //! Экран MCP-серверов (см. llm_core::mcp) из файла `mcp.json` (или
@@ -223,6 +234,9 @@ enum Screen {
     /// Расписание: задания MCP-планировщика и плановые запуски агентов (F5 с
     /// любого экрана, F5/Esc — обратно).
     Schedule,
+    /// Индекс документов для RAG (см. llm_core::rag): индексация, поиск,
+    /// версии, сравнение стратегий (F6 с любого экрана, F6/Esc — обратно).
+    Rag,
 }
 
 /// Шаги мастера создания агента — по одному вопросу за раз в нижнем поле ввода.
@@ -447,6 +461,10 @@ enum AppEvent {
     /// Список заданий MCP-планировщика обновлён (см. llm_core::automation::scheduler_jobs);
     /// `message` — итог команды `jobs …` для строки статуса экрана памяти.
     SchedulerJobs { jobs: Result<Vec<llm_core::SchedulerJob>, String>, message: Option<(String, bool)> },
+    /// Ход команды индекса документов (индексация, сравнение) — для строки статуса.
+    RagProgress(String),
+    /// Команда индекса документов завершилась: вывод или текст ошибки.
+    RagDone(Result<String, String>),
 }
 
 /// Ручной вызов инструмента с экрана MCP — показывается под этим инструментом.
@@ -541,6 +559,13 @@ struct DrawState<'a> {
     mcp_editing: bool,
     /// Последний ручной вызов инструмента (идущий или завершённый).
     mcp_call: Option<&'a McpCallView>,
+    /// Экран индекса: вывод последней команды, итог/ход в строке статуса,
+    /// идёт ли команда, прокрутка и её предел.
+    rag_output: &'a str,
+    rag_status: Option<(&'a str, bool)>,
+    rag_running: bool,
+    rag_scroll: u16,
+    rag_scroll_max: &'a std::cell::Cell<u16>,
 }
 
 /// Высота поля ввода по умолчанию (1 строка текста + рамка сверху/снизу).
@@ -607,7 +632,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut history: Vec<HistoryItem> = vec![HistoryItem {
         role: Role::System,
         text: "Challenger (TUI). Enter — отправить, Esc — выход, Tab — JSON запроса/ответа, \
-               F2 — управление агентами, F4 — MCP-серверы, F5 — расписание."
+               F2 — управление агентами, F4 — MCP-серверы, F5 — расписание, F6 — индекс документов."
             .to_string(),
         debug: None,
         tokens: None,
@@ -684,6 +709,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut schedule_scroll: u16 = 0;
     let schedule_scroll_max = std::cell::Cell::new(u16::MAX);
     let mut schedule_status: Option<(String, bool)> = None;
+    // Экран индекса документов (F6): куда вернуться, вывод последней команды
+    // (при входе — сводка индекса), итог или ход команды, идёт ли она сейчас.
+    // Команды долгие (индексация — минуты), поэтому выполняются в фоне.
+    let rag_config = llm_core::rag::RagConfig::from_env();
+    let mut rag_return = Screen::Chat;
+    let mut rag_output = String::new();
+    let mut rag_status: Option<(String, bool)> = None;
+    let mut rag_running = false;
+    let mut rag_scroll: u16 = 0;
+    let rag_scroll_max = std::cell::Cell::new(u16::MAX);
     // Прокрутка экрана памяти: разделов много, на невысоком терминале нижние
     // (плановые запуски) иначе не видны.
     let mut memory_scroll: u16 = 0;
@@ -878,6 +913,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             mcp_tool_selected,
             mcp_editing,
             mcp_call: mcp_call.as_ref(),
+            rag_output: &rag_output,
+            rag_status: rag_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
+            rag_running,
+            rag_scroll,
+            rag_scroll_max: &rag_scroll_max,
         };
         terminal.draw(|frame| draw(frame, &draw_state))?;
 
@@ -899,10 +939,32 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 Screen::AgentCreate => { wizard = None; Screen::AgentsList }
                                 Screen::AgentChat | Screen::AgentMemory => { agent_chat_name = None; Screen::AgentsList }
                                 Screen::Mcp => { mcp_editing = false; Screen::AgentsList }
-                                Screen::Schedule => Screen::AgentsList,
+                                Screen::Schedule | Screen::Rag => Screen::AgentsList,
                             };
                             input.clear();
                             confirm_delete = None;
+                            continue;
+                        }
+
+                        // F6 — индекс документов, как F5 — с любого экрана и обратно.
+                        // Команда индекса продолжает выполняться в фоне и после ухода с экрана.
+                        if key.code == KeyCode::F(6) {
+                            if screen == Screen::Rag {
+                                screen = rag_return;
+                            } else {
+                                if screen == Screen::Mcp {
+                                    mcp_editing = false;
+                                }
+                                rag_return = screen;
+                                screen = Screen::Rag;
+                                rag_scroll = 0;
+                                if !rag_running {
+                                    rag_status = None;
+                                    rag_running = true;
+                                    spawn_rag_command(rag_config.clone(), vec!["status".to_string()], tx.clone());
+                                }
+                            }
+                            input.clear();
                             continue;
                         }
 
@@ -1213,6 +1275,40 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             // обращения к LLM здесь нет), поэтому `waiting` не проверяется:
                             // это не мешает и не мешается запросу к самой LLM, если он
                             // сейчас выполняется в фоне для этого же или другого агента.
+                            Screen::Rag => match key.code {
+                                KeyCode::Esc => {
+                                    screen = rag_return;
+                                    input.clear();
+                                }
+                                KeyCode::Up => rag_scroll = rag_scroll.saturating_sub(1),
+                                KeyCode::Down => rag_scroll = rag_scroll.saturating_add(1).min(rag_scroll_max.get()),
+                                KeyCode::PageUp => rag_scroll = rag_scroll.saturating_sub(PAGE_STEP),
+                                KeyCode::PageDown => {
+                                    rag_scroll = rag_scroll.saturating_add(PAGE_STEP).min(rag_scroll_max.get())
+                                }
+                                KeyCode::Enter => {
+                                    let words: Vec<String> = input.split_whitespace().map(str::to_string).collect();
+                                    if words.is_empty() {
+                                        continue;
+                                    }
+                                    if rag_running {
+                                        rag_status = Some((
+                                            "Предыдущая команда индекса ещё выполняется — дождитесь её".to_string(),
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                    input.clear();
+                                    rag_status = Some((format!("{}…", words.join(" ")), false));
+                                    rag_running = true;
+                                    spawn_rag_command(rag_config.clone(), words, tx.clone());
+                                }
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            },
                             Screen::Schedule => match key.code {
                                 KeyCode::Esc => {
                                     screen = schedule_return;
@@ -1526,7 +1622,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
                         Screen::AgentMemory => input.push_str(&text),
                         Screen::Mcp if mcp_editing => input.push_str(&text),
-                        Screen::Schedule => input.push_str(&text),
+                        Screen::Schedule | Screen::Rag => input.push_str(&text),
                         Screen::AgentCreate if wizard.as_ref().is_some_and(|w| w.quick.is_some()) => {
                             input.push_str(&text);
                         }
@@ -1554,6 +1650,30 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         scheduler_jobs = Some(jobs);
                         if message.is_some() {
                             schedule_status = message;
+                        }
+                        continue;
+                    }
+                    AppEvent::RagProgress(line) => {
+                        rag_status = Some((line, false));
+                        continue;
+                    }
+                    AppEvent::RagDone(result) => {
+                        rag_running = false;
+                        rag_scroll = 0;
+                        match result {
+                            Ok(text) => {
+                                rag_output = text;
+                                rag_status = None;
+                            }
+                            // Многострочная ошибка (например, со списком команд) —
+                            // целиком в основную область, первая строка — в статус.
+                            Err(err) => {
+                                let first = err.lines().next().unwrap_or_default().to_string();
+                                if err.contains('\n') {
+                                    rag_output = err;
+                                }
+                                rag_status = Some((first, true));
+                            }
                         }
                         continue;
                     }
@@ -1727,7 +1847,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                 waiting = false;
                 waiting_agent = None;
             }
-            _ = spinner_tick.tick(), if waiting => {
+            _ = spinner_tick.tick(), if waiting || rag_running => {
                 spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
             }
             _ = activity_tick.tick() => {
@@ -1774,7 +1894,81 @@ fn draw(frame: &mut Frame, state: &DrawState) {
         Screen::AgentMemory => draw_agent_memory(frame, state),
         Screen::Mcp => draw_mcp(frame, state),
         Screen::Schedule => draw_schedule(frame, state),
+        Screen::Rag => draw_rag(frame, state),
     }
+}
+
+/// Запускает команду индекса документов (см. llm_core::rag::run_command) в
+/// фоне: ход — событиями RagProgress, итог — RagDone.
+fn spawn_rag_command(cfg: llm_core::rag::RagConfig, words: Vec<String>, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let progress = move |line: String| {
+            let _ = progress_tx.send(AppEvent::RagProgress(line));
+        };
+        let args: Vec<&str> = words.iter().map(String::as_str).collect();
+        let result = llm_core::rag::run_command(&cfg, &args, &progress).await.map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RagDone(result));
+    });
+}
+
+/// Экран индекса документов (F6): вывод последней команды (сводка, поиск,
+/// версии, сравнение) и поле для команд.
+fn draw_rag(frame: &mut Frame, state: &DrawState) {
+    let area = frame.area();
+    let chunks = layout_chunks(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✦ Challenger", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  Индекс документов (RAG)  ·  F6/Esc — назад"),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(header, chunks[0]);
+
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let section_style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if state.rag_output.is_empty() {
+        lines.push(Line::from(Span::styled("загрузка…", hint_style)));
+    }
+    for line in state.rag_output.lines() {
+        // Заголовки групп поиска («── fixed ──») и таблиц — цветом.
+        let style = if line.starts_with("── ") || line.starts_with("стратегия ") || line == "Чанки" || line.starts_with("Поиск по ") {
+            section_style
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    }
+    lines.push(Line::from(""));
+    for line in llm_core::rag::HELP.lines() {
+        lines.push(Line::from(Span::styled(line.to_string(), hint_style)));
+    }
+
+    let visible = chunks[1].height.saturating_sub(2);
+    let inner_width = chunks[1].width.saturating_sub(2).max(1);
+    // Длинные строки переносятся — считаем строки после переноса.
+    let wrapped: u16 = lines.iter().map(|l| (l.width() as u16).div_ceil(inner_width).max(1)).sum();
+    let max_scroll = wrapped.saturating_sub(visible);
+    state.rag_scroll_max.set(max_scroll);
+    let title = if wrapped > visible { " Индекс · ↑/↓ PgUp/PgDn — прокрутка " } else { " Индекс " };
+    let body = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.rag_scroll.min(max_scroll), 0))
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title));
+    frame.render_widget(body, chunks[1]);
+
+    let (status_text, status_color) = match state.rag_status {
+        Some((text, is_error)) if !state.rag_running => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
+        Some((text, _)) => (format!(" {} {text}", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow),
+        None if state.rag_running => (format!(" {} выполняется…", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow),
+        None => (
+            " Например: add ~/Downloads/отчёт.pdf fixed size=800 overlap=100 · search -s structure таймаут MCP · versions README.md · remove rag/uploads/отчёт.pdf".to_string(),
+            Color::DarkGray,
+        ),
+    };
+    frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(status_color)), chunks[2]);
+    render_input_box(frame, chunks[3], state.input, " Команда — Enter выполнить, F6/Esc назад ".to_string(), Color::Reset);
 }
 
 fn draw_chat(frame: &mut Frame, state: &DrawState) {
