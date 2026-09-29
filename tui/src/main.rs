@@ -87,6 +87,14 @@
 //! команды, что `llm-cli rag …`. Команды выполняются в фоне, ход индексации
 //! виден в строке статуса, экран можно покинуть.
 //!
+//! ## RAG-режим агента (Ctrl+R в чате агента)
+//!
+//! Агент отвечает с базой документов или без неё (см. llm_core::rag::retrieve):
+//! Ctrl+R в чате включает режим с параметрами по умолчанию и выключает его,
+//! `rag on [стратегия] [k=N] [min=0.5]` / `rag off` на экране памяти (F3)
+//! задают параметры. Режим виден в шапке чата, найденные фрагменты —
+//! строкой «RAG» перед ответом: номера [n] в ответе ссылаются на них.
+//!
 //! ## MCP (F4 с любого экрана)
 //!
 //! Экран MCP-серверов (см. llm_core::mcp) из файла `mcp.json` (или
@@ -140,6 +148,9 @@ enum Role {
     /// llm_core::ToolCallRecord; `ToolError` — вызов завершился ошибкой.
     Tool,
     ToolError,
+    /// Что нашёл поиск RAG-режима для вопроса (см. llm_core::rag::retrieve) —
+    /// источники под номерами, на которые ссылается ответ.
+    Rag,
 }
 
 struct HistoryItem {
@@ -1242,6 +1253,28 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         }
                                     }
                                 }
+                                // Ctrl+R — RAG-режим вкл/выкл: один и тот же вопрос можно
+                                // задать с базой документов и без неё и сравнить ответы.
+                                // Включается с параметрами по умолчанию, свои — `rag on …` на F3.
+                                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(name) = agent_chat_name.clone() {
+                                        if let Some(agent) = agent_manager.get(&name) {
+                                            let text = match toggle_rag(&agent) {
+                                                Ok(text) => text,
+                                                Err(err) => format!("не удалось переключить RAG: {err}"),
+                                            };
+                                            agent_histories.entry(name).or_default().push(HistoryItem {
+                                                role: Role::System,
+                                                text,
+                                                debug: None,
+                                                tokens: None,
+                                                cost: None,
+                                                cost_approx: false,
+                                            });
+                                            follow_bottom = true;
+                                        }
+                                    }
+                                }
                                 KeyCode::PageUp => {
                                     follow_bottom = false;
                                     scroll = scroll.saturating_sub(PAGE_STEP);
@@ -1782,6 +1815,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 let facts_updated = reply.facts_updated;
                                 // Вызовы инструментов — отдельными строками перед ответом,
                                 // в том порядке, в каком их делала модель.
+                                // Найденные RAG-фрагменты — перед ответом: поиск шёл до
+                                // запроса к модели, а номера [n] в ответе ссылаются на них.
+                                if let Some(rag) = &reply.rag {
+                                    entry.push(HistoryItem {
+                                        role: Role::Rag,
+                                        text: rag.summary_lines().join("\n"),
+                                        debug: None,
+                                        tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
+                                    });
+                                }
                                 for call in &reply.tool_calls {
                                     entry.push(HistoryItem {
                                         role: if call.is_error { Role::ToolError } else { Role::Tool },
@@ -2789,8 +2834,12 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Span::styled(name, Style::default().fg(Color::Cyan)),
         Span::raw(if state.agent_chat_running { "  ·  запущен" } else { "  ·  остановлен" }),
     ];
+    match state.agents.iter().find(|a| a.config.name == name).and_then(|a| a.config.rag.as_ref()) {
+        Some(rag) => header_spans.push(Span::styled(format!("  ·  {}", rag.describe()), Style::default().fg(Color::Yellow))),
+        None => header_spans.push(Span::styled("  ·  без RAG", Style::default().fg(Color::DarkGray))),
+    }
     header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
-    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  Ctrl+R RAG  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
     let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
@@ -2939,6 +2988,19 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
                 hint_style,
             )));
         }
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled("База документов — RAG-режим (индекс F6)", section_style)));
+    match info.and_then(|i| i.config.rag.as_ref()) {
+        Some(rag) => lines.push(Line::from(format!(
+            "  включён — {}: к каждому вопросу добавляются найденные фрагменты · rag off — выключить",
+            rag.describe()
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "  выключен — агент отвечает без базы документов · rag on [fixed|structure|sentence|parent] [k=N] [min=0.5]",
+            hint_style,
+        ))),
     }
     lines.push(Line::from(""));
 
@@ -3112,6 +3174,7 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
              task approve · task reject <причина> · task finish · task invariant set/remove <id> [текст] · \
              task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
              profile new <имя> · invariants new <id> · invariants remove <id> · \
+             rag on [стратегия] [k=N] [min=0.5] · rag off · \
              schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
                 .to_string(),
             Color::DarkGray,
@@ -3217,6 +3280,23 @@ fn send_to_agent(
         };
         let _ = tx.send(AppEvent::AgentResponse { name, result: response });
     });
+}
+
+/// Ctrl+R в чате агента: RAG-режим вкл/выкл (включается с параметрами по
+/// умолчанию). Возвращает строку для чата.
+fn toggle_rag(agent: &llm_core::Agent) -> Result<String> {
+    let mut config = agent.config();
+    let text = match config.rag.take() {
+        Some(_) => "RAG-режим выключен — агент отвечает без базы документов.".to_string(),
+        None => {
+            let settings = llm_core::rag::RagSettings::default();
+            let text = format!("RAG-режим включён — {}: к вопросу добавляются найденные фрагменты.", settings.describe());
+            config.rag = Some(settings);
+            text
+        }
+    };
+    agent.set_config(config)?;
+    Ok(text)
 }
 
 fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, String> {
@@ -3416,7 +3496,25 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             }
             _ => Err("укажите действие: invariants new <id> или invariants remove <id>".to_string()),
         },
-        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile/invariants")),
+        Some("rag") => {
+            let mut config = agent.config();
+            let text = match tokens.get(1).copied() {
+                Some("on") => {
+                    let settings = llm_core::rag::RagSettings::parse_args(&tokens[2..]).map_err(|err| err.to_string())?;
+                    let text = format!("RAG-режим включён — {}.", settings.describe());
+                    config.rag = Some(settings);
+                    text
+                }
+                Some("off") => {
+                    config.rag = None;
+                    "RAG-режим выключен — агент отвечает без базы документов.".to_string()
+                }
+                _ => return Err("укажите действие: rag on [стратегия] [k=N] [min=0.5] или rag off".to_string()),
+            };
+            agent.set_config(config).map_err(|err| err.to_string())?;
+            Ok(text)
+        }
+        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile/invariants/rag")),
         None => Ok(String::new()),
     }
 }
@@ -3432,6 +3530,7 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
         Role::Compression => ("Сжатие", Color::Yellow),
         Role::Tool => ("Тул", Color::Magenta),
         Role::ToolError => ("Тул ⚠", Color::Red),
+        Role::Rag => ("RAG", Color::Yellow),
     };
 
     let prefix_width = label.chars().count() + 2;

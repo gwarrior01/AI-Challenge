@@ -2473,6 +2473,47 @@
     border-color: rgba(255, 107, 107, 0.5);
   }
 
+  /* Найденные RAG-фрагменты — перед ответом агента: [n] ответа ссылаются на них. */
+  .agent-chat-main .agent-message.rag,
+  .agent-message.rag {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px solid rgba(234, 179, 8, 0.5);
+    font-size: 12.5px;
+    padding: 6px 12px;
+    border-radius: 10px;
+    max-width: 100%;
+  }
+
+  .agent-message.rag.error {
+    border-color: rgba(255, 107, 107, 0.5);
+    color: var(--error);
+  }
+
+  .agent-message.rag .rag-head {
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+
+  .agent-message.rag summary {
+    cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow-wrap: anywhere;
+  }
+
+  .agent-message.rag pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 260px;
+    overflow: auto;
+    margin: 4px 0 6px;
+  }
+
+  #agent-rag-toggle.on {
+    border-color: rgba(234, 179, 8, 0.7);
+    color: rgb(234, 179, 8);
+  }
+
   /* Вызов инструмента моделью в чате агента — перед её ответом. */
   .agent-chat-main .agent-message.tool,
   .agent-message.tool {
@@ -2875,6 +2916,14 @@
       <span class="card-hint" id="agent-chat-meta"></span>
     </div>
     <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
+    <button type="button" class="settings-btn" id="agent-rag-toggle" title="RAG-режим: к каждому вопросу добавляются найденные фрагменты базы документов (вкладка RAG)">📚 RAG</button>
+    <select id="agent-rag-strategy" class="settings-btn" title="Стратегия нарезки, по чанкам которой ищет RAG-режим">
+      <option value="auto">авто</option>
+      <option value="fixed">fixed</option>
+      <option value="structure">structure</option>
+      <option value="sentence">sentence</option>
+      <option value="parent">parent</option>
+    </select>
     <button type="button" class="settings-btn" id="agent-memory-toggle">🧠 Память</button>
     <label class="debug-check">
       <input type="checkbox" id="agent-chat-debug-toggle">
@@ -4278,6 +4327,8 @@ const viewAgents = document.getElementById('view-agents');
 const viewAgentChat = document.getElementById('view-agent-chat');
 const agentChatBackBtn = document.getElementById('agent-chat-back');
 const agentChatToggleBtn = document.getElementById('agent-chat-toggle');
+const agentRagToggleBtn = document.getElementById('agent-rag-toggle');
+const agentRagStrategyEl = document.getElementById('agent-rag-strategy');
 const agentChatStatusDot = document.getElementById('agent-chat-status-dot');
 const agentChatNameEl = document.getElementById('agent-chat-name');
 const agentChatMetaEl = document.getElementById('agent-chat-meta');
@@ -5398,6 +5449,7 @@ function agentMetaLine(config) {
   if (config.reasoning === false) parts.push('reasoning: выкл');
   parts.push('стратегия контекста: ' + (config.context_strategy || 'full'));
   parts.push('профиль: ' + (config.profile && config.profile.trim() ? config.profile : 'default'));
+  parts.push(config.rag ? `RAG: ${config.rag.strategy || 'авто'}, k=${config.rag.k}` : 'без RAG');
   return parts.join(' · ');
 }
 
@@ -5447,6 +5499,38 @@ function renderAgentMessage(msg) {
     resultPre.textContent = call.result || '';
     details.append(summary, argsLabel, argsPre, resultLabel, resultPre);
     row.append(details, preview);
+    return row;
+  }
+  // Что нашёл поиск RAG-режима: заголовок и источники [n], по клику — текст
+  // фрагмента, ушедший модели.
+  if (msg.role === 'rag') {
+    const rag = msg.rag;
+    const head = document.createElement('div');
+    head.className = 'rag-head';
+    row.appendChild(head);
+    if (rag.error) {
+      row.classList.add('error');
+      head.textContent = '📚 RAG: поиск не удался — ответ без контекста: ' + rag.error;
+      return row;
+    }
+    if (!rag.sources.length) {
+      head.textContent = `📚 RAG (${rag.strategy}): ` + (rag.below_threshold
+        ? `все ${rag.below_threshold} найденных фрагментов ниже порога близости`
+        : 'в индексе ничего не нашлось');
+      return row;
+    }
+    head.textContent = `📚 RAG (${rag.strategy}): ${rag.sources.length} фрагм. — в ответе ссылки [n]`;
+    rag.sources.forEach((src) => {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      const section = src.section ? ` › ${src.section}` : '';
+      const version = src.version > 1 ? ` (версия ${src.version})` : '';
+      summary.textContent = `[${src.n}] ${src.source}${version}${section} · строки ${src.start_line}–${src.end_line} · ${src.score.toFixed(2)}`;
+      const pre = document.createElement('pre');
+      pre.textContent = src.text;
+      details.append(summary, pre);
+      row.appendChild(details);
+    });
     return row;
   }
   // Служебная пометка о задаче (например, «⏸ Задача поставлена на паузу.») —
@@ -5643,6 +5727,12 @@ function updateAgentChatHeader(name) {
   agentChatInputEl.placeholder = running ? 'Написать агенту...' : 'Сначала запустите агента';
   agentChatToggleBtn.hidden = !info;
   agentChatToggleBtn.textContent = running ? '⏸ Остановить' : '▶ Запустить';
+  const rag = info ? info.config.rag : null;
+  agentRagToggleBtn.hidden = !info;
+  agentRagToggleBtn.classList.toggle('on', !!rag);
+  agentRagToggleBtn.textContent = rag ? '📚 RAG: вкл' : '📚 RAG: выкл';
+  agentRagStrategyEl.hidden = !info;
+  agentRagStrategyEl.value = (rag && rag.strategy) || 'auto';
 
   if (info && typeof info.context_window === 'number') {
     ensureAgentChatStats(name).contextWindow = info.context_window;
@@ -5737,6 +5827,43 @@ agentChatToggleBtn.addEventListener('click', async () => {
   }
 });
 
+// RAG-режим агента: вкл/выкл кнопкой, стратегия — списком рядом (смена
+// стратегии у выключенного режима его и включает). Сообщение в ленте чата
+// отмечает, с какого места ответы идут с базой документов или без неё.
+async function setAgentRag(enabled) {
+  const name = currentAgentChatName;
+  if (!name) return;
+  agentRagToggleBtn.disabled = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/rag`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, strategy: agentRagStrategyEl.value }),
+    });
+    const data = await res.json();
+    const rag = data.agent ? data.agent.config.rag : null;
+    const notice = data.error
+      ? { role: 'error', text: data.error }
+      : { role: 'notice', text: rag
+          ? `📚 RAG-режим включён — ${rag.strategy || 'авто'}, k=${rag.k}: к вопросу добавляются найденные фрагменты.`
+          : '📚 RAG-режим выключен — агент отвечает без базы документов.' };
+    agentChats[name].push(notice);
+    if (currentAgentChatName === name) {
+      agentChatMainEl.appendChild(renderAgentMessage(notice));
+      agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+    }
+    await fetchAgents();
+  } finally {
+    agentRagToggleBtn.disabled = false;
+  }
+}
+
+agentRagToggleBtn.addEventListener('click', () => {
+  const info = findAgentInfo(currentAgentChatName);
+  setAgentRag(!(info && info.config.rag));
+});
+agentRagStrategyEl.addEventListener('change', () => setAgentRag(true));
+
 // `promptOverride` — когда обмен запускается программно, а не вводом человека
 // (см. approve-обработчик ниже: после утверждения предложенного моделью
 // перехода запрос на продолжение уходит сам, без набора текста пользователем).
@@ -5807,6 +5934,20 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
     // Вызовы инструментов — перед ответом, в том порядке, в каком их делала
     // модель. Уже показанные по ходу обмена строки получают итоговые данные.
     if (livePoll) clearInterval(livePoll);
+    // Найденные RAG-фрагменты — перед вызовами инструментов и ответом: поиск
+    // идёт раньше запроса к модели.
+    if (!data.error && data.rag) {
+      const ragMsg = { role: 'rag', rag: data.rag };
+      const firstLive = live.rows.length ? agentChats[name].indexOf(live.rows[0].msg) : -1;
+      if (firstLive >= 0) agentChats[name].splice(firstLive, 0, ragMsg);
+      else agentChats[name].push(ragMsg);
+      if (currentAgentChatName === name) {
+        const liveFirst = live.rows.length ? live.rows[0].row : null;
+        const ragRow = renderAgentMessage(ragMsg);
+        if (liveFirst && liveFirst.parentNode === agentChatMainEl) agentChatMainEl.insertBefore(ragRow, liveFirst);
+        else agentChatMainEl.appendChild(ragRow);
+      }
+    }
     finishLiveToolCalls(name, live, (!data.error && data.tool_calls) || []);
     agentChats[name].push(msg);
     if (currentAgentChatName === name) {

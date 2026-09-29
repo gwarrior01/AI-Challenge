@@ -107,6 +107,20 @@ struct AgentAskRequest {
     continuation: bool,
 }
 
+/// Тело запроса на включение/выключение RAG-режима агента (см.
+/// llm_core::rag::retrieve): `enabled: false` — без базы документов;
+/// стратегия/k/порог не заданы — значения по умолчанию.
+#[derive(Deserialize)]
+struct SetRagRequest {
+    enabled: bool,
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    k: Option<usize>,
+    #[serde(default)]
+    min_score: Option<f32>,
+}
+
 #[derive(Deserialize)]
 struct SetStrategyRequest {
     context_strategy: String,
@@ -316,6 +330,7 @@ async fn create_agent(
         context_strategy,
         window_size: req.window_size.filter(|&n| n > 0),
         profile: req.profile.filter(|s| !s.trim().is_empty()),
+        rag: None,
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -338,6 +353,41 @@ async fn set_agent_strategy(
     };
     let mut config = agent.config();
     config.context_strategy = strategy;
+    match agent.set_config(config) {
+        Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// Включает или выключает RAG-режим агента — на лету, как стратегию и профиль.
+async fn set_agent_rag(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetRagRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let mut config = agent.config();
+    config.rag = if req.enabled {
+        // Та же проверка параметров, что у команды `rag on …` в TUI/CLI.
+        let mut args = Vec::new();
+        if let Some(strategy) = req.strategy.filter(|s| !s.trim().is_empty() && s != "auto") {
+            args.push(strategy);
+        }
+        if let Some(k) = req.k {
+            args.push(format!("k={k}"));
+        }
+        if let Some(min) = req.min_score {
+            args.push(format!("min={min}"));
+        }
+        match llm_core::rag::RagSettings::parse_args(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
+            Ok(settings) => Some(settings),
+            Err(err) => return Json(serde_json::json!({ "error": err.to_string() })),
+        }
+    } else {
+        None
+    };
     match agent.set_config(config) {
         Ok(()) => Json(serde_json::json!({ "agent": agent.info() })),
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
@@ -915,6 +965,9 @@ async fn ask_agent(
                 // Вызовы инструментов MCP-серверов за этот обмен — чат показывает
                 // их перед ответом (см. AgentReply::tool_calls).
                 "tool_calls": reply.tool_calls,
+                // Что нашёл поиск RAG-режима (источники [n] ответа) — null, если
+                // режим выключен (см. AgentReply::rag).
+                "rag": reply.rag,
             }))
         }
         Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
@@ -1221,6 +1274,7 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/history", get(agent_history))
         .route("/api/agents/:name/strategy", post(set_agent_strategy))
         .route("/api/agents/:name/profile", post(set_agent_profile))
+        .route("/api/agents/:name/rag", post(set_agent_rag))
         .route("/api/profiles", get(list_profiles).post(create_profile))
         .route(
             "/api/invariants",

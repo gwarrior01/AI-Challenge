@@ -435,6 +435,27 @@ llm-cli rag remove rag/uploads/report.pdf  # drop a document from the index (an 
 
 **Comparison** (`compare`, report in [`rag/compare.md`](rag/compare.md)). Chunk statistics per strategy — count, length min/median/p95/max, how many chunks end mid-sentence, how many cut a code block, how many have a section, embedding time — and retrieval quality on 14 control questions from `rag/eval.json`: each names a fragment of the answer and the document it was taken from; a chunk counts as found if it contains the whole fragment — from any document, since the same fact in a code doc comment is a right answer too. Embedding time and count are taken from the last full build of each strategy. The report gives hit@1/3/5, MRR@5, a per-question table and the questions where the strategies disagreed, with each strategy's top chunk.
 
+### RAG mode: an agent answering from the documents
+
+Any named agent can answer with or without the document index — a switch per agent (`AgentConfig::rag`, stored with the agent's config, off by default). With RAG on, every question goes through `core/src/rag/retrieve.rs`:
+
+**question → search for relevant chunks → question joined with them → request to the LLM.**
+
+1. The question is embedded and the top-`k` chunks of the chosen strategy are taken from the current versions of the indexed documents (the same `search` as `llm-cli rag search`; for `parent` the parent paragraph goes to the model, not the child sentence). Chunks below the similarity threshold (`min`, off by default) are dropped.
+2. Instead of the bare question the model gets the numbered fragments with their sources — `[1] README.md › MCP › … · строки 270–284 (близость 0.70)` and the text — plus the rules: answer from the fragments, cite them as `[1]`, `[2]`, ignore the irrelevant ones, say so when the answer isn't there and mark anything added from general knowledge. When nothing was found the model is told the base has no answer rather than being left to answer as if it came from the documents.
+3. The history keeps the original question only: the fragments are needed for this answer, the next question gets its own. A task continuation (after approve/resume) isn't a question and gets no search; a scheduled run does.
+4. The reply carries what was found (`AgentReply::rag` — strategy, sources with lines and scores, the fragment texts), shown above the answer in every interface so the `[n]` in the answer can be checked. If the search fails (empty index, embedding server down, a strategy nothing was cut with), the answer comes without context and the interface says why instead of failing the whole exchange.
+
+Settings: strategy (`fixed` / `structure` / `sentence` / `parent`; by default the first one the index has, in that order), `k` (1–20, default 5), `min` (0–1). The index is filled as in the section above; `LLM_EMBEDDING_MODEL` must be set.
+
+| Interface | Switch | Sources |
+|---|---|---|
+| TUI | **Ctrl+R** in the agent chat — on (defaults) / off; `rag on [strategy] [k=N] [min=0.5]` / `rag off` on the memory screen (F3), which also shows the mode. The chat header shows `RAG: structure, k=5` or `без RAG` | a yellow **RAG** line before the answer: `[n] source › section · lines · score` |
+| Web | **📚 RAG: вкл/выкл** and the strategy list in the agent chat header (`POST /api/agents/:name/rag` `{enabled, strategy?, k?, min_score?}`) | a card before the answer; each source expands to the text the model got |
+| CLI | `llm-cli agent rag <name> [on [strategy] [k=N] [min=0.5] \| off]`; `/rag on …`, `/rag off` inside `agent chat` | `📚 [n] …` lines before the answer |
+
+To compare the two modes, ask the same question, toggle the mode (Ctrl+R / the button / `/rag off`) and ask again: the answer without RAG comes only from the model's own knowledge, the one with RAG from the fragments shown above it.
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -603,7 +624,7 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI)
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI, retrieve.rs — RAG mode of agents: search by the question and the context for the LLM)
 cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents, `mcp` subcommand for MCP servers and `rag` subcommand for the document index
 mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
