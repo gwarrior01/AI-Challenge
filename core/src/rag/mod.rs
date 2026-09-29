@@ -5,7 +5,8 @@
 //!   [`crate::pdf`]);
 //! - [`chunking`] — стратегии `fixed`, `structure`, `sentence`, `parent`;
 //! - [`embed`] — клиент `/embeddings` (модель — `LLM_EMBEDDING_MODEL`);
-//! - [`store`] — индекс: документы, версии, чанки, векторы.
+//! - [`store`] — индекс: документы, версии, чанки, векторы;
+//! - [`retrieve`] — RAG-режим агента: поиск по вопросу и контекст для LLM.
 //!
 //! **Версии.** Индексация сравнивает SHA-256 файла с действующей версией
 //! документа: изменился — появляется версия N+1, прежняя становится
@@ -24,6 +25,7 @@ pub mod browse;
 pub mod chunking;
 pub mod corpus;
 pub mod embed;
+pub mod retrieve;
 pub mod store;
 
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 pub use chunking::{ChunkParams, Kind, ParamSpec, Strategy};
 pub use embed::Embedder;
+pub use retrieve::{RagContext, RagSettings, RagSource};
 use store::{ChunkHit, ChunkRow, NewVersion, Store};
 
 /// Куда писать о ходе долгой операции (индексации, сравнения).

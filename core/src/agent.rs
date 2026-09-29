@@ -199,6 +199,12 @@ pub struct AgentConfig {
     /// профиль описывает КАК отвечать, память — ЧТО агент знает.
     #[serde(default)]
     pub profile: Option<String>,
+    /// RAG-режим (см. [`crate::rag::retrieve`]): `Some` — перед каждым
+    /// вопросом человека (и плановым запуском) ищутся релевантные чанки
+    /// индекса документов, и модель получает их вместе с вопросом; `None` —
+    /// агент отвечает без базы документов.
+    #[serde(default)]
+    pub rag: Option<crate::rag::RagSettings>,
 }
 
 impl AgentConfig {
@@ -215,6 +221,7 @@ impl AgentConfig {
             context_strategy: ContextStrategy::default(),
             window_size: None,
             profile: None,
+            rag: None,
         }
     }
 }
@@ -375,6 +382,10 @@ pub struct AgentReply {
     /// `cost`, не персистится: интерфейсы показывают эти вызовы рядом с
     /// ответом, пока открыт диалог.
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Что нашёл поиск RAG-режима для этого вопроса (источники под номерами,
+    /// на которые ссылается ответ) — `None`, если режим выключен. Как и
+    /// `tool_calls`, не персистится.
+    pub rag: Option<crate::rag::RagContext>,
 }
 
 /// Выполненный вызов инструмента: сама запись и признак того, показывать ли её
@@ -2169,7 +2180,20 @@ impl Agent {
                 message.content = body.to_string();
             }
         }
-        messages.push(ChatMessage::user(prompt));
+        // RAG-режим: вопрос уходит модели вместе с найденными фрагментами
+        // базы документов. Служебному продолжению поиск не нужен — это не
+        // вопрос, а инструкция автомата; отказ перескочить этап модели не
+        // отправляется вовсе.
+        let rag_context = match &config.rag {
+            Some(settings) if !matches!(origin, Origin::Continuation) && stage_skip_refusal.is_none() => {
+                Some(crate::rag::retrieve::retrieve(prompt, settings).await)
+            }
+            _ => None,
+        };
+        match &rag_context {
+            Some(ctx) => messages.push(ChatMessage::user(crate::rag::retrieve::augment_prompt(prompt, ctx))),
+            None => messages.push(ChatMessage::user(prompt)),
+        }
 
         let options = ChatOptions {
             max_tokens: config.max_tokens,
@@ -2234,6 +2258,7 @@ impl Agent {
                         cost: None,
                         interrupted: true,
                         tool_calls: Vec::new(),
+                        rag: None,
                     });
                 }
             }
@@ -2296,6 +2321,7 @@ impl Agent {
             cost,
             interrupted: false,
             tool_calls: tool_calls.into_iter().filter(|call| call.server.is_some()).collect(),
+            rag: rag_context,
         })
     }
 

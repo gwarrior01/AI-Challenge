@@ -49,6 +49,9 @@
 //!   llm-cli agent profile <имя>                    -- показать текущий профиль персонализации агента
 //!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
 //!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
+//!   llm-cli agent rag <имя>                        -- RAG-режим агента: включён ли и с какими параметрами
+//!   llm-cli agent rag <имя> on [стратегия] [k=N] [min=0.5] -- отвечать с базой документов (llm_core::rag::retrieve)
+//!   llm-cli agent rag <имя> off                    -- отвечать без базы документов
 //!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
 //!   llm-cli agent invariants                       -- список жёстких инвариантов (общих для всех агентов)
 //!   llm-cli agent invariants show <id>             -- показать текст одного инварианта
@@ -814,6 +817,15 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
                 }
             }
         }
+        Some("rag") => {
+            let name = args.get(1).cloned().ok_or_else(|| {
+                anyhow!("укажите имя агента: llm-cli agent rag <имя> [on [стратегия] [k=N] [min=0.5] | off]")
+            })?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            let words: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            println!("{}", set_rag(&agent, &words)?);
+            Ok(())
+        }
         Some("profile") => {
             let name = args.get(1).cloned().ok_or_else(|| {
                 anyhow!("укажите имя агента: llm-cli agent profile <имя> [<профиль|none>]")
@@ -1199,6 +1211,7 @@ fn print_agent_usage() {
          \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
          \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
          \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)\n\
+         \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [min=0.5] | off] (RAG-режим: с базой документов или без)\n\
          \x20 llm-cli agent invariants                                 (жёсткие правила, общие для ВСЕХ агентов)\n\
          \x20 llm-cli agent invariants show <id>                       (показать текст одного инварианта)\n\
          \x20 llm-cli agent invariants create <id>                     (создать новый инвариант — пустой шаблон)\n\
@@ -1297,6 +1310,31 @@ fn print_restored_history(agent: &Agent) {
     println!();
 }
 
+/// `rag [on [стратегия] [k=N] [min=0.5] | off]` — показать или сменить
+/// RAG-режим агента; общая часть `agent rag` и команды `/rag` в чате.
+fn set_rag(agent: &Agent, words: &[&str]) -> Result<String> {
+    let mut config = agent.config();
+    let text = match words.first().copied() {
+        None => match &config.rag {
+            Some(rag) => return Ok(format!("{} — ответы с базой документов.", rag.describe())),
+            None => return Ok("RAG-режим выключен — агент отвечает без базы документов.".to_string()),
+        },
+        Some("on") => {
+            let settings = llm_core::rag::RagSettings::parse_args(&words[1..])?;
+            let text = format!("RAG-режим включён — {}.", settings.describe());
+            config.rag = Some(settings);
+            text
+        }
+        Some("off") => {
+            config.rag = None;
+            "RAG-режим выключен — агент отвечает без базы документов.".to_string()
+        }
+        Some(other) => bail!("непонятное действие «{other}» — rag on [стратегия] [k=N] [min=0.5] или rag off"),
+    };
+    agent.set_config(config)?;
+    Ok(text)
+}
+
 /// Интерактивный чат с конкретным запущенным агентом. Завершается по Ctrl+D или
 /// командам `stop`/`exit`, при этом агент останавливается и состояние сохраняется.
 /// Запрос агенту, печатающий вызовы MCP-инструментов в момент, когда они
@@ -1392,10 +1430,27 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
             break;
         }
 
+        // `/rag on|off …` — переключить RAG-режим, не выходя из чата: один и
+        // тот же вопрос можно задать с базой документов и без неё.
+        if let Some(rest) = prompt.strip_prefix("/rag") {
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            match set_rag(&agent, &words) {
+                Ok(text) => println!("{text}"),
+                Err(err) => eprintln!("Ошибка: {err:#}"),
+            }
+            continue;
+        }
+
         // Вызовы инструментов печатаются по ходу обмена (см. ask_printing_tool_calls),
         // поэтому reply.tool_calls здесь повторно не выводится.
         match ask_printing_tool_calls(&agent, prompt).await {
             Ok(reply) => {
+                // Найденные фрагменты — до ответа: [n] в ответе ссылаются на них.
+                if let Some(rag) = &reply.rag {
+                    for line in rag.summary_lines() {
+                        println!("📚 {line}");
+                    }
+                }
                 println!("{}", reply.text);
                 if let Some(usage) = reply.usage {
                     session_tokens += usage.total_tokens as u64;
