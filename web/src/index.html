@@ -1790,6 +1790,92 @@
     padding: 3px 8px;
   }
 
+  /* ---------- Вкладка «Jev» (решения моделью Jev, OpenRouter Decisions API) ---------- */
+
+  #view-jev {
+    padding: 16px 24px;
+    gap: 12px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  .jev-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+  }
+  .jev-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .jev-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .jev-q {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .jev-row { display: flex; gap: 6px; align-items: center; }
+  .jev-row > .grow { flex: 1; min-width: 0; }
+  .jev-q input, .jev-q select, #jev-state {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 6px 9px;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .jev-q input:focus, .jev-q select:focus, #jev-state:focus { outline: none; border-color: var(--accent); }
+  .jev-q input.key { width: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .jev-q .lbl { color: var(--muted); font-size: 11px; min-width: 44px; }
+  .jev-x {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 2px 6px;
+  }
+  .jev-x:hover { color: var(--error); }
+  #jev-state { width: 100%; min-height: 110px; resize: vertical; line-height: 1.5; }
+  .jev-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .jev-actions .rag-primary { margin-left: auto; }
+  .jev-answer {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .jev-answer-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .jev-answer-head code { color: var(--text); }
+  .jev-verdict { font-size: 15px; font-weight: 600; color: var(--ok); }
+  .jev-verdict.no { color: var(--warn); }
+  .jev-prob { display: grid; grid-template-columns: minmax(70px, max-content) 40px 1fr; gap: 8px; align-items: center; }
+  .jev-prob .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; }
+  .jev-prob.top .name { color: var(--ok); font-weight: 600; }
+  .jev-prob .pct { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .jev-prob .rag-bar-fill { transition: width 0.4s ease; }
+  .jev-foot { color: var(--muted); font-size: 11px; }
+  .jev-json summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  .jev-json pre {
+    margin: 6px 0 0;
+    max-height: 260px;
+    overflow: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 11px;
+  }
+  @media (max-width: 900px) {
+    .jev-layout { grid-template-columns: minmax(0, 1fr); }
+    #view-jev { padding: 12px 16px; }
+  }
+
   /* ---------- Вкладка «RAG» ---------- */
 
   #view-rag {
@@ -2608,6 +2694,7 @@
   <button type="button" class="tab-btn" id="tab-mcp" data-view="view-mcp">MCP</button>
   <button type="button" class="tab-btn" id="tab-schedule" data-view="view-schedule">Расписание</button>
   <button type="button" class="tab-btn" id="tab-rag" data-view="view-rag">RAG</button>
+  <button type="button" class="tab-btn" id="tab-jev" data-view="view-jev">Jev</button>
 </nav>
 
 <div class="settings-overlay" id="settings-overlay"></div>
@@ -2828,6 +2915,39 @@
     <main class="rag-detail" id="rag-detail">
       <div class="rag-empty card-hint">Выберите документ слева — будут видны его версии, чанки каждой стратегии и карта нарезки. Или найдите что-нибудь поиском.</div>
     </main>
+  </div>
+</div>
+
+<div class="view" id="view-jev" hidden>
+  <div class="jev-layout">
+    <div class="jev-col">
+      <section class="rag-card">
+        <div class="rag-card-head">
+          <h4>Вопросы</h4>
+          <div class="rag-actions">
+            <button type="button" class="settings-btn" id="jev-example" title="Разбор обращения в поддержку: да/нет, выбор команды, срочность">Пример</button>
+            <button type="button" class="settings-btn" id="jev-add">+ Вопрос</button>
+          </div>
+        </div>
+        <div class="card-hint">Jev не пишет текст: на каждый вопрос — типизированный ответ с вероятностями. <b>Да/нет</b> — вероятность «да», <b>выбор</b> — один из вариантов, <b>шкала</b> — уровень от 0.</div>
+        <div id="jev-questions" class="jev-col"></div>
+      </section>
+      <section class="rag-card">
+        <div class="rag-card-head"><h4>Ситуация (state)</h4></div>
+        <textarea id="jev-state" placeholder="Текст, о котором задаются вопросы. JSON-объект тоже подойдёт — уйдёт как структура."></textarea>
+        <div class="jev-actions">
+          <span class="jev-meta" id="jev-meta"></span>
+          <button type="button" class="rag-primary" id="jev-send">Решить</button>
+        </div>
+        <span class="field-error" id="jev-error" hidden></span>
+      </section>
+    </div>
+    <div class="jev-col">
+      <section class="rag-card">
+        <div class="rag-card-head"><h4>Ответ</h4></div>
+        <div id="jev-result" class="jev-col"><div class="card-hint">Здесь появятся ответы: вердикт и распределение вероятностей по каждому вопросу.</div></div>
+      </section>
+    </div>
   </div>
 </div>
 
@@ -7399,6 +7519,241 @@ async function openRagTab() {
   } catch (e) { /* покажется при следующем открытии */ }
 }
 ragEl('tab-rag').addEventListener('click', openRagTab);
+/* ---------- Вкладка «Jev» ---------- */
+
+const jev = { questions: [], loaded: false, sending: false };
+const jevEl = (id) => document.getElementById(id);
+const JEV_KINDS = { noul: 'Да / нет', choice: 'Выбор', score: 'Шкала' };
+
+function jevBlank(type) {
+  if (type === 'noul') return { yes: '', no: '' };
+  if (type === 'choice') return { options: [{ key: '', text: '' }, { key: '', text: '' }] };
+  return { levels: ['', ''] };
+}
+
+function jevNextKey() {
+  let n = jev.questions.length + 1;
+  while (jev.questions.some((q) => q.key === `q${n}`)) n++;
+  return `q${n}`;
+}
+
+function jevInput(value, placeholder, onInput, cls = 'grow') {
+  const el = document.createElement('input');
+  el.type = 'text';
+  el.className = cls;
+  el.value = value;
+  el.placeholder = placeholder;
+  el.addEventListener('input', () => onInput(el.value));
+  return el;
+}
+
+function jevRemoveBtn(title, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'jev-x';
+  b.textContent = '✕';
+  b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function jevRow(...children) {
+  const row = document.createElement('div');
+  row.className = 'jev-row';
+  children.forEach((c) => row.append(c));
+  return row;
+}
+
+function jevLabel(text) {
+  const span = document.createElement('span');
+  span.className = 'lbl';
+  span.textContent = text;
+  return span;
+}
+
+function renderJevQuestions() {
+  const box = jevEl('jev-questions');
+  box.innerHTML = '';
+  if (!jev.questions.length) {
+    box.innerHTML = '<div class="card-hint">Вопросов нет — добавьте свой или загрузите пример.</div>';
+  }
+  jev.questions.forEach((q, qi) => {
+    const card = document.createElement('div');
+    card.className = 'jev-q';
+    const type = document.createElement('select');
+    Object.entries(JEV_KINDS).forEach(([value, label]) => type.add(new Option(label, value, false, value === q.type)));
+    type.addEventListener('change', () => {
+      jev.questions[qi] = { key: q.key, instructions: q.instructions, type: type.value, ...jevBlank(type.value) };
+      renderJevQuestions();
+    });
+    card.append(jevRow(
+      type,
+      jevInput(q.key, 'ключ', (v) => { q.key = v.trim(); }, 'key'),
+      jevInput(q.instructions, 'Вопрос: например, «Сообщает ли клиент о баге?»', (v) => { q.instructions = v; }),
+      jevRemoveBtn('Удалить вопрос', () => { jev.questions.splice(qi, 1); renderJevQuestions(); }),
+    ));
+    if (q.type === 'noul') {
+      card.append(jevRow(jevLabel('да, если'), jevInput(q.yes, 'когда ответ «да»', (v) => { q.yes = v; })));
+      card.append(jevRow(jevLabel('нет, если'), jevInput(q.no, 'когда ответ «нет»', (v) => { q.no = v; })));
+    } else if (q.type === 'choice') {
+      q.options.forEach((o, oi) => card.append(jevRow(
+        jevInput(o.key, 'вариант', (v) => { o.key = v.trim(); }, 'key'),
+        jevInput(o.text, 'когда выбирать этот вариант', (v) => { o.text = v; }),
+        jevRemoveBtn('Удалить вариант', () => { q.options.splice(oi, 1); renderJevQuestions(); }),
+      )));
+      card.append(jevAddLink('+ вариант', () => { q.options.push({ key: '', text: '' }); renderJevQuestions(); }));
+    } else {
+      q.levels.forEach((level, li) => card.append(jevRow(
+        jevLabel(`уровень ${li}`),
+        jevInput(level, li === 0 ? 'самый низкий' : 'выше предыдущего', (v) => { q.levels[li] = v; }),
+        jevRemoveBtn('Удалить уровень', () => { q.levels.splice(li, 1); renderJevQuestions(); }),
+      )));
+      card.append(jevAddLink('+ уровень', () => { q.levels.push(''); renderJevQuestions(); }));
+    }
+    box.append(card);
+  });
+}
+
+function jevAddLink(text, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'rag-link';
+  b.style.alignSelf = 'flex-start';
+  b.textContent = text;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function jevPct(p) { return `${Math.round((p || 0) * 100)}%`; }
+
+function jevProbRow(name, p, top, title) {
+  const row = document.createElement('div');
+  row.className = 'jev-prob' + (top ? ' top' : '');
+  row.innerHTML = `<span class="name" title="${escapeHtml(title || name)}">${escapeHtml(name)}</span>
+    <span class="pct">${jevPct(p)}</span>
+    <div class="rag-bar"><div class="rag-bar-fill" style="width:${Math.round((p || 0) * 100)}%"></div></div>`;
+  return row;
+}
+
+function renderJevResult(data, questions) {
+  const box = jevEl('jev-result');
+  box.innerHTML = '';
+  const answers = data.response.answers || {};
+  questions.forEach((q) => {
+    const a = answers[q.key];
+    const card = document.createElement('div');
+    card.className = 'jev-answer';
+    const head = document.createElement('div');
+    head.className = 'jev-answer-head';
+    head.innerHTML = `<span><code>${escapeHtml(q.key)}</code> · ${escapeHtml(q.instructions)}</span><span class="rag-tag">${JEV_KINDS[q.type]}</span>`;
+    card.append(head);
+    const verdict = document.createElement('div');
+    verdict.className = 'jev-verdict';
+    if (!a) {
+      verdict.textContent = 'нет ответа — см. JSON';
+      verdict.classList.add('no');
+      card.append(verdict);
+    } else if (a.type === 'noul') {
+      const yes = a.noul >= 0.5;
+      verdict.textContent = `${yes ? 'Да' : 'Нет'} · вероятность «да» ${jevPct(a.noul)}`;
+      verdict.classList.toggle('no', !yes);
+      card.append(verdict, jevProbRow('да', a.noul, yes, q.yes), jevProbRow('нет', 1 - a.noul, !yes, q.no));
+    } else if (a.type === 'choice') {
+      verdict.textContent = `${a.choice}${a.confidence != null ? ` · уверенность ${jevPct(a.confidence)}` : ''}`;
+      card.append(verdict);
+      q.options.forEach((o) => card.append(jevProbRow(o.key, (a.probabilities || {})[o.key], o.key === a.choice, o.text)));
+    } else if (a.type === 'score') {
+      const nearest = Math.min(Math.max(Math.round(a.score), 0), q.levels.length - 1);
+      verdict.textContent = `${a.score.toFixed(2)} из 0–${q.levels.length - 1} · «${q.levels[nearest]}»${a.confidence != null ? ` · уверенность ${jevPct(a.confidence)}` : ''}`;
+      card.append(verdict);
+      q.levels.forEach((level, i) => card.append(jevProbRow(`${i} · ${level}`, (a.probabilities || {})[i], i === nearest, level)));
+    }
+    box.append(card);
+  });
+  const u = data.response.usage || {};
+  const foot = document.createElement('div');
+  foot.className = 'jev-foot';
+  foot.textContent = [
+    data.response.model,
+    data.response.provider,
+    `токены ${u.input_tokens ?? 0} → ${u.output_tokens ?? 0}`,
+    u.cost != null ? `$${u.cost.toFixed(6)}` : null,
+  ].filter(Boolean).join(' · ');
+  box.append(foot);
+  [['JSON запроса', data.requestJson], ['JSON ответа', data.responseJson]].forEach(([title, text]) => {
+    const d = document.createElement('details');
+    d.className = 'jev-json';
+    d.innerHTML = `<summary>${title}</summary><pre>${escapeHtml(text)}</pre>`;
+    box.append(d);
+  });
+}
+
+function jevShowError(text) {
+  const el = jevEl('jev-error');
+  el.textContent = text || '';
+  el.hidden = !text;
+}
+
+async function jevSend() {
+  if (jev.sending) return;
+  jevShowError('');
+  const questions = JSON.parse(JSON.stringify(jev.questions));
+  jev.sending = true;
+  const btn = jevEl('jev-send');
+  btn.disabled = true;
+  btn.textContent = 'Jev решает…';
+  try {
+    const res = await fetch('/api/decisions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questions, state: jevEl('jev-state').value }),
+    });
+    const data = await res.json();
+    if (data.error) jevShowError(data.error);
+    else renderJevResult(data, questions);
+  } catch (e) {
+    jevShowError(`Сервер недоступен: ${e.message}`);
+  } finally {
+    jev.sending = false;
+    btn.disabled = false;
+    btn.textContent = 'Решить';
+  }
+}
+
+async function openJevTab() {
+  if (jev.loaded) return;
+  try {
+    const cfg = await (await fetch('/api/decisions/config')).json();
+    jev.loaded = true;
+    jev.example = cfg.example;
+    jev.exampleState = cfg.exampleState;
+    jevEl('jev-meta').innerHTML = `<span class="rag-tag accent">${escapeHtml(cfg.model)}</span>` +
+      (cfg.hasKey ? '<span class="rag-tag ok">ключ задан</span>'
+                  : '<span class="rag-tag bad" title="Задайте JEV_API_KEY или OPENROUTER_API_KEY и перезапустите сервер">нет ключа OpenRouter</span>');
+    if (!jev.questions.length) jevLoadExample();
+  } catch (e) {
+    jevShowError(`Не удалось получить настройки Jev: ${e.message}`);
+  }
+}
+
+function jevLoadExample() {
+  if (!jev.example) return;
+  jev.questions = JSON.parse(JSON.stringify(jev.example));
+  if (!jevEl('jev-state').value.trim()) jevEl('jev-state').value = jev.exampleState;
+  renderJevQuestions();
+}
+
+jevEl('jev-example').addEventListener('click', jevLoadExample);
+jevEl('jev-add').addEventListener('click', () => {
+  jev.questions.push({ key: jevNextKey(), instructions: '', type: 'noul', ...jevBlank('noul') });
+  renderJevQuestions();
+});
+jevEl('jev-send').addEventListener('click', jevSend);
+jevEl('jev-state').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) jevSend();
+});
+jevEl('tab-jev').addEventListener('click', openJevTab);
+renderJevQuestions();
 </script>
 </body>
 </html>

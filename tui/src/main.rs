@@ -248,6 +248,9 @@ enum Screen {
     /// Индекс документов для RAG (см. llm_core::rag): индексация, поиск,
     /// версии, сравнение стратегий (F6 с любого экрана, F6/Esc — обратно).
     Rag,
+    /// Решения моделью Jev (см. llm_core::decisions): вопросы да/нет, выбор,
+    /// шкала — и ответ с вероятностями (F7 с любого экрана, F7/Esc — обратно).
+    Decisions,
 }
 
 /// Шаги мастера создания агента — по одному вопросу за раз в нижнем поле ввода.
@@ -476,6 +479,8 @@ enum AppEvent {
     RagProgress(String),
     /// Команда индекса документов завершилась: вывод или текст ошибки.
     RagDone(Result<String, String>),
+    /// Запрос к Jev завершился: ответы или текст ошибки.
+    DecisionDone(Result<Box<llm_core::decisions::Decision>, String>),
 }
 
 /// Ручной вызов инструмента с экрана MCP — показывается под этим инструментом.
@@ -577,6 +582,13 @@ struct DrawState<'a> {
     rag_running: bool,
     rag_scroll: u16,
     rag_scroll_max: &'a std::cell::Cell<u16>,
+    decisions_output: &'a str,
+    /// Сырые JSON последнего запроса к Jev — по Tab, как в чате.
+    decisions_debug: Option<&'a (String, String)>,
+    decisions_status: Option<(&'a str, bool)>,
+    decisions_running: bool,
+    decisions_scroll: u16,
+    decisions_scroll_max: &'a std::cell::Cell<u16>,
 }
 
 /// Высота поля ввода по умолчанию (1 строка текста + рамка сверху/снизу).
@@ -643,7 +655,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut history: Vec<HistoryItem> = vec![HistoryItem {
         role: Role::System,
         text: "Challenger (TUI). Enter — отправить, Esc — выход, Tab — JSON запроса/ответа, \
-               F2 — управление агентами, F4 — MCP-серверы, F5 — расписание, F6 — индекс документов."
+               F2 — управление агентами, F4 — MCP-серверы, F5 — расписание, F6 — индекс документов, F7 — решения (Jev)."
             .to_string(),
         debug: None,
         tokens: None,
@@ -730,6 +742,17 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     let mut rag_running = false;
     let mut rag_scroll: u16 = 0;
     let rag_scroll_max = std::cell::Cell::new(u16::MAX);
+    // Экран решений Jev (F7): набор вопросов живёт, пока открыт TUI; запрос
+    // идёт в фоне, как команды индекса.
+    let decisions_config = llm_core::decisions::DecisionsConfig::from_env();
+    let mut decisions_session = llm_core::decisions::DecisionSession::default();
+    let mut decisions_return = Screen::Chat;
+    let mut decisions_output = String::new();
+    let mut decisions_debug: Option<(String, String)> = None;
+    let mut decisions_status: Option<(String, bool)> = None;
+    let mut decisions_running = false;
+    let mut decisions_scroll: u16 = 0;
+    let decisions_scroll_max = std::cell::Cell::new(u16::MAX);
     // Прокрутка экрана памяти: разделов много, на невысоком терминале нижние
     // (плановые запуски) иначе не видны.
     let mut memory_scroll: u16 = 0;
@@ -929,6 +952,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             rag_running,
             rag_scroll,
             rag_scroll_max: &rag_scroll_max,
+            decisions_output: &decisions_output,
+            decisions_debug: decisions_debug.as_ref(),
+            decisions_status: decisions_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
+            decisions_running,
+            decisions_scroll,
+            decisions_scroll_max: &decisions_scroll_max,
         };
         terminal.draw(|frame| draw(frame, &draw_state))?;
 
@@ -950,10 +979,30 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 Screen::AgentCreate => { wizard = None; Screen::AgentsList }
                                 Screen::AgentChat | Screen::AgentMemory => { agent_chat_name = None; Screen::AgentsList }
                                 Screen::Mcp => { mcp_editing = false; Screen::AgentsList }
-                                Screen::Schedule | Screen::Rag => Screen::AgentsList,
+                                Screen::Schedule | Screen::Rag | Screen::Decisions => Screen::AgentsList,
                             };
                             input.clear();
                             confirm_delete = None;
+                            continue;
+                        }
+
+                        // F7 — решения моделью Jev, как F6 — с любого экрана и обратно.
+                        // Запрос продолжает выполняться в фоне и после ухода с экрана.
+                        if key.code == KeyCode::F(7) {
+                            if screen == Screen::Decisions {
+                                screen = decisions_return;
+                            } else {
+                                if screen == Screen::Mcp {
+                                    mcp_editing = false;
+                                }
+                                decisions_return = screen;
+                                screen = Screen::Decisions;
+                                decisions_scroll = 0;
+                                if decisions_output.is_empty() {
+                                    decisions_output = decisions_session.list();
+                                }
+                            }
+                            input.clear();
                             continue;
                         }
 
@@ -1342,6 +1391,72 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 }
                                 _ => {}
                             },
+                            Screen::Decisions => match key.code {
+                                KeyCode::Esc => {
+                                    screen = decisions_return;
+                                    input.clear();
+                                }
+                                KeyCode::Tab => show_debug = !show_debug,
+                                KeyCode::Up => decisions_scroll = decisions_scroll.saturating_sub(1),
+                                KeyCode::Down => {
+                                    decisions_scroll = decisions_scroll.saturating_add(1).min(decisions_scroll_max.get())
+                                }
+                                KeyCode::PageUp => decisions_scroll = decisions_scroll.saturating_sub(PAGE_STEP),
+                                KeyCode::PageDown => {
+                                    decisions_scroll =
+                                        decisions_scroll.saturating_add(PAGE_STEP).min(decisions_scroll_max.get())
+                                }
+                                KeyCode::Enter => {
+                                    if input.trim().is_empty() {
+                                        continue;
+                                    }
+                                    match decisions_session.apply(&input) {
+                                        Ok(llm_core::decisions::Step::Output(text)) => {
+                                            decisions_output = text;
+                                            decisions_status = None;
+                                            decisions_scroll = 0;
+                                            input.clear();
+                                        }
+                                        Ok(llm_core::decisions::Step::Ask(state)) => {
+                                            if decisions_running {
+                                                decisions_status = Some((
+                                                    "Предыдущий запрос к Jev ещё выполняется — дождитесь его".to_string(),
+                                                    true,
+                                                ));
+                                                continue;
+                                            }
+                                            input.clear();
+                                            decisions_running = true;
+                                            decisions_status = Some(("Jev решает…".to_string(), false));
+                                            let (cfg, questions, tx) =
+                                                (decisions_config.clone(), decisions_session.questions.clone(), tx.clone());
+                                            tokio::spawn(async move {
+                                                let result = llm_core::decisions::decide(&cfg, &questions, &state)
+                                                    .await
+                                                    .map(Box::new)
+                                                    .map_err(|e| format!("{e:#}"));
+                                                let _ = tx.send(AppEvent::DecisionDone(result));
+                                            });
+                                        }
+                                        // Многострочная ошибка (со списком команд) — в основную
+                                        // область, первая строка — в статус; ввод остаётся для правки.
+                                        Err(err) => {
+                                            let err = format!("{err:#}");
+                                            let first = err.lines().next().unwrap_or_default().to_string();
+                                            if err.contains('\n') {
+                                                decisions_output = err;
+                                                decisions_scroll = 0;
+                                            }
+                                            decisions_status = Some((first, true));
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) => input.push(c),
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            },
                             Screen::Schedule => match key.code {
                                 KeyCode::Esc => {
                                     screen = schedule_return;
@@ -1655,7 +1770,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
                         Screen::AgentMemory => input.push_str(&text),
                         Screen::Mcp if mcp_editing => input.push_str(&text),
-                        Screen::Schedule | Screen::Rag => input.push_str(&text),
+                        Screen::Schedule | Screen::Rag | Screen::Decisions => input.push_str(&text),
                         Screen::AgentCreate if wizard.as_ref().is_some_and(|w| w.quick.is_some()) => {
                             input.push_str(&text);
                         }
@@ -1707,6 +1822,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                 }
                                 rag_status = Some((first, true));
                             }
+                        }
+                        continue;
+                    }
+                    AppEvent::DecisionDone(result) => {
+                        decisions_running = false;
+                        decisions_scroll = 0;
+                        match result {
+                            Ok(decision) => {
+                                decisions_output = decision.text;
+                                decisions_debug = Some((decision.request_json, decision.response_json));
+                                decisions_status = None;
+                            }
+                            Err(err) => decisions_status = Some((err, true)),
                         }
                         continue;
                     }
@@ -1892,7 +2020,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                 waiting = false;
                 waiting_agent = None;
             }
-            _ = spinner_tick.tick(), if waiting || rag_running => {
+            _ = spinner_tick.tick(), if waiting || rag_running || decisions_running => {
                 spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
             }
             _ = activity_tick.tick() => {
@@ -1940,6 +2068,7 @@ fn draw(frame: &mut Frame, state: &DrawState) {
         Screen::Mcp => draw_mcp(frame, state),
         Screen::Schedule => draw_schedule(frame, state),
         Screen::Rag => draw_rag(frame, state),
+        Screen::Decisions => draw_decisions(frame, state),
     }
 }
 
@@ -2014,6 +2143,70 @@ fn draw_rag(frame: &mut Frame, state: &DrawState) {
     };
     frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(status_color)), chunks[2]);
     render_input_box(frame, chunks[3], state.input, " Команда — Enter выполнить, F6/Esc назад ".to_string(), Color::Reset);
+}
+
+/// Экран решений Jev (F7): вопросы или ответы последнего запроса, справка
+/// по командам и поле ввода.
+fn draw_decisions(frame: &mut Frame, state: &DrawState) {
+    let area = frame.area();
+    let chunks = layout_chunks(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("✦ Challenger", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  Решения · Jev (OpenRouter Decisions API)  ·  Tab — JSON  ·  F7/Esc — назад"),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
+    frame.render_widget(header, chunks[0]);
+
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in state.decisions_output.lines() {
+        let style = if line.trim_start().starts_with('→') {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else if line.trim_start().starts_with('▸') {
+            Style::default().fg(Color::Green)
+        } else if !line.starts_with(' ') && line.contains(" — ") {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else if line.starts_with("модель ") {
+            hint_style
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    }
+    if let (true, Some((request, response))) = (state.show_debug, state.decisions_debug) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("── запрос ──", hint_style)));
+        lines.extend(request.lines().map(|l| Line::from(Span::styled(l.to_string(), hint_style))));
+        lines.push(Line::from(Span::styled("── ответ ──", hint_style)));
+        lines.extend(response.lines().map(|l| Line::from(Span::styled(l.to_string(), hint_style))));
+    }
+    lines.push(Line::from(""));
+    for line in llm_core::decisions::HELP.lines() {
+        lines.push(Line::from(Span::styled(line.to_string(), hint_style)));
+    }
+
+    let visible = chunks[1].height.saturating_sub(2);
+    let inner_width = chunks[1].width.saturating_sub(2).max(1);
+    let wrapped: u16 = lines.iter().map(|l| (l.width() as u16).div_ceil(inner_width).max(1)).sum();
+    let max_scroll = wrapped.saturating_sub(visible);
+    state.decisions_scroll_max.set(max_scroll);
+    let title = if wrapped > visible { " Jev · ↑/↓ PgUp/PgDn — прокрутка " } else { " Jev " };
+    let body = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.decisions_scroll.min(max_scroll), 0))
+        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title));
+    frame.render_widget(body, chunks[1]);
+
+    let (status_text, status_color) = match state.decisions_status {
+        Some((text, is_error)) if !state.decisions_running => {
+            (format!(" {text}"), if is_error { Color::Red } else { Color::Green })
+        }
+        Some((text, _)) => (format!(" {} {text}", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow),
+        None => (" Начните с example — пример вопросов, затем ask <ситуация>".to_string(), Color::DarkGray),
+    };
+    frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(status_color)), chunks[2]);
+    render_input_box(frame, chunks[3], state.input, " Команда — Enter выполнить, F7/Esc назад ".to_string(), Color::Reset);
 }
 
 fn draw_chat(frame: &mut Frame, state: &DrawState) {

@@ -1,5 +1,6 @@
 //! Веб-интерфейс LLM-агента (axum): чат в браузере со счётчиком токенов на запрос и за сессию.
 
+mod decisions;
 mod rag;
 
 use anyhow::Result;
@@ -1320,6 +1321,7 @@ async fn main() -> Result<()> {
         .route("/api/mcp/:name/:action", post(set_mcp_enabled))
         .route("/api/mcp/:name/tools/:tool", post(call_mcp_tool))
         .merge(rag::routes())
+        .merge(decisions::routes())
         .with_state(state);
 
     let port = std::env::var("PORT").ok().and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(8080);

@@ -456,6 +456,21 @@ Settings: strategy (`fixed` / `structure` / `sentence` / `parent`; by default th
 
 To compare the two modes, ask the same question, toggle the mode (Ctrl+R / the button / `/rag off`) and ask again: the answer without RAG comes only from the model's own knowledge, the one with RAG from the fragments shown above it.
 
+### Decisions: the Jev model
+
+Jev (TypeSafe, served by OpenRouter) is a decision model, not a text model: instead of generated prose it returns a typed answer with probabilities for each question — so there is nothing to parse and nothing to hallucinate. It is called through a separate endpoint, `POST https://openrouter.ai/api/alpha/decisions` (`core/src/decisions.rs`), not through `chat/completions`. A request is a set of named questions plus the `state` they are asked about (text, or a JSON object/array sent as structure); three question types:
+
+- **`noul`** (yes/no) — criteria for "yes" and for "no"; the answer is the probability of "yes";
+- **`choice`** — named options with a description of when to pick each (two or more); the answer is the chosen option, its confidence and the probability of every option;
+- **`score`** — levels from the lowest (0) up; the answer is the expected level (fractional: 1.99 ≈ level 2), confidence and the probability of each level.
+
+Settings: `JEV_API_KEY` (or `OPENROUTER_API_KEY`; if `LLM_API_URL` points to openrouter.ai, `LLM_API_KEY` is used) — an OpenRouter key with prepaid credits; optional `JEV_API_URL` and `JEV_MODEL` (`typesafe/jev-1.13` by default).
+
+| Interface | Where | How |
+|---|---|---|
+| TUI | **F7** from any screen (F7/Esc — back) | commands, parts separated by `;`: `noul <key>: <question> ; <when yes> ; <when no>`, `choice <key>: <question> ; <option>: <description> ; …`, `score <key>: <question> ; <level 0> ; <level 1> ; …`, then `ask <situation>`; also `list`, `del <key>`, `clear`, `example` (a support-ticket triage sample). Answers show as bars; `Tab` — raw request/response JSON |
+| Web | the **Jev** tab | a form: question cards (type, key, question, criteria), the situation, **Решить** (Ctrl/⌘+Enter); answers as probability bars plus the raw JSON (`GET /api/decisions/config`, `POST /api/decisions` `{questions, state}`) |
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -624,14 +639,14 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI, retrieve.rs — RAG mode of agents: search by the question and the context for the LLM)
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI, retrieve.rs — RAG mode of agents: search by the question and the context for the LLM) + Jev decisions via OpenRouter Decisions API (src/decisions.rs)
 cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents, `mcp` subcommand for MCP servers and `rag` subcommand for the document index
 mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
   scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
   documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
-web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page, src/rag.rs: the RAG tab's API
+web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page, src/rag.rs: the RAG tab's API, src/decisions.rs: the Jev tab's API
 tui/              — llm-tui: terminal interface (ratatui)
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template
 rag/              — eval.json — control questions for comparing chunking strategies, compare.md — the comparison report (index.db — the index itself, uploads/ — uploaded documents; both git-ignored)

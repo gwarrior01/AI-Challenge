@@ -39,6 +39,8 @@ pub mod pdf;
 
 pub mod rag;
 
+pub mod decisions;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
