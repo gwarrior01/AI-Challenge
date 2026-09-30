@@ -43,6 +43,8 @@ Both working and long-term memory (when non-empty) are injected as extra system 
 
 ### Task State Machine
 
+**Task mode is per agent and off by default** (`AgentConfig::task_mode`). Off, the agent is a plain chat: no stage block in the prompt, no `move_stage`/`update_step` tools, no gates or stage limits on MCP tools. On, everything below applies. Switch it with **Ctrl+T** in the TUI agent chat (or `task mode on|off` on F3), the **🧭 Этапы** button in the web agent chat (`POST /api/agents/:name/task-mode` `{enabled}`), or `llm-cli agent task <name> mode on|off`. Turning it on creates a task named after the agent in `planning` if there is none (`Agent::enable_task_mode`); `task start`/`task join` turn it on as well. Turning it off keeps the task — stage, journal, working memory — so turning it back on continues from the same stage; to drop it, finish the task.
+
 The shared task from working memory above also carries a **formalized finite-state machine** (`Stage` in `core/src/memory.rs`): a **stage**, a free-text **current step**, and a free-text **expected action** — plus a **pause** flag independent of the stage. Four stages, matching a typical work cycle:
 
 ```
@@ -91,7 +93,7 @@ The two gates above are fixed for every task. A **specific** task can add its ow
 
 #### Web UI: no manual task form, status lives in the chat itself
 
-The web UI deliberately doesn't expose the manual `task start`/`join`/`set` commands above at all — a named agent's task is created **automatically** by the first message sent to it (`POST /api/agents/:name/ask` calls an `ensure_task` helper before `handle_request` if the agent has no active task yet, naming it after the agent itself), starting in `planning` the same as everywhere else. This is a web-UI-only convenience layered on top of the same `Agent`/`Stage` machinery — the CLI and TUI are untouched and still require an explicit `agent task <name> start`, consistent with the "nothing is written automatically" memory philosophy above.
+The web UI deliberately doesn't expose the manual `task start`/`join`/`set` commands above at all — in task mode (the **🧭 Этапы** button) a named agent's task is created **automatically**: when the mode is switched on, and again by the next message after «🏁 Новая задача» (`POST /api/agents/:name/ask` calls an `ensure_task` helper before `handle_request` if the agent is in task mode and has no active task yet, naming it after the agent itself), starting in `planning` the same as everywhere else. With the mode off, the stage strip and the task action bar are hidden and the agent is a plain chat. The TUI and CLI create the task when the mode is switched on (Ctrl+T, `task mode on`) or by an explicit `task start`, but not on every message.
 
 Because the task is no longer something the person sets up, its status isn't tucked away in the "🧠 Память" tab either (that tab now only holds personalization and long-term memory). Instead:
 - A **stage strip right under the chat header** (top of the dialogue) shows the current stage badge plus a one-line hint (current step / expected action) and a "🏁 Новая задача" button that finishes the task so the next message starts a fresh one.
@@ -441,18 +443,35 @@ Any named agent can answer with or without the document index — a switch per a
 
 **question → search for relevant chunks → question joined with them → request to the LLM.**
 
-1. The question is embedded and the top-`k` chunks of the chosen strategy are taken from the current versions of the indexed documents (the same `search` as `llm-cli rag search`; for `parent` the parent paragraph goes to the model, not the child sentence). Chunks below the similarity threshold (`min`, off by default) are dropped.
+1. The question is embedded and the top-`n` candidate chunks of the chosen strategy are taken from the current versions of the indexed documents (for `parent` the parent paragraph goes to the model, not the child sentence). Then a second stage filters and reorders them (below) and the best `k` go to the model.
 2. Instead of the bare question the model gets the numbered fragments with their sources — `[1] README.md › MCP › … · строки 270–284 (близость 0.70)` and the text — plus the rules: answer from the fragments, cite them as `[1]`, `[2]`, ignore the irrelevant ones, say so when the answer isn't there and mark anything added from general knowledge. When nothing was found the model is told the base has no answer rather than being left to answer as if it came from the documents.
 3. The history keeps the original question only: the fragments are needed for this answer, the next question gets its own. A task continuation (after approve/resume) isn't a question and gets no search; a scheduled run does.
 4. The reply carries what was found (`AgentReply::rag` — strategy, sources with lines and scores, the fragment texts), shown above the answer in every interface so the `[n]` in the answer can be checked. If the search fails (empty index, embedding server down, a strategy nothing was cut with), the answer comes without context and the interface says why instead of failing the whole exchange.
 
-Settings: strategy (`fixed` / `structure` / `sentence` / `parent`; by default the first one the index has, in that order), `k` (1–20, default 5), `min` (0–1). The index is filled as in the section above; `LLM_EMBEDDING_MODEL` must be set.
+#### Second stage: query rewrite, relevance filter, reranking
+
+```text
+question → [rewrite] → embedding → top-n candidates (n=20)
+         → similarity threshold (min) → [reranker] → reranker threshold (rmin) → top-k (k=5) → prompt
+```
+
+- **Query rewrite** (`rewrite`, off by default) — the agent's own model turns the question into a search query: key terms, names, identifiers and numbers kept, synonyms and an English translation of the key terms added (questions are usually in Russian, the README and code comments often in English). The search runs on both the question and the rewritten query; a chunk's similarity is the better of the two.
+- **Similarity threshold** (`min`, 0–1, off by default) — candidates below it are dropped before reranking.
+- **Reranker** (`rerank=`, `none` by default), code in `core/src/rag/rerank.rs`:
+  - `heuristic` — no model calls: similarity + up to 0.2 for the query terms found in the chunk text. Identifiers and numbers (`MIN_INTERVAL`, `8092`) weigh 2.5× a word, long words are matched by their stem, and a term's weight is scaled by its rarity among the candidates (a term every candidate has distinguishes nothing).
+  - `llm` — one request to the agent's model with all candidates (first 700 characters each), which scores each 0–10 (stored as 0–1). Malformed JSON or a failed request doesn't fail the exchange: the order stays by similarity and the RAG line shows a warning.
+- **Reranker threshold** (`rmin`, 0–1) — candidates with a lower reranker score are dropped: the model's score for `llm`, the boosted similarity for `heuristic`.
+- **Top-n / top-k** — `n` candidates before filtering (1–50, default 20, not below `k`), `k` fragments after (1–20, default 5).
+
+The RAG line before the answer shows each stage — `RAG (structure · rewrite · rerank llm): 20 кандидатов → 14 после порога → 3 после реранкера → 3 фрагм.` — the rewritten query, any warnings and, per source, the similarity, the reranker score and where the chunk was before reranking (`0.58 → реранк 0.90 (было #7)`). Rewrite and `llm` reranking are extra model calls per question; their tokens are counted in `RagContext::tokens`. Configs saved before these settings load unchanged: second stage off, `n=20`.
+
+Settings: strategy (`fixed` / `structure` / `sentence` / `parent`; by default the first one the index has, in that order), `k`, `n`, `min`, `rewrite`, `rerank`, `rmin` — `rag on [strategy] [k=5] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5]`. The index is filled as in the section above; `LLM_EMBEDDING_MODEL` must be set.
 
 | Interface | Switch | Sources |
 |---|---|---|
-| TUI | **Ctrl+R** in the agent chat — on (defaults) / off; `rag on [strategy] [k=N] [min=0.5]` / `rag off` on the memory screen (F3), which also shows the mode. The chat header shows `RAG: structure, k=5` or `без RAG` | a yellow **RAG** line before the answer: `[n] source › section · lines · score` |
-| Web | **📚 RAG: вкл/выкл** and the strategy list in the agent chat header (`POST /api/agents/:name/rag` `{enabled, strategy?, k?, min_score?}`) | a card before the answer; each source expands to the text the model got |
-| CLI | `llm-cli agent rag <name> [on [strategy] [k=N] [min=0.5] \| off]`; `/rag on …`, `/rag off` inside `agent chat` | `📚 [n] …` lines before the answer |
+| TUI | **Ctrl+R** in the agent chat — on (defaults) / off; `rag on …` / `rag off` on the memory screen (F3), which also shows the mode. The chat header shows `RAG: structure, топ-20 → k=5, rerank llm` or `без RAG` | a yellow **RAG** line before the answer: stages, rewritten query, `[n] source › section · lines · score → реранк … (было #m)` |
+| Web | **📚 RAG: вкл/выкл**, the strategy list and **⚙** (top-n, top-k, thresholds, rewrite, reranker) in the agent chat header (`POST /api/agents/:name/rag` `{enabled, strategy?, k?, min_score?, candidates?, rewrite?, rerank?, rerank_min?}`) | a card before the answer with the stages and the query; each source expands to the text the model got |
+| CLI | `llm-cli agent rag <name> [on … \| off]`; `/rag on …`, `/rag off` inside `agent chat` | `📚 …` lines before the answer |
 
 To compare the two modes, ask the same question, toggle the mode (Ctrl+R / the button / `/rag off`) and ask again: the answer without RAG comes only from the model's own knowledge, the one with RAG from the fragments shown above it.
 
@@ -624,7 +643,7 @@ Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
 ```
 Cargo.toml       — workspace tying all crates together
 .env.example     — environment variable template
-core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI, retrieve.rs — RAG mode of agents: search by the question and the context for the LLM)
+core/             — llm-core: LLM client (src/lib.rs) + agent entity and registry (src/agent.rs) + context summarization (src/context.rs) + 3-tier memory model (src/memory.rs) + personalization profiles (src/profile.rs) + hard invariants (src/invariants.rs) + MCP client (src/mcp.rs) + scheduled agent runs (src/automation.rs) + PDF → Markdown (src/pdf.rs) + document index for RAG (src/rag/: corpus.rs — files and versions, chunking.rs — three strategies, embed.rs — /embeddings client, store.rs — SQLite index, browse.rs — index browsing for the web UI, retrieve.rs — RAG mode of agents: search by the question and the context for the LLM, rerank.rs — query rewrite and reranking)
 cli/              — llm-cli: console interface; also `agent` subcommand for managing named agents, `mcp` subcommand for MCP servers and `rag` subcommand for the document index
 mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:

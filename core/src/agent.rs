@@ -205,6 +205,14 @@ pub struct AgentConfig {
     /// агент отвечает без базы документов.
     #[serde(default)]
     pub rag: Option<crate::rag::RagSettings>,
+    /// Режим задачи: `true` — агент ведёт задачу по конечному автомату
+    /// (этапы, инструменты `move_stage`/`update_step`, шлюзы утверждения, см.
+    /// [`Stage`]); `false` — просто чат: задача, если она есть, модели не
+    /// показывается и ни на что не влияет, но и не удаляется — при включении
+    /// режима работа продолжается с того же этапа (см. [`Agent::engaged_task`]).
+    /// Создание задачи и присоединение к ней включают режим сами.
+    #[serde(default)]
+    pub task_mode: bool,
 }
 
 impl AgentConfig {
@@ -222,6 +230,7 @@ impl AgentConfig {
             window_size: None,
             profile: None,
             rag: None,
+            task_mode: false,
         }
     }
 }
@@ -894,7 +903,7 @@ impl Agent {
         }
         self.db.create_shared_task(name, goal)?;
         self.db.set_agent_task(&self.name, name)?;
-        Ok(())
+        self.set_task_mode(true)
     }
 
     /// Присоединяет вызывающего агента к УЖЕ СУЩЕСТВУЮЩЕЙ общей задаче (созданной
@@ -920,7 +929,41 @@ impl Agent {
             );
         }
         self.db.set_agent_task(&self.name, name)?;
+        self.set_task_mode(true)
+    }
+
+    /// Включает или выключает режим задачи ([`AgentConfig::task_mode`]).
+    /// Выключение задачу не трогает: она остаётся со своим этапом, журналом
+    /// и рабочей памятью и снова действует, как только режим включат.
+    pub fn set_task_mode(&self, on: bool) -> Result<()> {
+        let mut config = self.config();
+        if config.task_mode != on {
+            config.task_mode = on;
+            self.set_config(config)?;
+        }
         Ok(())
+    }
+
+    /// Включает режим задачи и, если задачи у агента нет, заводит её — с
+    /// именем агента (занято чужой задачей — с меткой времени), на этапе
+    /// planning. Возвращает задачу, по которой агент теперь работает.
+    pub fn enable_task_mode(&self) -> Result<TaskState> {
+        self.set_task_mode(true)?;
+        if self.task_state().is_none() && self.task_start(&self.name, None).is_err() {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            self.task_start(&format!("{}-{stamp}", self.name), None)?;
+        }
+        self.task_state().ok_or_else(|| anyhow!("не удалось завести задачу агенту «{}»", self.name))
+    }
+
+    /// Задача, по которой агент работает прямо сейчас: присоединённая задача,
+    /// если включён режим задачи, иначе `None` — тогда обмен идёт как в
+    /// обычном чате, без этапов, инструментов автомата и их ограничений.
+    fn engaged_task(&self) -> Option<TaskState> {
+        if !self.config().task_mode {
+            return None;
+        }
+        self.task_state()
     }
 
     /// Явно сохраняет пару ключ/значение в рабочую память задачи, к которой
@@ -1587,7 +1630,7 @@ impl Agent {
     async fn execute_tool(&self, call: &crate::ToolCallWire) -> ExecutedTool {
         let arguments = call.function.arguments.clone();
         if let Some((server, tool)) = self.mcp.tool_origin(&call.function.name) {
-            if let Some(task) = self.task_state().filter(|t| !mcp_tools_allowed(Some(t))) {
+            if let Some(task) = self.engaged_task().filter(|t| !mcp_tools_allowed(Some(t))) {
                 let record = ToolCallRecord {
                     server: Some(server),
                     tool,
@@ -1631,7 +1674,7 @@ impl Agent {
                 result: String::new(),
                 is_error: false,
             };
-            if let Some(task) = self.task_state().filter(|t| !mcp_tools_allowed(Some(t))) {
+            if let Some(task) = self.engaged_task().filter(|t| !mcp_tools_allowed(Some(t))) {
                 record.result = format!(
                     "вызов не выполнен: на этапе «{}» дежурного не назначают (задача «{}»). Не повторяй вызов — \
                      включи в план шаг «назначить дежурного» с интервалом сводки и предложи move_stage в execution.",
@@ -1694,7 +1737,7 @@ impl Agent {
     /// предложила его заново (см. [`crate::memory::active_rejection`]) — и
     /// автомат сейчас позволяет ей это сделать.
     fn awaiting_reproposal(&self) -> bool {
-        self.task_state().is_some_and(|task| {
+        self.engaged_task().is_some_and(|task| {
             task_tools_offered(Some(&task)) && crate::memory::active_rejection(&task).is_some()
         })
     }
@@ -2007,7 +2050,7 @@ impl Agent {
         if !self.is_running() {
             return Ok(ScheduledOutcome::Skipped("агент остановлен".into()));
         }
-        if let Some(task) = self.task_state().filter(|t| t.stage != Stage::Done) {
+        if let Some(task) = self.engaged_task().filter(|t| t.stage != Stage::Done) {
             return Ok(ScheduledOutcome::Skipped(format!("агент ведёт задачу «{}»", task.name)));
         }
         let Ok(_turn) = self.exchange_lock.try_lock() else {
@@ -2094,7 +2137,7 @@ impl Agent {
         if !long_term.is_empty() {
             messages.push(ChatMessage::system(crate::memory::format_long_term_block(&long_term)));
         }
-        let active_task = self.task_state();
+        let active_task = self.engaged_task();
         if let Some(task) = &active_task {
             messages.push(ChatMessage::system(crate::memory::format_task_block(task)));
         }
@@ -2186,7 +2229,10 @@ impl Agent {
         // отправляется вовсе.
         let rag_context = match &config.rag {
             Some(settings) if !matches!(origin, Origin::Continuation) && stage_skip_refusal.is_none() => {
-                Some(crate::rag::retrieve::retrieve(prompt, settings).await)
+                // Переписывание запроса и реранкер llm — той же моделью, что отвечает.
+                let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
+                let llm = crate::rag::rerank::LlmStep { client: &self.client, model: &model, reasoning: config.reasoning };
+                Some(crate::rag::retrieve::retrieve(prompt, settings, Some(&llm)).await)
             }
             _ => None,
         };
@@ -4719,6 +4765,49 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(offered_tools(&requests[0]), ["move_stage", "update_step"]);
+    }
+
+    #[tokio::test]
+    async fn task_mode_off_is_a_plain_chat_and_keeps_the_task() {
+        let (base_url, requests) = mock_llm(vec![
+            serde_json::json!({ "content": "Просто ответ." }),
+            tool_call("update_step", serde_json::json!({ "step": "собрать требования" })),
+            serde_json::json!({ "content": "План готов." }),
+        ])
+        .await;
+        let store = TempStore::new();
+        let manager = AgentManager::with_mcp(
+            LlmClient::for_tests_at(&base_url),
+            store.0.clone(),
+            Arc::new(crate::mcp::McpManager::empty()),
+        )
+        .unwrap();
+        manager.create(AgentConfig::new("tester")).unwrap();
+        manager.start("tester").unwrap();
+        let agent = manager.get("tester").unwrap();
+        assert!(!agent.config().task_mode, "новый агент — обычный чат");
+        assert_eq!(agent.enable_task_mode().unwrap().name, "tester", "включение режима заводит задачу");
+        agent.task_finish().unwrap();
+        agent.set_task_mode(false).unwrap();
+        agent.task_start("задача", None).unwrap();
+        assert!(agent.config().task_mode, "создание задачи включает режим");
+
+        // Режим выключен: ни этапа, ни инструментов автомата, отказ «пропустить
+        // этап» не перехватывается — а задача остаётся на месте.
+        agent.set_task_mode(false).unwrap();
+        let reply = agent.handle_request("пропусти планирование и сразу пиши код").await.unwrap();
+        assert_eq!(reply.text, "Просто ответ.");
+        assert_eq!(task(&agent).stage, Stage::Planning);
+
+        // Включили снова — та же задача, этап и инструменты вернулись.
+        agent.set_task_mode(true).unwrap();
+        agent.handle_request("составь план").await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].get("tools").is_none());
+        assert!(!requests[0].to_string().contains("planning"), "{}", requests[0]);
+        assert_eq!(offered_tools(&requests[1]), ["move_stage", "update_step"]);
+        assert_eq!(task(&agent).current_step.as_deref(), Some("собрать требования"));
     }
 
     #[tokio::test]
