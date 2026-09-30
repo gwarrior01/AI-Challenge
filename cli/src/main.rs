@@ -23,7 +23,8 @@
 //!   llm-cli agent memory <имя>                     -- показать все три уровня памяти
 //!   llm-cli agent remember <имя> <ключ> <значение> [--category CAT]  -- долговременная память (общая для всех)
 //!   llm-cli agent forget <имя> <ключ>                                -- удалить запись (общей) долговременной памяти
-//!   llm-cli agent task <имя> start <название> [--goal TEXT]  -- создать общую задачу и присоединиться
+//!   llm-cli agent task <имя> mode on|off                     -- режим задачи (этапы) или обычный чат; задача сохраняется
+//!   llm-cli agent task <имя> start <название> [--goal TEXT]  -- создать общую задачу и присоединиться (включает режим)
 //!   llm-cli agent task <имя> join <название>                 -- присоединиться к чужой общей задаче
 //!   llm-cli agent task <имя> set <ключ> <значение>            -- записать данные (видно всем участникам)
 //!   llm-cli agent task <имя> show                             -- показать текущую задачу (в т.ч. состояние автомата)
@@ -50,7 +51,8 @@
 //!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
 //!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
 //!   llm-cli agent rag <имя>                        -- RAG-режим агента: включён ли и с какими параметрами
-//!   llm-cli agent rag <имя> on [стратегия] [k=N] [min=0.5] -- отвечать с базой документов (llm_core::rag::retrieve)
+//!   llm-cli agent rag <имя> on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5]
+//!                                         -- отвечать с базой документов (llm_core::rag::retrieve)
 //!   llm-cli agent rag <имя> off                    -- отвечать без базы документов
 //!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
 //!   llm-cli agent invariants                       -- список жёстких инвариантов (общих для всех агентов)
@@ -603,6 +605,20 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             })?;
             let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
             match args.get(2).map(String::as_str) {
+                Some("mode") => {
+                    match args.get(3).map(String::as_str) {
+                        Some("on") => {
+                            let task = agent.enable_task_mode()?;
+                            println!("Режим задачи включён — задача «{}», этап «{}».", task.name, task.stage);
+                        }
+                        Some("off") => {
+                            agent.set_task_mode(false)?;
+                            println!("Режим задачи выключен — агент «{name}» отвечает как обычный чат, задача сохранена.");
+                        }
+                        _ => bail!("укажите: llm-cli agent task {name} mode on|off"),
+                    }
+                    Ok(())
+                }
                 Some("start") => {
                     let task_name = args
                         .get(3)
@@ -819,7 +835,7 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
         }
         Some("rag") => {
             let name = args.get(1).cloned().ok_or_else(|| {
-                anyhow!("укажите имя агента: llm-cli agent rag <имя> [on [стратегия] [k=N] [min=0.5] | off]")
+                anyhow!("укажите имя агента: llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=…] [rmin=0.5] | off]")
             })?;
             let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
             let words: Vec<&str> = args[2..].iter().map(String::as_str).collect();
@@ -1211,7 +1227,8 @@ fn print_agent_usage() {
          \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
          \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
          \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)\n\
-         \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [min=0.5] | off] (RAG-режим: с базой документов или без)\n\
+         \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] | off]\n\
+         \x20     (RAG-режим: с базой документов или без; n — кандидатов до фильтра, k — фрагментов после)\n\
          \x20 llm-cli agent invariants                                 (жёсткие правила, общие для ВСЕХ агентов)\n\
          \x20 llm-cli agent invariants show <id>                       (показать текст одного инварианта)\n\
          \x20 llm-cli agent invariants create <id>                     (создать новый инвариант — пустой шаблон)\n\
@@ -1310,7 +1327,7 @@ fn print_restored_history(agent: &Agent) {
     println!();
 }
 
-/// `rag [on [стратегия] [k=N] [min=0.5] | off]` — показать или сменить
+/// `rag [on … | off]` (см. [`llm_core::rag::retrieve::RAG_ON_USAGE`]) — показать или сменить
 /// RAG-режим агента; общая часть `agent rag` и команды `/rag` в чате.
 fn set_rag(agent: &Agent, words: &[&str]) -> Result<String> {
     let mut config = agent.config();
@@ -1329,7 +1346,7 @@ fn set_rag(agent: &Agent, words: &[&str]) -> Result<String> {
             config.rag = None;
             "RAG-режим выключен — агент отвечает без базы документов.".to_string()
         }
-        Some(other) => bail!("непонятное действие «{other}» — rag on [стратегия] [k=N] [min=0.5] или rag off"),
+        Some(other) => bail!("непонятное действие «{other}» — {} или rag off", llm_core::rag::retrieve::RAG_ON_USAGE),
     };
     agent.set_config(config)?;
     Ok(text)

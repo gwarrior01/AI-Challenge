@@ -119,6 +119,16 @@ struct SetRagRequest {
     k: Option<usize>,
     #[serde(default)]
     min_score: Option<f32>,
+    /// Топ-N кандидатов до фильтра и реранкинга.
+    #[serde(default)]
+    candidates: Option<usize>,
+    #[serde(default)]
+    rewrite: bool,
+    /// `none` | `heuristic` | `llm`.
+    #[serde(default)]
+    rerank: Option<String>,
+    #[serde(default)]
+    rerank_min: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +341,8 @@ async fn create_agent(
         window_size: req.window_size.filter(|&n| n > 0),
         profile: req.profile.filter(|s| !s.trim().is_empty()),
         rag: None,
+        // Новый агент — обычный чат; этапы включаются кнопкой «🧭 Этапы» в чате.
+        task_mode: false,
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -359,6 +371,30 @@ async fn set_agent_strategy(
     }
 }
 
+#[derive(Deserialize)]
+struct SetTaskModeRequest {
+    enabled: bool,
+}
+
+/// Включает или выключает режим задачи агента (конечный автомат этапов, см.
+/// llm_core::AgentConfig::task_mode). Включение сразу заводит задачу, если её
+/// нет, — этап «planning» появляется в чате до первого вопроса; выключение
+/// задачу не удаляет, агент просто отвечает как обычный чат.
+async fn set_agent_task_mode(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetTaskModeRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    let result = if req.enabled { agent.enable_task_mode().map(|_| ()) } else { agent.set_task_mode(false) };
+    if let Err(err) = result {
+        return Json(serde_json::json!({ "error": err.to_string() }));
+    }
+    Json(serde_json::json!({ "agent": agent.info() }))
+}
+
 /// Включает или выключает RAG-режим агента — на лету, как стратегию и профиль.
 async fn set_agent_rag(
     State(state): State<AppState>,
@@ -380,6 +416,18 @@ async fn set_agent_rag(
         }
         if let Some(min) = req.min_score {
             args.push(format!("min={min}"));
+        }
+        if let Some(n) = req.candidates {
+            args.push(format!("n={n}"));
+        }
+        if req.rewrite {
+            args.push("rewrite".to_string());
+        }
+        if let Some(rerank) = req.rerank.filter(|r| !r.trim().is_empty()) {
+            args.push(format!("rerank={rerank}"));
+        }
+        if let Some(rmin) = req.rerank_min.filter(|&m| m > 0.0) {
+            args.push(format!("rmin={rmin}"));
         }
         match llm_core::rag::RagSettings::parse_args(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
             Ok(settings) => Some(settings),
@@ -670,7 +718,7 @@ async fn task_ensure_agent(State(state): State<AppState>, Path(name): Path<Strin
     let Some(agent) = state.agents.get(&name) else {
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
-    ensure_task(&agent, &name);
+    ensure_task(&agent);
     Json(serde_json::json!({ "agent": agent.info() }))
 }
 
@@ -928,7 +976,7 @@ async fn ask_agent(
     let Some(agent) = state.agents.get(&name) else {
         return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
     };
-    ensure_task(&agent, &name);
+    ensure_task(&agent);
     let result = if req.continuation {
         agent.continue_task(&req.prompt).await
     } else {
@@ -1048,32 +1096,15 @@ async fn reload_mcp(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(mcp_snapshot(&state))
 }
 
-/// Веб-интерфейс ведёт задачу за пользователя, без ручного `agent task start`:
-/// первый же вопрос агенту без активной задачи заводит её автоматически, сразу
-/// в этапе `planning` (значение по умолчанию [`llm_core::Stage`]) — см.
-/// документацию модуля [`llm_core::memory`] за тем, что это довесок только для
-/// веб-интерфейса: CLI и TUI по-прежнему требуют явного `agent task start`,
-/// как и весь остальной "ничего не пишется автоматически" принцип рабочей и
-/// долговременной памяти.
-///
-/// Имя задачи — имя самого агента: у каждого именованного агента в этом
-/// потоке не больше одной активной задачи одновременно, и после `task/finish`
-/// то же имя свободно для следующей. Коллизия (то же имя занято ЧУЖИМ
-/// агентом) — редкий случай при обычном использовании веб-интерфейса,
-/// поэтому просто добавляем метку времени и пробуем ещё раз, не блокируя
-/// обмен из-за этого.
-fn ensure_task(agent: &llm_core::Agent, agent_name: &str) {
-    if agent.task_state().is_some() {
-        return;
+/// В режиме задачи ([`llm_core::AgentConfig::task_mode`]) веб-интерфейс
+/// ведёт задачу за пользователя: вопрос агенту без активной задачи заводит её
+/// (см. [`llm_core::Agent::enable_task_mode`] — имя агента, этап planning),
+/// например после «🏁 Новая задача». Без режима агент — обычный чат, и задача
+/// ему не заводится.
+fn ensure_task(agent: &llm_core::Agent) {
+    if agent.config().task_mode && agent.task_state().is_none() {
+        let _ = agent.enable_task_mode();
     }
-    if agent.task_start(agent_name, None).is_ok() {
-        return;
-    }
-    let unique = format!(
-        "{agent_name}-{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-    );
-    let _ = agent.task_start(&unique, None);
 }
 
 #[derive(Deserialize)]
@@ -1275,6 +1306,7 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/strategy", post(set_agent_strategy))
         .route("/api/agents/:name/profile", post(set_agent_profile))
         .route("/api/agents/:name/rag", post(set_agent_rag))
+        .route("/api/agents/:name/task-mode", post(set_agent_task_mode))
         .route("/api/profiles", get(list_profiles).post(create_profile))
         .route(
             "/api/invariants",

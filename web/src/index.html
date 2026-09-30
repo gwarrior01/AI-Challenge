@@ -2509,10 +2509,50 @@
     margin: 4px 0 6px;
   }
 
+  #agent-task-mode-toggle.on {
+    border-color: rgba(108, 141, 255, 0.7);
+    color: var(--accent);
+  }
+
   #agent-rag-toggle.on {
     border-color: rgba(234, 179, 8, 0.7);
     color: rgb(234, 179, 8);
   }
+
+  .agent-message.rag .rag-query,
+  .agent-message.rag .rag-warn {
+    color: var(--muted);
+    margin-bottom: 2px;
+    overflow-wrap: anywhere;
+  }
+  .agent-message.rag .rag-warn { color: var(--warn); }
+  .agent-message.rag .rag-moved { color: rgb(234, 179, 8); }
+
+  /* Параметры поиска RAG-режима: топ-N до фильтра, топ-K после, пороги,
+     переписывание запроса и реранкер (кнопка ⚙ рядом с «📚 RAG»). */
+  .agent-rag-panel {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px 16px;
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+    font-size: 12px;
+  }
+  .agent-rag-panel[hidden] { display: none; }
+  .agent-rag-panel label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); }
+  .agent-rag-panel label.inline { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
+  .agent-rag-panel input[type="number"], .agent-rag-panel select {
+    width: 90px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+  }
+  .agent-rag-panel .card-hint { flex-basis: 100%; }
 
   /* Вызов инструмента моделью в чате агента — перед её ответом. */
   .agent-chat-main .agent-message.tool,
@@ -2916,6 +2956,7 @@
       <span class="card-hint" id="agent-chat-meta"></span>
     </div>
     <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
+    <button type="button" class="settings-btn" id="agent-task-mode-toggle" title="Режим задачи: агент ведёт работу по этапам planning → execution → validation → done с утверждением переходов. Выключен — обычный чат; задача при этом сохраняется и продолжится при включении">🧭 Этапы</button>
     <button type="button" class="settings-btn" id="agent-rag-toggle" title="RAG-режим: к каждому вопросу добавляются найденные фрагменты базы документов (вкладка RAG)">📚 RAG</button>
     <select id="agent-rag-strategy" class="settings-btn" title="Стратегия нарезки, по чанкам которой ищет RAG-режим">
       <option value="auto">авто</option>
@@ -2924,6 +2965,7 @@
       <option value="sentence">sentence</option>
       <option value="parent">parent</option>
     </select>
+    <button type="button" class="settings-btn" id="agent-rag-settings" title="Параметры поиска: топ-N до фильтра, топ-K после, пороги, переписывание запроса, реранкер">⚙</button>
     <button type="button" class="settings-btn" id="agent-memory-toggle">🧠 Память</button>
     <label class="debug-check">
       <input type="checkbox" id="agent-chat-debug-toggle">
@@ -2942,6 +2984,26 @@
     </div>
     <span class="ctx-pending-badge" id="agent-ctx-pending" hidden></span>
     <span class="ctx-pending-badge" id="agent-cost-badge" hidden></span>
+  </div>
+  <div class="agent-rag-panel" id="agent-rag-panel" hidden>
+    <label title="Сколько ближайших по эмбеддингу чанков берёт первый этап — до фильтра и реранкинга">кандидатов (топ-N)
+      <input type="number" id="agent-rag-n" min="1" max="50" step="1"></label>
+    <label title="Сколько фрагментов уходит модели — после фильтра и реранкинга">в контекст (топ-K)
+      <input type="number" id="agent-rag-k" min="1" max="20" step="1"></label>
+    <label title="Чанки с косинусной близостью ниже порога отбрасываются; 0 — без порога">порог близости
+      <input type="number" id="agent-rag-min" min="0" max="1" step="0.05"></label>
+    <label class="inline" title="Модель переписывает вопрос в поисковый запрос (термины, идентификаторы, перевод на английский); ищем по обеим формулировкам">
+      <input type="checkbox" id="agent-rag-rewrite"> переписать запрос</label>
+    <label title="heuristic — близость + бонус за термины запроса в тексте; llm — модель оценивает каждого кандидата 0–10">реранкер
+      <select id="agent-rag-rerank">
+        <option value="none">нет</option>
+        <option value="heuristic">heuristic</option>
+        <option value="llm">llm</option>
+      </select></label>
+    <label title="Кандидаты с оценкой реранкера ниже порога отбрасываются: у llm — оценка модели 0–1, у heuristic — близость с бонусом; 0 — без порога">порог реранкера
+      <input type="number" id="agent-rag-rmin" min="0" max="1" step="0.05"></label>
+    <button type="button" class="settings-btn" id="agent-rag-apply">Применить</button>
+    <span class="card-hint">вопрос → [переписывание] → топ-N по близости → порог близости → [реранкер] → порог реранкера → топ-K в контекст</span>
   </div>
   <div class="branch-bar" id="agent-branch-bar" hidden>
     <div class="branch-bar-group">
@@ -4327,8 +4389,19 @@ const viewAgents = document.getElementById('view-agents');
 const viewAgentChat = document.getElementById('view-agent-chat');
 const agentChatBackBtn = document.getElementById('agent-chat-back');
 const agentChatToggleBtn = document.getElementById('agent-chat-toggle');
+const agentTaskModeBtn = document.getElementById('agent-task-mode-toggle');
 const agentRagToggleBtn = document.getElementById('agent-rag-toggle');
 const agentRagStrategyEl = document.getElementById('agent-rag-strategy');
+const agentRagSettingsBtn = document.getElementById('agent-rag-settings');
+const agentRagPanel = document.getElementById('agent-rag-panel');
+const agentRagFields = {
+  n: document.getElementById('agent-rag-n'),
+  k: document.getElementById('agent-rag-k'),
+  min: document.getElementById('agent-rag-min'),
+  rewrite: document.getElementById('agent-rag-rewrite'),
+  rerank: document.getElementById('agent-rag-rerank'),
+  rmin: document.getElementById('agent-rag-rmin'),
+};
 const agentChatStatusDot = document.getElementById('agent-chat-status-dot');
 const agentChatNameEl = document.getElementById('agent-chat-name');
 const agentChatMetaEl = document.getElementById('agent-chat-meta');
@@ -4362,8 +4435,10 @@ const agentRememberBtnEl = document.getElementById('agent-remember-btn');
 // Конечный автомат задачи (см. llm_core::memory::Stage) — теперь НЕ в панели
 // памяти: полоска статуса вверху диалога (task-stage-bar) и панель действий
 // рядом с кнопкой "Отправить" (task-action-bar), обе обновляются из
-// renderTaskBar (см. ниже) при каждом обновлении AgentInfo. Задача заводится
-// автоматически первым вопросом агенту — см. ensure_task в web/src/main.rs.
+// renderTaskBar (см. ниже) при каждом обновлении AgentInfo. Только в режиме
+// задачи (кнопка «🧭 Этапы», AgentConfig::task_mode): тогда задача заводится
+// автоматически первым вопросом агенту — см. ensure_task в web/src/main.rs;
+// без режима агент — обычный чат, полоски скрыты.
 const agentTaskStageBarEl = document.getElementById('agent-task-stage-bar');
 const agentTaskStageBadgeEl = document.getElementById('agent-task-stage-badge');
 const agentTaskNewBtnEl = document.getElementById('agent-task-new-btn');
@@ -4842,6 +4917,8 @@ function renderMemoryPanel(info) {
 // Задача заводится автоматически первым вопросом агенту (ensure_task на
 // бэкенде) — до первого сообщения task === null, полоски скрыты.
 function renderTaskBar(task) {
+  // Режим задачи выключен — задача (если есть) сохранена, но не действует.
+  if (!agentTaskModeOn(currentAgentChatName)) task = null;
   currentTaskSnapshot = task;
   agentTaskStageBarEl.hidden = !task;
   agentTaskActionBarEl.hidden = !task;
@@ -5449,7 +5526,7 @@ function agentMetaLine(config) {
   if (config.reasoning === false) parts.push('reasoning: выкл');
   parts.push('стратегия контекста: ' + (config.context_strategy || 'full'));
   parts.push('профиль: ' + (config.profile && config.profile.trim() ? config.profile : 'default'));
-  parts.push(config.rag ? `RAG: ${config.rag.strategy || 'авто'}, k=${config.rag.k}` : 'без RAG');
+  parts.push(config.rag ? ragDescribe(config.rag) : 'без RAG');
   return parts.join(' · ');
 }
 
@@ -5513,19 +5590,53 @@ function renderAgentMessage(msg) {
       head.textContent = '📚 RAG: поиск не удался — ответ без контекста: ' + rag.error;
       return row;
     }
+    // Метка и этапы — как RagContext::label/stages в core (TUI, CLI).
+    let label = rag.strategy;
+    if (rag.query) label += ' · rewrite';
+    if (rag.rerank && rag.rerank !== 'none') label += ` · rerank ${rag.rerank}`;
+    const candidates = rag.candidates || 0;
+    const belowRerank = rag.below_rerank || 0;
     if (!rag.sources.length) {
-      head.textContent = `📚 RAG (${rag.strategy}): ` + (rag.below_threshold
-        ? `все ${rag.below_threshold} найденных фрагментов ниже порога близости`
-        : 'в индексе ничего не нашлось');
-      return row;
+      head.textContent = `📚 RAG (${label}): ` + (belowRerank
+        ? `все ${rag.below_threshold + belowRerank} кандидатов ниже порога реранкера`
+        : rag.below_threshold
+          ? `все ${rag.below_threshold} найденных фрагментов ниже порога близости`
+          : 'в индексе ничего не нашлось');
+    } else {
+      const stages = [`${candidates} кандидатов`];
+      const afterThreshold = candidates - rag.below_threshold;
+      if (rag.below_threshold) stages.push(`${afterThreshold} после порога`);
+      if (belowRerank) stages.push(`${afterThreshold - belowRerank} после реранкера`);
+      stages.push(`${rag.sources.length} фрагм.`);
+      head.textContent = `📚 RAG (${label}): ${stages.join(' → ')} — в ответе ссылки [n]`;
     }
-    head.textContent = `📚 RAG (${rag.strategy}): ${rag.sources.length} фрагм. — в ответе ссылки [n]`;
+    if (rag.query) {
+      const q = document.createElement('div');
+      q.className = 'rag-query';
+      q.textContent = 'запрос: ' + rag.query;
+      row.appendChild(q);
+    }
+    (rag.warnings || []).forEach((w) => {
+      const div = document.createElement('div');
+      div.className = 'rag-warn';
+      div.textContent = '⚠ ' + w;
+      row.appendChild(div);
+    });
     rag.sources.forEach((src) => {
       const details = document.createElement('details');
       const summary = document.createElement('summary');
       const section = src.section ? ` › ${src.section}` : '';
       const version = src.version > 1 ? ` (версия ${src.version})` : '';
       summary.textContent = `[${src.n}] ${src.source}${version}${section} · строки ${src.start_line}–${src.end_line} · ${src.score.toFixed(2)}`;
+      if (src.rerank_score !== null && src.rerank_score !== undefined) {
+        summary.append(` → реранк ${src.rerank_score.toFixed(2)}`);
+        if (src.rank_before !== src.n) {
+          const moved = document.createElement('span');
+          moved.className = 'rag-moved';
+          moved.textContent = ` (было #${src.rank_before})`;
+          summary.appendChild(moved);
+        }
+      }
       const pre = document.createElement('pre');
       pre.textContent = src.text;
       details.append(summary, pre);
@@ -5728,11 +5839,17 @@ function updateAgentChatHeader(name) {
   agentChatToggleBtn.hidden = !info;
   agentChatToggleBtn.textContent = running ? '⏸ Остановить' : '▶ Запустить';
   const rag = info ? info.config.rag : null;
+  agentTaskModeBtn.hidden = !info;
+  agentTaskModeBtn.classList.toggle('on', !!(info && info.config.task_mode));
+  agentTaskModeBtn.textContent = info && info.config.task_mode ? '🧭 Этапы: вкл' : '🧭 Этапы: выкл';
   agentRagToggleBtn.hidden = !info;
   agentRagToggleBtn.classList.toggle('on', !!rag);
   agentRagToggleBtn.textContent = rag ? '📚 RAG: вкл' : '📚 RAG: выкл';
   agentRagStrategyEl.hidden = !info;
   agentRagStrategyEl.value = (rag && rag.strategy) || 'auto';
+  agentRagSettingsBtn.hidden = !info;
+  if (!info) agentRagPanel.hidden = true;
+  fillAgentRagPanel(rag);
 
   if (info && typeof info.context_window === 'number') {
     ensureAgentChatStats(name).contextWindow = info.context_window;
@@ -5830,22 +5947,72 @@ agentChatToggleBtn.addEventListener('click', async () => {
 // RAG-режим агента: вкл/выкл кнопкой, стратегия — списком рядом (смена
 // стратегии у выключенного режима его и включает). Сообщение в ленте чата
 // отмечает, с какого места ответы идут с базой документов или без неё.
+// Режим задачи агента: вкл — работа по этапам с утверждением переходов
+// (задача заводится сразу, этап виден до первого вопроса), выкл — обычный
+// чат; задача при этом не удаляется и продолжится при включении.
+function agentTaskModeOn(name) {
+  const info = name ? findAgentInfo(name) : null;
+  return !!(info && info.config.task_mode);
+}
+
+agentTaskModeBtn.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const enabled = !agentTaskModeOn(name);
+  agentTaskModeBtn.disabled = true;
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(name)}/task-mode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const data = await res.json();
+    const task = data.agent ? data.agent.task : null;
+    const notice = data.error
+      ? { role: 'error', text: data.error }
+      : { role: 'notice', text: enabled
+          ? `🧭 Режим задачи включён — этап «${task ? task.stage : 'planning'}»: переходы между этапами утверждаете вы.`
+          : '🧭 Режим задачи выключен — агент отвечает как обычный чат. Задача сохранена и продолжится при включении.' };
+    agentChats[name].push(notice);
+    if (currentAgentChatName === name) {
+      agentChatMainEl.appendChild(renderAgentMessage(notice));
+      agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+    }
+    await fetchAgents();
+    if (currentAgentChatName === name) renderTaskBar(task);
+  } finally {
+    agentTaskModeBtn.disabled = false;
+  }
+});
+
+// Параметры поиска — из панели ⚙ (её поля заполняются из настроек агента,
+// так что смена стратегии или включение их не сбрасывает).
 async function setAgentRag(enabled) {
   const name = currentAgentChatName;
   if (!name) return;
   agentRagToggleBtn.disabled = true;
+  const num = (el) => (el.value === '' ? null : Number(el.value));
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}/rag`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled, strategy: agentRagStrategyEl.value }),
+      body: JSON.stringify({
+        enabled,
+        strategy: agentRagStrategyEl.value,
+        candidates: num(agentRagFields.n),
+        k: num(agentRagFields.k),
+        min_score: num(agentRagFields.min),
+        rewrite: agentRagFields.rewrite.checked,
+        rerank: agentRagFields.rerank.value,
+        rerank_min: agentRagFields.rerank.value === 'none' ? null : num(agentRagFields.rmin),
+      }),
     });
     const data = await res.json();
     const rag = data.agent ? data.agent.config.rag : null;
     const notice = data.error
       ? { role: 'error', text: data.error }
       : { role: 'notice', text: rag
-          ? `📚 RAG-режим включён — ${rag.strategy || 'авто'}, k=${rag.k}: к вопросу добавляются найденные фрагменты.`
+          ? `📚 RAG-режим включён — ${ragDescribe(rag)}: к вопросу добавляются найденные фрагменты.`
           : '📚 RAG-режим выключен — агент отвечает без базы документов.' };
     agentChats[name].push(notice);
     if (currentAgentChatName === name) {
@@ -5863,6 +6030,39 @@ agentRagToggleBtn.addEventListener('click', () => {
   setAgentRag(!(info && info.config.rag));
 });
 agentRagStrategyEl.addEventListener('change', () => setAgentRag(true));
+agentRagSettingsBtn.addEventListener('click', () => {
+  agentRagPanel.hidden = !agentRagPanel.hidden;
+});
+agentRagFields.rerank.addEventListener('change', () => {
+  agentRagFields.rmin.disabled = agentRagFields.rerank.value === 'none';
+});
+document.getElementById('agent-rag-apply').addEventListener('click', () => setAgentRag(true));
+
+// Поля панели ⚙ из настроек агента; выключенный режим — значения по умолчанию
+// (как RagSettings::default в core).
+function fillAgentRagPanel(rag) {
+  if (agentRagPanel.contains(document.activeElement)) return; // не мешать правке
+  const r = rag || {};
+  agentRagFields.n.value = r.candidates ?? 20;
+  agentRagFields.k.value = r.k ?? 5;
+  agentRagFields.min.value = r.min_score ?? 0;
+  agentRagFields.rewrite.checked = !!r.rewrite;
+  agentRagFields.rerank.value = r.rerank || 'none';
+  agentRagFields.rmin.value = r.rerank_min ?? 0;
+  agentRagFields.rmin.disabled = agentRagFields.rerank.value === 'none';
+}
+
+// Одной строкой — как RagSettings::describe в core.
+function ragDescribe(rag) {
+  let s = `RAG: ${rag.strategy || 'авто'}, топ-${rag.candidates ?? 20} → k=${rag.k}`;
+  if (rag.min_score > 0) s += `, порог ${rag.min_score.toFixed(2)}`;
+  if (rag.rewrite) s += ', rewrite';
+  if (rag.rerank && rag.rerank !== 'none') {
+    s += `, rerank ${rag.rerank}`;
+    if (rag.rerank_min > 0) s += ` ≥ ${rag.rerank_min.toFixed(2)}`;
+  }
+  return s;
+}
 
 // `promptOverride` — когда обмен запускается программно, а не вводом человека
 // (см. approve-обработчик ниже: после утверждения предложенного моделью

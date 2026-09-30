@@ -6,7 +6,9 @@
 //! - [`chunking`] — стратегии `fixed`, `structure`, `sentence`, `parent`;
 //! - [`embed`] — клиент `/embeddings` (модель — `LLM_EMBEDDING_MODEL`);
 //! - [`store`] — индекс: документы, версии, чанки, векторы;
-//! - [`retrieve`] — RAG-режим агента: поиск по вопросу и контекст для LLM.
+//! - [`retrieve`] — RAG-режим агента: поиск по вопросу и контекст для LLM;
+//! - [`rerank`] — второй этап поиска: переписывание запроса и реранкинг
+//!   кандидатов (эвристика по терминам или оценка моделью).
 //!
 //! **Версии.** Индексация сравнивает SHA-256 файла с действующей версией
 //! документа: изменился — появляется версия N+1, прежняя становится
@@ -25,6 +27,7 @@ pub mod browse;
 pub mod chunking;
 pub mod corpus;
 pub mod embed;
+pub mod rerank;
 pub mod retrieve;
 pub mod store;
 
@@ -37,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 pub use chunking::{ChunkParams, Kind, ParamSpec, Strategy};
 pub use embed::Embedder;
+pub use rerank::Rerank;
 pub use retrieve::{RagContext, RagSettings, RagSource};
 use store::{ChunkHit, ChunkRow, NewVersion, Store};
 
@@ -621,7 +625,17 @@ pub struct SearchHit {
 /// Топ-`k` по близости. Parent-child: у одного родителя остаётся лучший
 /// ребёнок — в выдаче `k` разных абзацев, а не один абзац несколько раз.
 fn rank(set: &[(ChunkHit, Vec<f32>)], query: &[f32], k: usize) -> Vec<SearchHit> {
-    let mut scored: Vec<(f32, usize)> = set.iter().enumerate().map(|(i, (_, v))| (embed::dot(query, v), i)).collect();
+    rank_multi(set, &[query.to_vec()], k)
+}
+
+/// То же для нескольких формулировок одного запроса (исходный вопрос и его
+/// переписанный вариант): близость чанка — лучшая из близостей к ним.
+fn rank_multi(set: &[(ChunkHit, Vec<f32>)], queries: &[Vec<f32>], k: usize) -> Vec<SearchHit> {
+    let mut scored: Vec<(f32, usize)> = set
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| (queries.iter().map(|q| embed::dot(q, v)).fold(f32::MIN, f32::max), i))
+        .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut seen_parents = std::collections::HashSet::new();
     scored
@@ -669,6 +683,19 @@ pub async fn search(cfg: &RagConfig, embedder: &Embedder, query: &str, opts: &Se
         result.push((strategy, rank(&set, &qvec, opts.k)));
     }
     Ok(result)
+}
+
+/// Поиск одной стратегии по нескольким формулировкам запроса — топ-`k`
+/// действующих чанков по лучшей из близостей (см. [`rank_multi`]).
+pub async fn search_queries(cfg: &RagConfig, embedder: &Embedder, queries: &[String], strategy: Strategy, k: usize) -> Result<Vec<SearchHit>> {
+    let store = Store::open(&cfg.db_path)?;
+    check_model(&store, embedder)?;
+    let mut qvecs = Vec::with_capacity(queries.len());
+    for query in queries {
+        qvecs.push(embedder.embed_query(query).await?);
+    }
+    let set = store.search_set(strategy.name(), None, None)?;
+    Ok(rank_multi(&set, &qvecs, k))
 }
 
 // ---------------------------------------------------------------------------

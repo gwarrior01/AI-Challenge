@@ -87,13 +87,26 @@
 //! команды, что `llm-cli rag …`. Команды выполняются в фоне, ход индексации
 //! виден в строке статуса, экран можно покинуть.
 //!
+//! ## Режим задачи (Ctrl+T в чате агента)
+//!
+//! Агент работает либо как обычный чат, либо по этапам задачи (planning →
+//! execution → validation → done с утверждением переходов, см.
+//! llm_core::AgentConfig::task_mode). Ctrl+T в чате переключает режим:
+//! включение сразу заводит задачу, если её нет, выключение задачу не удаляет —
+//! она продолжится с того же этапа. То же — `task mode on|off` на F3; `task
+//! start`/`task join` включают режим сами. В шапке чата — этап или «чат».
+//!
 //! ## RAG-режим агента (Ctrl+R в чате агента)
 //!
 //! Агент отвечает с базой документов или без неё (см. llm_core::rag::retrieve):
 //! Ctrl+R в чате включает режим с параметрами по умолчанию и выключает его,
-//! `rag on [стратегия] [k=N] [min=0.5]` / `rag off` на экране памяти (F3)
-//! задают параметры. Режим виден в шапке чата, найденные фрагменты —
-//! строкой «RAG» перед ответом: номера [n] в ответе ссылаются на них.
+//! `rag on [стратегия] [k=N] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm]
+//! [rmin=0.5]` / `rag off` на экране памяти (F3) задают параметры: топ-N
+//! кандидатов до фильтра, топ-K после, порог близости, переписывание запроса,
+//! реранкер и его порог. Режим виден в шапке чата, найденные фрагменты —
+//! строкой «RAG» перед ответом: этапы поиска (кандидатов → после порога →
+//! после реранкера), переписанный запрос и источники с близостью, оценкой
+//! реранкера и прежним местом; номера [n] в ответе ссылаются на них.
 //!
 //! ## MCP (F4 с любого экрана)
 //!
@@ -863,9 +876,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             _ => Vec::new(),
         };
         let screen_agent_task = match &screen {
-            Screen::AgentChat => {
-                agent_chat_name.as_ref().and_then(|n| agent_manager.get(n)).and_then(|a| a.task_state())
-            }
+            // Без режима задачи задача (если есть) не действует — в шапке «чат».
+            Screen::AgentChat => agent_chat_name
+                .as_ref()
+                .and_then(|n| agent_manager.get(n))
+                .filter(|a| a.config().task_mode)
+                .and_then(|a| a.task_state()),
             _ => None,
         };
 
@@ -1250,6 +1266,27 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                             } else {
                                                 agent_manager.start(&name)
                                             };
+                                        }
+                                    }
+                                }
+                                // Ctrl+T — режим задачи вкл/выкл: этапы с утверждением
+                                // переходов или обычный чат (задача при выключении живёт дальше).
+                                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(name) = agent_chat_name.clone() {
+                                        if let Some(agent) = agent_manager.get(&name) {
+                                            let text = match toggle_task_mode(&agent) {
+                                                Ok(text) => text,
+                                                Err(err) => format!("не удалось переключить режим задачи: {err}"),
+                                            };
+                                            agent_histories.entry(name).or_default().push(HistoryItem {
+                                                role: Role::System,
+                                                text,
+                                                debug: None,
+                                                tokens: None,
+                                                cost: None,
+                                                cost_approx: false,
+                                            });
+                                            follow_bottom = true;
                                         }
                                     }
                                 }
@@ -2838,8 +2875,13 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Some(rag) => header_spans.push(Span::styled(format!("  ·  {}", rag.describe()), Style::default().fg(Color::Yellow))),
         None => header_spans.push(Span::styled("  ·  без RAG", Style::default().fg(Color::DarkGray))),
     }
-    header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
-    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  Ctrl+R RAG  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
+    let task_mode = state.agents.iter().find(|a| a.config.name == name).is_some_and(|a| a.config.task_mode);
+    if task_mode {
+        header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
+    } else {
+        header_spans.push(Span::styled("  ·  чат, без этапов", Style::default().fg(Color::DarkGray)));
+    }
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  Ctrl+T этапы  ·  Ctrl+R RAG  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
     let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
@@ -2998,7 +3040,7 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
             rag.describe()
         ))),
         None => lines.push(Line::from(Span::styled(
-            "  выключен — агент отвечает без базы документов · rag on [fixed|structure|sentence|parent] [k=N] [min=0.5]",
+            format!("  выключен — агент отвечает без базы документов · {}", llm_core::rag::retrieve::RAG_ON_USAGE),
             hint_style,
         ))),
     }
@@ -3013,6 +3055,14 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled("Рабочая — данные ОБЩЕЙ задачи", section_style)));
+    if info.is_some_and(|i| i.config.task_mode) {
+        lines.push(Line::from("  режим задачи: включён — работа по этапам · task mode off (Ctrl+T в чате) — обычный чат"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  режим задачи: выключен — агент отвечает как обычный чат, задача ниже не действует · task mode on (Ctrl+T в чате)",
+            hint_style,
+        )));
+    }
     match info.and_then(|i| i.task.as_ref()) {
         Some(task) => {
             let goal_suffix = task.goal.as_deref().map(|g| format!(" (цель: {g})")).unwrap_or_default();
@@ -3169,12 +3219,12 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
         Some((text, is_error)) => (format!(" {text}"), if is_error { Color::Red } else { Color::Green }),
         None => (
             " Команды: remember <ключ> <значение> [--category CAT] · forget <ключ> · \
-             task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · \
+             task mode on|off · task start <имя> [--goal ТЕКСТ] · task join <имя> · task set <ключ> <значение> · \
              task advance <этап> [--step T] [--expect T] · task pause · task resume · \
              task approve · task reject <причина> · task finish · task invariant set/remove <id> [текст] · \
              task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
              profile new <имя> · invariants new <id> · invariants remove <id> · \
-             rag on [стратегия] [k=N] [min=0.5] · rag off · \
+             rag on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] · rag off · \
              schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
                 .to_string(),
             Color::DarkGray,
@@ -3282,6 +3332,20 @@ fn send_to_agent(
     });
 }
 
+/// Ctrl+T в чате агента: режим задачи вкл/выкл. Возвращает строку для чата.
+fn toggle_task_mode(agent: &llm_core::Agent) -> Result<String> {
+    if agent.config().task_mode {
+        agent.set_task_mode(false)?;
+        return Ok("Режим задачи выключен — агент отвечает как обычный чат. Задача сохранена и продолжится при включении."
+            .to_string());
+    }
+    let task = agent.enable_task_mode()?;
+    Ok(format!(
+        "Режим задачи включён — задача «{}», этап «{}»: переходы между этапами утверждаете вы.",
+        task.name, task.stage
+    ))
+}
+
 /// Ctrl+R в чате агента: RAG-режим вкл/выкл (включается с параметрами по
 /// умолчанию). Возвращает строку для чата.
 fn toggle_rag(agent: &llm_core::Agent) -> Result<String> {
@@ -3332,6 +3396,17 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             }
         }
         Some("task") => match tokens.get(1).copied() {
+            Some("mode") => match tokens.get(2).copied() {
+                Some("on") => {
+                    let task = agent.enable_task_mode().map_err(|err| err.to_string())?;
+                    Ok(format!("Режим задачи включён — задача «{}», этап «{}».", task.name, task.stage))
+                }
+                Some("off") => {
+                    agent.set_task_mode(false).map_err(|err| err.to_string())?;
+                    Ok("Режим задачи выключен — агент отвечает как обычный чат, задача сохранена.".to_string())
+                }
+                _ => Err("укажите: task mode on или task mode off".to_string()),
+            },
             Some("start") => {
                 let task_name =
                     tokens.get(2).copied().ok_or("укажите название: task start <название> [--goal ТЕКСТ]")?;
@@ -3509,7 +3584,7 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
                     config.rag = None;
                     "RAG-режим выключен — агент отвечает без базы документов.".to_string()
                 }
-                _ => return Err("укажите действие: rag on [стратегия] [k=N] [min=0.5] или rag off".to_string()),
+                _ => return Err(format!("укажите действие: {} или rag off", llm_core::rag::retrieve::RAG_ON_USAGE)),
             };
             agent.set_config(config).map_err(|err| err.to_string())?;
             Ok(text)
