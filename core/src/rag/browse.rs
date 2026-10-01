@@ -24,6 +24,9 @@ pub struct StrategyOverview {
 #[derive(Debug, Serialize)]
 pub struct Overview {
     pub db_path: String,
+    /// Префикс путей загруженных документов — интерфейсы его не показывают
+    /// (см. [`super::display_source`]).
+    pub uploads_prefix: String,
     pub model: Option<String>,
     pub dim: Option<usize>,
     pub indexed_at: Option<String>,
@@ -55,6 +58,7 @@ pub fn overview(cfg: &RagConfig) -> Result<Overview> {
     }
     Ok(Overview {
         db_path: cfg.source_of(&cfg.db_path),
+        uploads_prefix: super::uploads_prefix().to_string(),
         model: store.meta(META_MODEL)?,
         dim: store.meta(META_DIM)?.and_then(|d| d.parse().ok()),
         indexed_at: store.meta(META_INDEXED_AT)?.and_then(|s| s.parse().ok()).map(fmt_time),

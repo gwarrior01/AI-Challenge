@@ -389,7 +389,7 @@ llm-cli rag versions README.md
 llm-cli rag compare          # writes rag/compare.md
 llm-cli rag add ~/Downloads/report.pdf     # vectorize one file (outside the corpus → copied to rag/uploads/)
 llm-cli rag add report.pdf fixed size=800 overlap=100   # one strategy with its own parameters
-llm-cli rag remove rag/uploads/report.pdf  # drop a document from the index (an uploaded one — with its file)
+llm-cli rag remove report.pdf             # drop a document from the index (an uploaded one — with its file)
 ```
 
 **Corpus.** By default the corpus is empty: the index holds only what was added explicitly — uploaded in the web UI or via `add` — and `index` re-checks just the uploads folder. `RAG_CORPUS` adds comma-separated files and folders relative to the working directory; the comparison in `rag/compare.md` was made with `RAG_CORPUS=README.md,core/src,mcp,invariants,profiles,documents/inbox`: this README (~95 KB, about 30 pages on its own), the core and the own MCP servers' Rust code, the invariant and profile files, and the PDFs (`mcp/documents-mcp/demo/mcp-report.pdf` and whatever is in the inbox). Folders are walked recursively for `.md`, `.txt`, `.rs`, `.pdf`; `target`, `testdata` and hidden folders are skipped. PDF goes through the same PDF → Markdown converter as `documents-mcp` (it moved to `core/src/pdf.rs` so both use one copy), so a PDF gets headings and is chunked like Markdown.
@@ -422,7 +422,7 @@ llm-cli rag remove rag/uploads/report.pdf  # drop a document from the index (an 
 | `vectors` | `vector_key` (sha256 of model + prefix + text) → `vector`, a BLOB of little-endian f32, L2-normalized; bge-m3: 1024 × 4 = 4 KB each |
 | `meta` | model and dimension of the index, last indexing time, the last run and last full build of each strategy |
 
-**Uploads.** `rag/uploads/` (`RAG_UPLOADS`, git-ignored) is always part of the corpus, whatever `RAG_CORPUS` says — otherwise the next full `index` would take uploaded files for deleted ones. Uploading a file with the same name again makes it the document's next version. `add <path>` indexes a file that is inside the corpus in place and copies any other file into `rag/uploads/`; `remove` deletes all versions, chunks and now-unreferenced vectors of a document, and for an uploaded one the file too (a corpus file stays on disk, so the next full `index` brings it back — the command says so).
+**Uploads.** `rag/uploads/` (`RAG_UPLOADS`, git-ignored) is always part of the corpus, whatever `RAG_CORPUS` says — otherwise the next full `index` would take uploaded files for deleted ones. Uploading a file with the same name again makes it the document's next version. `add <path>` indexes a file that is inside the corpus in place and copies any other file into `rag/uploads/`; `remove` deletes all versions, chunks and now-unreferenced vectors of a document, and for an uploaded one the file too (a corpus file stays on disk, so the next full `index` brings it back — the command says so). The uploads folder is an internal detail: everywhere a document is shown — command output, the TUI, the web UI with its tooltips, RAG sources and quotes in answers, the model's prompt — an uploaded one is named without it (`report.pdf`, `report.pdf@v1/structure/0004`; `rag::display_source`), corpus files keep their path (`core/src/agent.rs`). `remove`, `versions` and `search --source` take either form.
 
 **Web: the RAG tab** (`web/src/rag.rs`, `/api/rag/*`):
 
@@ -444,9 +444,22 @@ Any named agent can answer with or without the document index — a switch per a
 **question → search for relevant chunks → question joined with them → request to the LLM.**
 
 1. The question is embedded and the top-`n` candidate chunks of the chosen strategy are taken from the current versions of the indexed documents (for `parent` the parent paragraph goes to the model, not the child sentence). Then a second stage filters and reorders them (below) and the best `k` go to the model.
-2. Instead of the bare question the model gets the numbered fragments with their sources — `[1] README.md › MCP › … · строки 270–284 (близость 0.70)` and the text — plus the rules: answer from the fragments, cite them as `[1]`, `[2]`, ignore the irrelevant ones, say so when the answer isn't there and mark anything added from general knowledge. When nothing was found the model is told the base has no answer rather than being left to answer as if it came from the documents.
-3. The history keeps the original question only: the fragments are needed for this answer, the next question gets its own. A task continuation (after approve/resume) isn't a question and gets no search; a scheduled run does.
-4. The reply carries what was found (`AgentReply::rag` — strategy, sources with lines and scores, the fragment texts), shown above the answer in every interface so the `[n]` in the answer can be checked. If the search fails (empty index, embedding server down, a strategy nothing was cut with), the answer comes without context and the interface says why instead of failing the whole exchange.
+2. **Nothing relevant — «не знаю» without the model.** If no candidate passes the thresholds (`min`, and `rmin` with a reranker), the model is not asked at all: the reply is just «Не знаю: в базе документов нет фрагментов, достаточно близких к вопросу. Уточните, пожалуйста, вопрос.» The reason (`лучшая 0.41 при пороге 0.50`, all below the reranker threshold, or an empty index) and the three nearest candidates are shown in the RAG line above it, not in the answer. Otherwise the model would answer from general knowledge as if from the documents; a rule decided by code can't be talked around.
+3. Otherwise, instead of the bare question the model gets the numbered fragments with their sources — `[1] README.md › MCP › … · строки 270–284 · chunk README.md@v3/structure/0042 (близость 0.70)` and the text — and the answer format (`core/src/rag/answer.rs`), three mandatory blocks:
+   ```text
+   Ответ: … [1.1] … [1.2] … [2.1]
+   Источники:
+   - [1] README.md › MCP › … · строки 270–284 · chunk README.md@v3/structure/0042
+   - [2] …
+   Цитаты:
+   - [1.1] строка 272: «verbatim text from fragment 1»
+   - [1.2] строки 280–281: «another quote from fragment 1»
+   - [2.1] строка 15: «…»
+   ```
+   `[n]` is a fragment, `[n.m]` the m-th quote from it; each statement of the answer points at the quote that backs it (or at a whole fragment, `[1]`). Only the fragments may be used; when they hold no answer the model writes «Ответ: Не знаю.» and asks to clarify the question.
+4. **The answer is checked by code.** `answer::check` parses the blocks (`**Ответ:**`, `### Цитаты` are fine) and finds problems: a missing block, no `[n]` in the answer, a reference to a fragment that wasn't given, a quote without a number, several quotes of one fragment under the same number (they get `[n.1]`, `[n.2]` anyway), an answer reference `[n.m]` to a quote that doesn't exist, a quote that isn't verbatim in its fragment (case, whitespace, quote marks, dashes, `ё`/`е` and trailing punctuation are ignored; `…` skips text between verbatim parts, which must come in order), a cited fragment without a quote. With problems the model is asked once to fix them (the list goes back to it); the better of the two answers is kept and its tokens are added to `RagContext::tokens`. Then `answer::finalize` builds the final text whatever the model wrote: **Источники** (document name and `chunk_id` in backticks, so Markdown doesn't turn the `_` in `AI_SDLC.txt` into italics) come from the search data for the fragments the model referenced (all of them if it referenced none), never from its own words; each verified quote gets the document lines it was found on (`строка 74`, `строки 74–75` — found by code, not taken from the model); a non-verbatim quote stays marked `⚠ нет дословно во фрагменте [n]`, and a source left without a verified quote gets the start of its fragment, marked as such. The result (`RagContext::check`: cited fragments, quotes with `verified`/`auto`, problems, whether there was a retry) is shown with the RAG line — `ответ: ✓ источники [1][3], цитаты 2/2 дословно`.
+5. The history keeps the original question only: the fragments are needed for this answer, the next question gets its own. A task continuation (after approve/resume) isn't a question and gets no search; a scheduled run does.
+6. The reply carries what was found (`AgentReply::rag` — strategy, sources with `chunk_id`, lines and scores, the fragment texts, the answer check), shown above the answer in every interface so the `[n]` in the answer can be checked. If the search fails (empty index, embedding server down, a strategy nothing was cut with), the answer comes without context and the interface says why instead of failing the whole exchange.
 
 #### Second stage: query rewrite, relevance filter, reranking
 
@@ -456,21 +469,21 @@ question → [rewrite] → embedding → top-n candidates (n=20)
 ```
 
 - **Query rewrite** (`rewrite`, off by default) — the agent's own model turns the question into a search query: key terms, names, identifiers and numbers kept, synonyms and an English translation of the key terms added (questions are usually in Russian, the README and code comments often in English). The search runs on both the question and the rewritten query; a chunk's similarity is the better of the two.
-- **Similarity threshold** (`min`, 0–1, off by default) — candidates below it are dropped before reranking.
+- **Similarity threshold** (`min`, 0–1, default 0.5) — candidates below it are dropped before reranking; if none is left, the answer is «не знаю» (above). 0.5 is set for `text-embedding-bge-m3`: in `rag/compare.md` the chunks with the answer score 0.63–0.71; another embedding model needs its own value, and `min=0` turns the threshold off. Configs saved with an explicit `min_score` keep it; ones without it get 0.5.
 - **Reranker** (`rerank=`, `none` by default), code in `core/src/rag/rerank.rs`:
   - `heuristic` — no model calls: similarity + up to 0.2 for the query terms found in the chunk text. Identifiers and numbers (`MIN_INTERVAL`, `8092`) weigh 2.5× a word, long words are matched by their stem, and a term's weight is scaled by its rarity among the candidates (a term every candidate has distinguishes nothing).
   - `llm` — one request to the agent's model with all candidates (first 700 characters each), which scores each 0–10 (stored as 0–1). Malformed JSON or a failed request doesn't fail the exchange: the order stays by similarity and the RAG line shows a warning.
 - **Reranker threshold** (`rmin`, 0–1) — candidates with a lower reranker score are dropped: the model's score for `llm`, the boosted similarity for `heuristic`.
 - **Top-n / top-k** — `n` candidates before filtering (1–50, default 20, not below `k`), `k` fragments after (1–20, default 5).
 
-The RAG line before the answer shows each stage — `RAG (structure · rewrite · rerank llm): 20 кандидатов → 14 после порога → 3 после реранкера → 3 фрагм.` — the rewritten query, any warnings and, per source, the similarity, the reranker score and where the chunk was before reranking (`0.58 → реранк 0.90 (было #7)`). Rewrite and `llm` reranking are extra model calls per question; their tokens are counted in `RagContext::tokens`. Configs saved before these settings load unchanged: second stage off, `n=20`.
+The RAG line before the answer shows each stage — `RAG (structure · rewrite · rerank llm): 20 кандидатов → 14 после порога → 3 после реранкера → 3 фрагм.` — the rewritten query, any warnings and, per source, the similarity, the reranker score and where the chunk was before reranking (`0.58 → реранк 0.90 (было #7)`). Rewrite and `llm` reranking are extra model calls per question; their tokens are counted in `RagContext::tokens`. Configs saved before these settings load with the second stage off and `n=20`.
 
 Settings: strategy (`fixed` / `structure` / `sentence` / `parent`; by default the first one the index has, in that order), `k`, `n`, `min`, `rewrite`, `rerank`, `rmin` — `rag on [strategy] [k=5] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5]`. The index is filled as in the section above; `LLM_EMBEDDING_MODEL` must be set.
 
 | Interface | Switch | Sources |
 |---|---|---|
 | TUI | **Ctrl+R** in the agent chat — on (defaults) / off; `rag on …` / `rag off` on the memory screen (F3), which also shows the mode. The chat header shows `RAG: structure, топ-20 → k=5, rerank llm` or `без RAG` | a yellow **RAG** line before the answer: stages, rewritten query, `[n] source › section · lines · score → реранк … (было #m)` |
-| Web | **📚 RAG: вкл/выкл**, the strategy list and **⚙** (top-n, top-k, thresholds, rewrite, reranker) in the agent chat header (`POST /api/agents/:name/rag` `{enabled, strategy?, k?, min_score?, candidates?, rewrite?, rerank?, rerank_min?}`) | a card before the answer with the stages and the query; each source expands to the text the model got |
+| Web | **📚 RAG: вкл/выкл**, the strategy list and **⚙** (top-n, top-k, thresholds, rewrite, reranker) in the agent chat header (`POST /api/agents/:name/rag` `{enabled, strategy?, k?, min_score?, candidates?, rewrite?, rerank?, rerank_min?}`) | a card before the answer with the stages, the query, the answer check and nearest candidates on «не знаю»; each source (with its `chunk_id`) expands to the text the model got |
 | CLI | `llm-cli agent rag <name> [on … \| off]`; `/rag on …`, `/rag off` inside `agent chat` | `📚 …` lines before the answer |
 
 To compare the two modes, ask the same question, toggle the mode (Ctrl+R / the button / `/rag off`) and ask again: the answer without RAG comes only from the model's own knowledge, the one with RAG from the fragments shown above it.

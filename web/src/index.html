@@ -3764,12 +3764,18 @@ function escapeHtml(str) {
 
 function renderInline(escapedText) {
   let text = escapedText;
-  text = text.replace(/`([^`]+)`/g, (m, code) => `<code>${code}</code>`);
+  // Инлайн-код — в сторону до выделений: `AI_SDLC.txt` и `a*b` внутри него
+  // не должны становиться курсивом.
+  const codes = [];
+  text = text.replace(/`([^`]+)`/g, (m, code) => `\u0000${codes.push(code) - 1}\u0000`);
   text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  text = text.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[^\p{L}\p{N}_])__([^_]+)__(?![\p{L}\p{N}_])/gu, '$1<strong>$2</strong>');
   text = text.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-  text = text.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+  // `_` выделяет только на границе слова, как в CommonMark: AI_SDLC.txt —
+  // одно слово, а не «AI» и курсив до следующего «_».
+  text = text.replace(/(^|[^\p{L}\p{N}_])_([^_\n]+)_(?![\p{L}\p{N}_])/gu, '$1<em>$2</em>');
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  text = text.replace(/\u0000(\d+)\u0000/g, (m, i) => `<code>${codes[i]}</code>`);
   return text;
 }
 
@@ -5597,18 +5603,19 @@ function renderAgentMessage(msg) {
     const candidates = rag.candidates || 0;
     const belowRerank = rag.below_rerank || 0;
     if (!rag.sources.length) {
+      const best = rag.best_score != null ? `: лучшая ${rag.best_score.toFixed(2)} при пороге ${rag.min_score.toFixed(2)}` : '';
       head.textContent = `📚 RAG (${label}): ` + (belowRerank
-        ? `все ${rag.below_threshold + belowRerank} кандидатов ниже порога реранкера`
+        ? `все ${rag.below_threshold + belowRerank} кандидатов ниже порога реранкера ${rag.rerank_min.toFixed(2)}`
         : rag.below_threshold
-          ? `все ${rag.below_threshold} найденных фрагментов ниже порога близости`
-          : 'в индексе ничего не нашлось');
+          ? `все ${rag.below_threshold} найденных фрагментов ниже порога близости${best}`
+          : 'в индексе ничего не нашлось') + ' → «не знаю» без запроса к модели';
     } else {
       const stages = [`${candidates} кандидатов`];
       const afterThreshold = candidates - rag.below_threshold;
       if (rag.below_threshold) stages.push(`${afterThreshold} после порога`);
       if (belowRerank) stages.push(`${afterThreshold - belowRerank} после реранкера`);
       stages.push(`${rag.sources.length} фрагм.`);
-      head.textContent = `📚 RAG (${label}): ${stages.join(' → ')} — в ответе ссылки [n]`;
+      head.textContent = `📚 RAG (${label}): ${stages.join(' → ')} — ответ, источники и цитаты по номерам [n]`;
     }
     if (rag.query) {
       const q = document.createElement('div');
@@ -5627,7 +5634,7 @@ function renderAgentMessage(msg) {
       const summary = document.createElement('summary');
       const section = src.section ? ` › ${src.section}` : '';
       const version = src.version > 1 ? ` (версия ${src.version})` : '';
-      summary.textContent = `[${src.n}] ${src.source}${version}${section} · строки ${src.start_line}–${src.end_line} · ${src.score.toFixed(2)}`;
+      summary.textContent = `[${src.n}] ${src.name || ragDisplay(src.source)}${version}${section} · строки ${src.start_line}–${src.end_line} · ${src.score.toFixed(2)}`;
       if (src.rerank_score !== null && src.rerank_score !== undefined) {
         summary.append(` → реранк ${src.rerank_score.toFixed(2)}`);
         if (src.rank_before !== src.n) {
@@ -5637,11 +5644,48 @@ function renderAgentMessage(msg) {
           summary.appendChild(moved);
         }
       }
+      const chunk = document.createElement('span');
+      chunk.className = 'rag-moved';
+      chunk.textContent = ` · ${ragShortId(src.chunk_id || '')}`;
+      chunk.title = ragDisplay(src.chunk_id || '');
+      summary.appendChild(chunk);
       const pre = document.createElement('pre');
       pre.textContent = src.text;
       details.append(summary, pre);
       row.appendChild(details);
     });
+    // Ничего не прошло порог — ближайшие кандидаты (как RagContext::summary_lines).
+    (rag.nearest || []).forEach((src) => {
+      const div = document.createElement('div');
+      div.className = 'rag-query';
+      const section = src.section ? ` › ${src.section}` : '';
+      div.textContent = `≈ ${src.name || ragDisplay(src.source)}${section} · строки ${src.start_line}–${src.end_line} · ${src.score.toFixed(2)} (ниже порога)`;
+      row.appendChild(div);
+    });
+    // Проверка ответа модели — как AnswerCheck::summary в core.
+    const check = rag.check;
+    if (check) {
+      const div = document.createElement('div');
+      div.className = check.problems.length ? 'rag-warn' : 'rag-query';
+      if (check.unknown) {
+        div.textContent = 'ответ: модель не нашла ответа во фрагментах — «не знаю»';
+      } else {
+        const own = check.quotes.filter((q) => !q.auto);
+        const auto = check.quotes.length - own.length;
+        let text = `ответ: ${check.problems.length ? '⚠' : '✓'} источники ${check.cited.map((n) => `[${n}]`).join('')}, `
+          + `цитаты ${own.filter((q) => q.verified).length}/${own.length} дословно`;
+        if (auto) text += `, ${auto} подставлено из фрагментов`;
+        if (check.retried) text += ', после повтора';
+        div.textContent = text;
+      }
+      row.appendChild(div);
+      check.problems.forEach((p) => {
+        const warn = document.createElement('div');
+        warn.className = 'rag-warn';
+        warn.textContent = '⚠ ' + p;
+        row.appendChild(warn);
+      });
+    }
     return row;
   }
   // Служебная пометка о задаче (например, «⏸ Задача поставлена на паузу.») —
@@ -6045,7 +6089,7 @@ function fillAgentRagPanel(rag) {
   const r = rag || {};
   agentRagFields.n.value = r.candidates ?? 20;
   agentRagFields.k.value = r.k ?? 5;
-  agentRagFields.min.value = r.min_score ?? 0;
+  agentRagFields.min.value = r.min_score ?? 0.5;
   agentRagFields.rewrite.checked = !!r.rewrite;
   agentRagFields.rerank.value = r.rerank || 'none';
   agentRagFields.rmin.value = r.rerank_min ?? 0;
@@ -6767,6 +6811,14 @@ function ragName(source) {
   return String(source).split('/').pop();
 }
 
+// Путь документа (или chunk_id) для показа — без папки загрузок, как
+// display_source в core: «rag/uploads/отчёт.pdf» → «отчёт.pdf».
+function ragDisplay(source) {
+  const s = String(source);
+  const prefix = rag.uploadsPrefix || 'rag/uploads/';
+  return s.startsWith(prefix) ? s.slice(prefix.length) : s;
+}
+
 // chunk_id с именем файла вместо пути: «отчёт.pdf@v1/parent/0004».
 function ragShortId(chunkId) {
   const at = chunkId.indexOf('@');
@@ -6812,6 +6864,7 @@ async function loadRagOverview() {
   const el = ragEl('rag-overview');
   try {
     const o = await ragGet('/api/rag/overview');
+    if (o.uploads_prefix) rag.uploadsPrefix = o.uploads_prefix;
     const firstLoad = !Object.keys(rag.paramSpecs).length;
     o.strategies.forEach((s) => { rag.paramSpecs[s.strategy] = s.params; });
     if (firstLoad) renderRagParams();
@@ -6847,7 +6900,7 @@ function renderRagDocs() {
     ? docs
         .map((d) => `
       <button type="button" class="rag-doc${d.source === rag.selected ? ' active' : ''}" data-source="${escapeHtml(d.source)}" title="${escapeHtml(d.title || '')}">
-        <span class="rag-doc-source" title="${escapeHtml(d.source)}">${escapeHtml(ragName(d.source))}</span>
+        <span class="rag-doc-source" title="${escapeHtml(ragDisplay(d.source))}">${escapeHtml(ragName(d.source))}</span>
         <span class="rag-doc-meta">
           <span class="rag-tag accent">v${d.version}</span>
           ${d.status !== 'current' ? ragStatusTag(d.status) : ''}
@@ -6901,7 +6954,7 @@ function renderRagDetail() {
     ${rag.fromSearch && rag.lastSearch ? `<button type="button" class="rag-back" id="rag-back" title="«${escapeHtml(rag.lastSearch.query)}» · топ-${rag.lastSearch.k}">← К результатам поиска</button>` : ''}
     <div class="rag-doc-head">
       <div>
-        <h3 title="${escapeHtml(v.source)}">${escapeHtml(ragName(v.source))}</h3>
+        <h3 title="${escapeHtml(ragDisplay(v.source))}">${escapeHtml(ragName(v.source))}</h3>
         <div class="card-hint">${escapeHtml(v.title || '')}</div>
         <div class="rag-doc-meta" style="margin-top:6px">
           ${ragStatusTag(v.status)} ${ragGitTag(v)}
@@ -7031,7 +7084,7 @@ function ragChunkCard(c, kind) {
   return `
     <div class="rag-chunk" data-chunk="${escapeHtml(c.chunk_id)}">
       <div class="rag-chunk-meta">
-        <span class="rag-chunk-id" title="${escapeHtml(c.chunk_id)}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span>
+        <span class="rag-chunk-id" title="${escapeHtml(ragDisplay(c.chunk_id))}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span>
         <span class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</span>
         <span>строки ${c.start_line}–${c.end_line}</span>
         <span>${c.char_len} симв. · ≈${c.tokens_est} ток.</span>
@@ -7120,7 +7173,7 @@ function renderRagMap(map) {
   for (let p = 0; p < sorted.length - 1; p++) {
     const a = sorted[p];
     const b = sorted[p + 1];
-    (startsAt.get(a) || []).forEach((i) => { html += `<span class="rag-ord" title="${escapeHtml(chunks[i].chunk_id)}">#${chunks[i].ord}</span>`; });
+    (startsAt.get(a) || []).forEach((i) => { html += `<span class="rag-ord" title="${escapeHtml(ragDisplay(chunks[i].chunk_id))}">#${chunks[i].ord}</span>`; });
     const covering = [];
     for (let i = 0; i < chunks.length; i++) {
       if (chunks[i].start <= a && chunks[i].end >= b) covering.push(i);
@@ -7157,7 +7210,7 @@ function renderRagMap(map) {
     const spans = [...mapEl.querySelectorAll('span[data-chunks]')].filter((s) => s.dataset.chunks.split(',').map(Number).includes(chunkIndex));
     spans.forEach((s) => s.classList.add('picked'));
     ragEl('rag-map-info').innerHTML = `
-      <span class="rag-chunk-id" title="${escapeHtml(c.chunk_id)}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span> ·
+      <span class="rag-chunk-id" title="${escapeHtml(ragDisplay(c.chunk_id))}">#${c.ord} · ${escapeHtml(ragShortId(c.chunk_id))}</span> ·
       <span class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</span> ·
       строки ${c.start_line}–${c.end_line} · ${c.char_len} симв. ·
       ${c.parent ? `в контекст — родитель, ${c.parent[1] - c.parent[0]} симв. · ` : ''}
@@ -7339,7 +7392,7 @@ function renderRagSearch(query, results) {
           <div class="rag-hit" data-source="${escapeHtml(v.source)}" data-version="${v.version}" data-strategy="${escapeHtml(r.strategy)}" data-chunk="${escapeHtml(c.chunk_id)}">
             <div class="rag-chunk-meta">
               <span class="rag-hit-score">${i + 1}. ${h.score.toFixed(3)}</span>
-              <span class="rag-chunk-id" title="${escapeHtml(v.source)}">${escapeHtml(ragName(v.source))}</span>
+              <span class="rag-chunk-id" title="${escapeHtml(ragDisplay(v.source))}">${escapeHtml(ragName(v.source))}</span>
               <span>v${v.version} · строки ${c.start_line}–${c.end_line}</span>
             </div>
             <div class="rag-chunk-section">${escapeHtml(c.section || 'без раздела')}</div>

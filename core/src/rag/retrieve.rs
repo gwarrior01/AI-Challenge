@@ -16,6 +16,11 @@
 //! ```
 //!
 //! Переписывание и реранкинг — [`super::rerank`], оба выключены по умолчанию.
+//!
+//! Если ни один фрагмент не прошёл пороги, модель не спрашивают: ответ —
+//! «не знаю» и просьба уточнить вопрос ([`super::answer::refusal`]). Иначе
+//! модель отвечает блоками «Ответ / Источники / Цитаты», и код их проверяет
+//! ([`super::answer`]).
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -25,9 +30,10 @@ use super::{indexed_strategies, search_queries, Embedder, RagConfig, Strategy};
 
 /// Сколько чанков по умолчанию уходит в контекст.
 pub const DEFAULT_K: usize = 5;
-/// Порог, при котором фрагмент ещё считают релевантным, если он не задан;
-/// 0 — порога нет, модель сама отбрасывает лишнее по инструкции.
-pub const DEFAULT_MIN_SCORE: f32 = 0.0;
+/// Порог близости, ниже которого фрагмент не считают релевантным, если он не
+/// задан. Ничего не прошло порог — ответ «не знаю» без модели. 0.5 — под
+/// bge-m3: в `rag/compare.md` найденные ответы — 0.63–0.71.
+pub const DEFAULT_MIN_SCORE: f32 = 0.5;
 /// Сколько кандидатов по умолчанию берёт первый этап — поиск по эмбеддингу —
 /// до фильтра и реранкинга.
 pub const DEFAULT_CANDIDATES: usize = 20;
@@ -50,7 +56,7 @@ pub struct RagSettings {
     #[serde(default = "default_k")]
     pub k: usize,
     /// Чанки с близостью ниже порога в контекст не попадают.
-    #[serde(default)]
+    #[serde(default = "default_min_score")]
     pub min_score: f32,
     /// Топ-N первого этапа: сколько ближайших чанков ищется до фильтра и
     /// реранкинга (не меньше `k`).
@@ -69,6 +75,10 @@ pub struct RagSettings {
 
 fn default_k() -> usize {
     DEFAULT_K
+}
+
+fn default_min_score() -> f32 {
+    DEFAULT_MIN_SCORE
 }
 
 fn default_candidates() -> usize {
@@ -157,7 +167,11 @@ impl RagSettings {
 #[derive(Debug, Clone, Serialize)]
 pub struct RagSource {
     pub n: usize,
+    /// `README.md@v2/structure/0007` — чанк в индексе.
+    pub chunk_id: String,
     pub source: String,
+    /// Документ для показа — без папки загрузок (см. [`super::display_source`]).
+    pub name: String,
     pub version: i64,
     pub section: Option<String>,
     pub start_line: i64,
@@ -175,7 +189,7 @@ pub struct RagSource {
 impl RagSource {
     /// `README.md › Раздел · строки 10–24`
     pub fn location(&self) -> String {
-        let mut s = self.source.clone();
+        let mut s = self.name.clone();
         if self.version > 1 {
             s.push_str(&format!(" (версия {})", self.version));
         }
@@ -210,6 +224,17 @@ pub struct RagContext {
     /// Поиск не удался (нет индекса, сервер эмбеддингов недоступен…) — ответ
     /// тогда дан без контекста, интерфейсы об этом предупреждают.
     pub error: Option<String>,
+    /// Пороги, с которыми шёл поиск, — для объяснения «не знаю».
+    pub min_score: f32,
+    pub rerank_min: f32,
+    /// Лучшая близость среди кандидатов.
+    pub best_score: Option<f32>,
+    /// Ничего не прошло порог — ближайшие кандидаты (до 3), подсказка, как
+    /// уточнить вопрос.
+    pub nearest: Vec<RagSource>,
+    /// Проверка ответа модели (см. [`super::answer::check`]); `None` — модель
+    /// не отвечала (отказ «не знаю» или поиск не удался).
+    pub check: Option<super::answer::AnswerCheck>,
 }
 
 impl RagContext {
@@ -222,13 +247,14 @@ impl RagContext {
         let mut lines = Vec::new();
         if self.sources.is_empty() {
             let reason = if self.below_rerank > 0 {
-                format!("все {} кандидатов ниже порога реранкера", self.below_threshold + self.below_rerank)
+                format!("все {} кандидатов ниже порога реранкера {:.2}", self.below_threshold + self.below_rerank, self.rerank_min)
             } else if self.below_threshold > 0 {
-                format!("все {} найденных фрагментов ниже порога близости", self.below_threshold)
+                let best = self.best_score.map(|b| format!(": лучшая {b:.2} при пороге {:.2}", self.min_score)).unwrap_or_default();
+                format!("все {} найденных фрагментов ниже порога близости{best}", self.below_threshold)
             } else {
                 "в индексе ничего не нашлось".to_string()
             };
-            lines.push(format!("RAG ({}): {reason}", self.label()));
+            lines.push(format!("RAG ({}): {reason} → «не знаю» без запроса к модели", self.label()));
         } else {
             lines.push(format!("RAG ({}): {}", self.label(), self.stages()));
         }
@@ -237,6 +263,11 @@ impl RagContext {
         }
         lines.extend(self.warnings.iter().map(|w| format!("⚠ {w}")));
         lines.extend(self.sources.iter().map(|s| format!("[{}] {} · {}", s.n, s.location(), s.scores())));
+        lines.extend(self.nearest.iter().map(|s| format!("≈ {} · {:.2} (ниже порога)", s.location(), s.score)));
+        if let Some(check) = &self.check {
+            lines.push(check.summary());
+            lines.extend(check.problems.iter().map(|p| format!("⚠ {p}")));
+        }
         lines
     }
 
@@ -308,7 +339,12 @@ async fn retrieve_in(
     llm: Option<&LlmStep<'_>>,
 ) -> Result<RagContext> {
     let strategy = resolve_strategy(cfg, settings)?;
-    let mut ctx = RagContext { strategy: strategy.name().to_string(), ..RagContext::default() };
+    let mut ctx = RagContext {
+        strategy: strategy.name().to_string(),
+        min_score: settings.min_score,
+        rerank_min: settings.rerank_min,
+        ..RagContext::default()
+    };
 
     // Переписывание: ищем и по вопросу, и по запросу — переписанный запрос
     // может потерять то, что было в вопросе дословно.
@@ -333,6 +369,8 @@ async fn retrieve_in(
     let k = settings.k.max(1);
     let hits = search_queries(cfg, embedder, &queries, strategy, settings.candidates.max(k)).await?;
     ctx.candidates = hits.len();
+    ctx.best_score = hits.iter().map(|h| h.score).reduce(f32::max);
+    let nearest: Vec<RagSource> = hits.iter().take(3).enumerate().map(|(i, h)| to_source(i + 1, i, h, None)).collect();
     let kept: Vec<(usize, super::SearchHit)> =
         hits.into_iter().enumerate().filter(|(_, h)| h.score >= settings.min_score).collect();
     ctx.below_threshold = ctx.candidates - kept.len();
@@ -372,26 +410,34 @@ async fn retrieve_in(
     };
     ranked.truncate(k);
 
-    ctx.sources = ranked
-        .into_iter()
-        .enumerate()
-        .map(|(n, (before, h, rerank_score))| {
-            let c = &h.hit.chunk;
-            RagSource {
-                n: n + 1,
-                source: h.hit.version.source.clone(),
-                version: h.hit.version.version,
-                section: c.section.clone(),
-                start_line: c.context_start_line.unwrap_or(c.start_line),
-                end_line: c.context_end_line.unwrap_or(c.end_line),
-                score: h.score,
-                rerank_score,
-                rank_before: before + 1,
-                text: c.context_text().trim().to_string(),
-            }
-        })
-        .collect();
+    ctx.sources =
+        ranked.into_iter().enumerate().map(|(n, (before, h, rerank_score))| to_source(n + 1, before, &h, rerank_score)).collect();
+    if ctx.sources.is_empty() {
+        ctx.nearest = nearest;
+    }
     Ok(ctx)
+}
+
+fn to_source(n: usize, before: usize, h: &super::SearchHit, rerank_score: Option<f32>) -> RagSource {
+    let c = &h.hit.chunk;
+    // Текст без пустых строк по краям, а первая строка — та, с которой он
+    // теперь начинается: по ней считаются строки цитат.
+    let raw = c.context_text();
+    let lead = &raw[..raw.len() - raw.trim_start().len()];
+    RagSource {
+        n,
+        chunk_id: c.chunk_id.clone(),
+        source: h.hit.version.source.clone(),
+        name: super::display_source(&h.hit.version.source).to_string(),
+        version: h.hit.version.version,
+        section: c.section.clone(),
+        start_line: c.context_start_line.unwrap_or(c.start_line) + lead.matches('\n').count() as i64,
+        end_line: c.context_end_line.unwrap_or(c.end_line),
+        score: h.score,
+        rerank_score,
+        rank_before: before + 1,
+        text: raw.trim().to_string(),
+    }
 }
 
 /// Первые `max` символов строки — для сообщений об ошибках.
@@ -418,30 +464,24 @@ fn resolve_strategy(cfg: &RagConfig, settings: &RagSettings) -> Result<Strategy>
     }
 }
 
-/// Вопрос вместе с найденными фрагментами — то, что уходит модели вместо
-/// голого вопроса. Без фрагментов (ничего не нашлось или ниже порога) модель
-/// всё равно узнаёт, что база ответа не содержит, — иначе она молча ответила
-/// бы из общих знаний, будто из документов. Ошибка поиска — вопрос как есть.
+/// Вопрос вместе с найденными фрагментами и правилами ответа (см.
+/// [`super::answer::FORMAT_RULES`]) — то, что уходит модели вместо голого
+/// вопроса. Без фрагментов модель не спрашивают вовсе (см.
+/// [`super::answer::refusal`]); при ошибке поиска — вопрос как есть.
 pub fn augment_prompt(question: &str, ctx: &RagContext) -> String {
-    if ctx.error.is_some() {
+    if ctx.error.is_some() || ctx.sources.is_empty() {
         return question.to_string();
     }
-    if ctx.sources.is_empty() {
-        return format!(
-            "[Режим RAG] В базе документов не нашлось фрагментов, относящихся к вопросу. Скажи об этом прямо; \
-             если отвечаешь из общих знаний — явно пометь, что это не из документов.\n\nВопрос: {question}"
-        );
-    }
-    let mut s = String::from(
-        "[Режим RAG] Ниже — фрагменты из базы документов, найденные поиском по вопросу. Отвечай на их основе:\n\
-         - опирайся на факты из фрагментов и ссылайся на них номерами в квадратных скобках — [1], [2];\n\
-         - фрагменты, не относящиеся к вопросу, игнорируй;\n\
-         - если во фрагментах ответа нет или он неполон — так и скажи; то, что добавляешь из общих знаний, \
-         явно пометь как не из документов;\n\
-         - не выдумывай источники, цифры и цитаты.\n\n",
-    );
+    let mut s = format!("{}\n\n", super::answer::FORMAT_RULES);
     for src in &ctx.sources {
-        s.push_str(&format!("[{}] {} (близость {:.2})\n{}\n\n", src.n, src.location(), src.score, src.text));
+        s.push_str(&format!(
+            "[{}] {} · chunk {} (близость {:.2})\n{}\n\n",
+            src.n,
+            src.location(),
+            super::display_source(&src.chunk_id),
+            src.score,
+            src.text
+        ));
     }
     s.push_str(&format!("Вопрос: {question}"));
     s
@@ -454,7 +494,9 @@ mod tests {
     fn source(n: usize) -> RagSource {
         RagSource {
             n,
+            chunk_id: format!("README.md@v1/structure/{n:04}"),
             source: "README.md".into(),
+            name: "README.md".into(),
             version: 1,
             section: Some("MCP".into()),
             start_line: 10,
@@ -468,15 +510,16 @@ mod tests {
 
     #[test]
     fn parses_settings() {
-        let s = RagSettings::parse_args(&["structure", "k=3", "min=0.5"]).unwrap();
-        assert_eq!(s, RagSettings { strategy: Some("structure".into()), k: 3, min_score: 0.5, ..RagSettings::default() });
+        let s = RagSettings::parse_args(&["structure", "k=3", "min=0.3"]).unwrap();
+        assert_eq!(s, RagSettings { strategy: Some("structure".into()), k: 3, min_score: 0.3, ..RagSettings::default() });
+        assert_eq!(RagSettings::parse_args(&["min=0"]).unwrap().min_score, 0.0);
         assert_eq!(RagSettings::parse_args(&[]).unwrap(), RagSettings::default());
         assert!(RagSettings::parse_args(&["k=0"]).is_err());
         assert!(RagSettings::parse_args(&["борщ"]).is_err());
 
         let s = RagSettings::parse_args(&["n=30", "k=4", "rewrite", "rerank=llm", "rmin=0.6"]).unwrap();
         assert_eq!((s.candidates, s.k, s.rewrite, s.rerank, s.rerank_min), (30, 4, true, Rerank::Llm, 0.6));
-        assert_eq!(s.describe(), "RAG: авто, топ-30 → k=4, rewrite, rerank llm ≥ 0.60");
+        assert_eq!(s.describe(), "RAG: авто, топ-30 → k=4, порог 0.50, rewrite, rerank llm ≥ 0.60");
         // Без n кандидатов не меньше k; явный n меньше k — ошибка.
         assert_eq!(RagSettings::parse_args(&["k=20"]).unwrap().candidates, 20);
         assert!(RagSettings::parse_args(&["n=3", "k=5"]).is_err());
@@ -490,16 +533,16 @@ mod tests {
     fn prompt_carries_sources_and_question() {
         let ctx = RagContext { strategy: "fixed".into(), sources: vec![source(1)], ..RagContext::default() };
         let p = augment_prompt("Какой адрес?", &ctx);
-        assert!(p.contains("[1] README.md › MCP · строки 10–12"));
+        assert!(p.contains("[1] README.md › MCP · строки 10–12 · chunk README.md@v1/structure/0001"));
+        assert!(p.contains("Цитаты:"));
         assert!(p.contains("127.0.0.1:8092"));
         assert!(p.ends_with("Вопрос: Какой адрес?"));
     }
 
     #[test]
-    fn empty_context_says_so_and_error_passes_question() {
+    fn empty_context_is_refused_and_error_passes_question() {
         let empty = RagContext { strategy: "fixed".into(), candidates: 2, below_threshold: 2, ..RagContext::default() };
-        assert!(augment_prompt("q", &empty).contains("не нашлось"));
-        assert!(empty.summary_lines()[0].contains("ниже порога"));
+        assert!(empty.summary_lines()[0].contains("ниже порога близости → «не знаю»"));
         let failed = RagContext { error: Some("нет связи".into()), ..empty };
         assert_eq!(augment_prompt("q", &failed), "q");
     }
@@ -598,7 +641,7 @@ mod tests {
         let question = "Как поменять, где слушает сервер?";
 
         // Без второго этапа — все кандидаты по близости, топ-K.
-        let plain = RagSettings { k: 2, ..RagSettings::default() };
+        let plain = RagSettings { k: 2, min_score: 0.0, ..RagSettings::default() };
         let ctx = retrieve_in(&cfg, &embedder, question, &plain, Some(&llm)).await.unwrap();
         assert_eq!((ctx.sources.len(), ctx.rerank, ctx.query.as_deref()), (2, Rerank::None, None));
         assert!(ctx.candidates >= 3 && ctx.sources.iter().all(|s| s.rerank_score.is_none()));
@@ -607,9 +650,13 @@ mod tests {
         let strict = RagSettings { min_score: 1.0, ..plain.clone() };
         let ctx = retrieve_in(&cfg, &embedder, question, &strict, Some(&llm)).await.unwrap();
         assert!(ctx.sources.is_empty() && ctx.below_threshold == ctx.candidates);
+        // Ближайшие кандидаты — для просьбы уточнить вопрос; модель не нужна.
+        assert_eq!(ctx.nearest.len(), 3);
+        assert_eq!(ctx.best_score, Some(ctx.nearest[0].score));
+        assert!(crate::rag::answer::refusal(&ctx).unwrap().starts_with("Не знаю"));
 
         // Rewrite + llm с порогом: остаётся только фрагмент с ответом.
-        let full = RagSettings { k: 3, rewrite: true, rerank: Rerank::Llm, rerank_min: 0.5, ..RagSettings::default() };
+        let full = RagSettings { k: 3, rewrite: true, rerank: Rerank::Llm, rerank_min: 0.5, min_score: 0.0, ..RagSettings::default() };
         let ctx = retrieve_in(&cfg, &embedder, question, &full, Some(&llm)).await.unwrap();
         assert_eq!(ctx.query.as_deref(), Some("APP_PORT server port"));
         assert_eq!(ctx.rerank, Rerank::Llm);
@@ -620,7 +667,7 @@ mod tests {
         assert!(ctx.warnings.is_empty());
 
         // Эвристика поднимает фрагмент с идентификатором из переписанного запроса.
-        let heuristic = RagSettings { k: 1, rewrite: true, rerank: Rerank::Heuristic, ..RagSettings::default() };
+        let heuristic = RagSettings { k: 1, rewrite: true, rerank: Rerank::Heuristic, min_score: 0.0, ..RagSettings::default() };
         let ctx = retrieve_in(&cfg, &embedder, question, &heuristic, Some(&llm)).await.unwrap();
         assert!(ctx.sources[0].text.contains("APP_PORT"), "{:?}", ctx.summary_lines());
 
@@ -636,7 +683,7 @@ mod tests {
         let (cfg, embedder) = indexed().await;
         let client = crate::LlmClient::for_tests_at(&mock_chat(|_| "не знаю".into()).await);
         let llm = LlmStep { client: &client, model: "test-model", reasoning: None };
-        let settings = RagSettings { k: 2, rerank: Rerank::Llm, rerank_min: 0.9, ..RagSettings::default() };
+        let settings = RagSettings { k: 2, rerank: Rerank::Llm, rerank_min: 0.9, min_score: 0.0, ..RagSettings::default() };
         let ctx = retrieve_in(&cfg, &embedder, "Где пишутся журналы?", &settings, Some(&llm)).await.unwrap();
         assert_eq!((ctx.rerank, ctx.sources.len(), ctx.below_rerank), (Rerank::None, 2, 0));
         assert!(ctx.warnings[0].contains("реранкер llm не сработал"), "{:?}", ctx.warnings);
