@@ -129,6 +129,9 @@ struct SetRagRequest {
     rerank: Option<String>,
     #[serde(default)]
     rerank_min: Option<f32>,
+    /// Ответ с цитатами (строгий формат) — иначе свободный ответ с источниками.
+    #[serde(default)]
+    quotes: bool,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +431,9 @@ async fn set_agent_rag(
         }
         if let Some(rmin) = req.rerank_min.filter(|&m| m > 0.0) {
             args.push(format!("rmin={rmin}"));
+        }
+        if req.quotes {
+            args.push("quotes".to_string());
         }
         match llm_core::rag::RagSettings::parse_args(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
             Ok(settings) => Some(settings),

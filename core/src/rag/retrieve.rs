@@ -43,7 +43,7 @@ pub const MAX_CANDIDATES: usize = 50;
 
 /// Параметры команды `rag on …` — одна строка для подсказок всех интерфейсов.
 pub const RAG_ON_USAGE: &str =
-    "rag on [fixed|structure|sentence|parent] [k=5] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5]";
+    "rag on [fixed|structure|sentence|parent] [k=5] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes]";
 
 /// Настройки RAG-режима агента.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +71,11 @@ pub struct RagSettings {
     /// близость с бонусом за термины. 0 — порога нет.
     #[serde(default)]
     pub rerank_min: f32,
+    /// Ответ с цитатами: строгие блоки «Ответ / Источники / Цитаты» с
+    /// проверкой цитат (см. [`super::answer`]). Выключено — модель отвечает
+    /// своими словами со ссылками [n], к ответу добавляются только источники.
+    #[serde(default)]
+    pub quotes: bool,
 }
 
 fn default_k() -> usize {
@@ -95,6 +100,7 @@ impl Default for RagSettings {
             rewrite: false,
             rerank: Rerank::None,
             rerank_min: 0.0,
+            quotes: false,
         }
     }
 }
@@ -125,6 +131,8 @@ impl RagSettings {
                 settings.rerank = Rerank::parse(v).ok_or_else(|| anyhow::anyhow!("rerank — none, heuristic или llm"))?;
             } else if *arg == "rewrite" {
                 settings.rewrite = true;
+            } else if *arg == "quotes" {
+                settings.quotes = true;
             } else if let Some(s) = Strategy::parse(arg) {
                 settings.strategy = Some(s.name().to_string());
             } else {
@@ -158,6 +166,9 @@ impl RagSettings {
             if self.rerank_min > 0.0 {
                 s.push_str(&format!(" ≥ {:.2}", self.rerank_min));
             }
+        }
+        if self.quotes {
+            s.push_str(", с цитатами");
         }
         s
     }
@@ -224,6 +235,8 @@ pub struct RagContext {
     /// Поиск не удался (нет индекса, сервер эмбеддингов недоступен…) — ответ
     /// тогда дан без контекста, интерфейсы об этом предупреждают.
     pub error: Option<String>,
+    /// Ответ с цитатами (см. [`RagSettings::quotes`]).
+    pub quotes: bool,
     /// Пороги, с которыми шёл поиск, — для объяснения «не знаю».
     pub min_score: f32,
     pub rerank_min: f32,
@@ -343,6 +356,7 @@ async fn retrieve_in(
         strategy: strategy.name().to_string(),
         min_score: settings.min_score,
         rerank_min: settings.rerank_min,
+        quotes: settings.quotes,
         ..RagContext::default()
     };
 
@@ -472,7 +486,8 @@ pub fn augment_prompt(question: &str, ctx: &RagContext) -> String {
     if ctx.error.is_some() || ctx.sources.is_empty() {
         return question.to_string();
     }
-    let mut s = format!("{}\n\n", super::answer::FORMAT_RULES);
+    let rules = if ctx.quotes { super::answer::FORMAT_RULES } else { super::answer::ANSWER_RULES };
+    let mut s = format!("{rules}\n\n");
     for src in &ctx.sources {
         s.push_str(&format!(
             "[{}] {} · chunk {} (близость {:.2})\n{}\n\n",
@@ -517,9 +532,10 @@ mod tests {
         assert!(RagSettings::parse_args(&["k=0"]).is_err());
         assert!(RagSettings::parse_args(&["борщ"]).is_err());
 
-        let s = RagSettings::parse_args(&["n=30", "k=4", "rewrite", "rerank=llm", "rmin=0.6"]).unwrap();
-        assert_eq!((s.candidates, s.k, s.rewrite, s.rerank, s.rerank_min), (30, 4, true, Rerank::Llm, 0.6));
-        assert_eq!(s.describe(), "RAG: авто, топ-30 → k=4, порог 0.50, rewrite, rerank llm ≥ 0.60");
+        let s = RagSettings::parse_args(&["n=30", "k=4", "rewrite", "rerank=llm", "rmin=0.6", "quotes"]).unwrap();
+        assert_eq!((s.candidates, s.k, s.rewrite, s.rerank, s.rerank_min, s.quotes), (30, 4, true, Rerank::Llm, 0.6, true));
+        assert_eq!(s.describe(), "RAG: авто, топ-30 → k=4, порог 0.50, rewrite, rerank llm ≥ 0.60, с цитатами");
+        assert!(!RagSettings::parse_args(&[]).unwrap().quotes);
         // Без n кандидатов не меньше k; явный n меньше k — ошибка.
         assert_eq!(RagSettings::parse_args(&["k=20"]).unwrap().candidates, 20);
         assert!(RagSettings::parse_args(&["n=3", "k=5"]).is_err());
@@ -534,7 +550,9 @@ mod tests {
         let ctx = RagContext { strategy: "fixed".into(), sources: vec![source(1)], ..RagContext::default() };
         let p = augment_prompt("Какой адрес?", &ctx);
         assert!(p.contains("[1] README.md › MCP · строки 10–12 · chunk README.md@v1/structure/0001"));
-        assert!(p.contains("Цитаты:"));
+        assert!(!p.contains("Цитаты:"), "без цитат — свободный ответ");
+        let quoted = augment_prompt("Какой адрес?", &RagContext { quotes: true, ..ctx });
+        assert!(quoted.contains("Цитаты:"));
         assert!(p.contains("127.0.0.1:8092"));
         assert!(p.ends_with("Вопрос: Какой адрес?"));
     }
@@ -575,6 +593,41 @@ mod tests {
         let embedder = Embedder::new(&url, None, "fake-embed", 8);
         super::super::index(&cfg, &embedder, &[Strategy::Structure], &|_| {}).await.unwrap();
         (cfg, embedder)
+    }
+
+    /// «Не знаю» по загруженному документу: ни в ответе, ни в строке RAG, ни
+    /// в источниках для интерфейсов нет папки загрузок.
+    #[tokio::test]
+    async fn refusal_for_uploaded_document_hides_uploads_folder() {
+        let base = std::env::temp_dir().join(format!("rag-uploads-{}-{}", std::process::id(), rand_suffix()));
+        let cfg = RagConfig {
+            db_path: base.join("rag/index.db"),
+            corpus: vec![],
+            eval_path: base.join("rag/eval.json"),
+            report_path: base.join("rag/compare.md"),
+            uploads: base.join("rag/uploads"),
+            base: base.clone(),
+        };
+        std::fs::create_dir_all(&cfg.uploads).unwrap();
+        let body: String = (1..=12).map(|i| format!("## Раздел {i}\n\nТекст раздела {i} про настройку сервера и журналы, достаточно длинный.\n\n")).collect();
+        std::fs::write(cfg.uploads.join("AI_SDLC.txt"), body).unwrap();
+        let (url, _) = super::super::embed::test_support::serve().await;
+        let embedder = Embedder::new(&url, None, "fake-embed", 8);
+        super::super::index(&cfg, &embedder, &[Strategy::Structure], &|_| {}).await.unwrap();
+
+        let strict = RagSettings { min_score: 1.0, ..RagSettings::default() };
+        let ctx = retrieve_in(&cfg, &embedder, "Как приготовить борщ?", &strict, None).await.unwrap();
+        assert!(ctx.sources.is_empty() && !ctx.nearest.is_empty());
+        assert!(ctx.nearest[0].source.starts_with("rag/uploads/"), "в индексе путь полный");
+        let shown = format!(
+            "{}\n{}\n{}",
+            crate::rag::answer::refusal(&ctx).unwrap(),
+            ctx.summary_lines().join("\n"),
+            ctx.nearest.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("\n")
+        );
+        assert!(!shown.contains("rag/uploads"), "{shown}");
+        assert!(shown.contains("≈ AI_SDLC.txt · строки"), "{shown}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn rand_suffix() -> u128 {

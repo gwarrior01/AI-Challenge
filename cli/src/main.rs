@@ -51,7 +51,7 @@
 //!   llm-cli agent profile <имя> <профиль|none>     -- сменить профиль (или отключить персонализацию)
 //!   llm-cli agent profiles                         -- список всех профилей из каталога профилей
 //!   llm-cli agent rag <имя>                        -- RAG-режим агента: включён ли и с какими параметрами
-//!   llm-cli agent rag <имя> on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5]
+//!   llm-cli agent rag <имя> on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes]
 //!                                         -- отвечать с базой документов (llm_core::rag::retrieve)
 //!   llm-cli agent rag <имя> off                    -- отвечать без базы документов
 //!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
@@ -835,7 +835,7 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
         }
         Some("rag") => {
             let name = args.get(1).cloned().ok_or_else(|| {
-                anyhow!("укажите имя агента: llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=…] [rmin=0.5] | off]")
+                anyhow!("укажите имя агента: llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=…] [rmin=0.5] [quotes] | off]")
             })?;
             let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
             let words: Vec<&str> = args[2..].iter().map(String::as_str).collect();
@@ -1227,7 +1227,7 @@ fn print_agent_usage() {
          \x20 llm-cli agent profile <имя> <профиль|none>               (сменить профиль / отключить персонализацию)\n\
          \x20 llm-cli agent profiles                                   (список профилей в каталоге профилей)\n\
          \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)\n\
-         \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] | off]\n\
+         \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes] | off]\n\
          \x20     (RAG-режим: с базой документов или без; n — кандидатов до фильтра, k — фрагментов после)\n\
          \x20 llm-cli agent invariants                                 (жёсткие правила, общие для ВСЕХ агентов)\n\
          \x20 llm-cli agent invariants show <id>                       (показать текст одного инварианта)\n\

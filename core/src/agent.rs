@@ -2380,10 +2380,11 @@ impl Agent {
         })
     }
 
-    /// Ответ RAG-режима в обязательном формате «Ответ / Источники / Цитаты»
-    /// (см. [`crate::rag::answer`]): ответ модели проверяется, при ошибках модель
+    /// Ответ RAG-режима (см. [`crate::rag::answer`]). С цитатами — формат
+    /// «Ответ / Источники / Цитаты»: ответ модели проверяется, при ошибках её
     /// один раз просят исправить его, затем блоки собираются кодом — источники
-    /// из данных поиска, цитаты с отметкой проверки. Итог проверки — в
+    /// из данных поиска, цитаты с отметкой проверки. Без цитат — ответ модели
+    /// как есть плюс источники по её ссылкам [n]. Итог проверки — в
     /// `ctx.check`, токены повтора — в `ctx.tokens`.
     async fn checked_rag_answer(
         &self,
@@ -2396,7 +2397,9 @@ impl Agent {
         use crate::rag::answer;
         let mut content = content;
         let mut check = answer::check(&content, ctx);
-        if !check.problems.is_empty() {
+        // Повтор — только ради строгого формата с цитатами: свободный ответ
+        // не переспрашивается.
+        if ctx.quotes && !check.problems.is_empty() {
             let mut retry = messages.to_vec();
             retry.push(ChatMessage::assistant(content.clone()));
             retry.push(ChatMessage::user(answer::fix_request(&check.problems)));
