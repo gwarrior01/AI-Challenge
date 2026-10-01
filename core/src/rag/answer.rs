@@ -1,6 +1,12 @@
 //! Ответ RAG-режима: обязательные блоки «Ответ / Источники / Цитаты» и их
 //! проверка кодом — инструкции модели для этого мало.
 //!
+//! Цитаты включаются на агента ([`super::RagSettings::quotes`]). Без них
+//! модель отвечает своими словами со ссылками на фрагменты `[n]`
+//! ([`ANSWER_RULES`]), формат не навязывается и не проверяется — код лишь
+//! добавляет блок «Источники» по фрагментам, на которые она сослалась.
+//! «Не знаю» ниже порога — в обоих режимах.
+//!
 //! ```text
 //! поиск → ничего не прошло порог → refusal: «Не знаю» + просьба уточнить (без модели)
 //!       → фрагменты → модель (FORMAT_RULES) → check → ошибки? → fix_request, один повтор
@@ -23,19 +29,40 @@ use serde::Serialize;
 use super::display_source;
 use super::retrieve::{RagContext, RagSource};
 
-/// Правила ответа — в начале запроса с фрагментами (см.
+/// Правила свободного ответа (цитаты выключены) — в начале запроса с
+/// фрагментами (см. [`super::retrieve::augment_prompt`]).
+pub(crate) const ANSWER_RULES: &str = "\
+[Режим RAG] Ниже — фрагменты из базы документов, найденные поиском по вопросу. Фрагменты пронумерованы: [1], [2], …
+
+Ответь на вопрос, опираясь на них: своими словами, на языке вопроса, так, как объяснил бы эксперт, — суть, как это работает или зачем нужно, вывод.
+- После фактов из фрагментов ставь номер фрагмента в квадратных скобках: [1], [2]. Источники и цитаты отдельным списком не пиши — их добавят автоматически.
+- Фрагменты, не относящиеся к вопросу, игнорируй; не добавляй факты из общих знаний, не выдумывай цифры и названия.
+- Если во фрагментах ответа нет — начни ответ со слов «Не знаю», одним предложением скажи, чего не хватает, и попроси уточнить вопрос.";
+
+/// Правила ответа с цитатами — в начале запроса с фрагментами (см.
 /// [`super::retrieve::augment_prompt`]).
 pub(crate) const FORMAT_RULES: &str = "\
 [Режим RAG] Ниже — фрагменты из базы документов, найденные поиском по вопросу. Фрагменты пронумерованы: [1], [2], … Отвечай только на их основе.
 
+Как отвечать:
+1. Сначала пойми, что из фрагментов отвечает на вопрос, и напиши ответ так, как эксперт объяснил бы это человеку: своими словами, на языке вопроса — суть, как это работает или зачем нужно, вывод. Ответ должен быть понятен без цитат.
+2. Затем выбери 2–4 коротких дословных цитаты, которые подтверждают ключевые утверждения ответа, и поставь номер цитаты после такого утверждения. Не каждое предложение нуждается в цитате.
+
+Пример (на вопрос «Зачем сервису кэш?» по фрагментам о кэше):
+Плохо — ответ из пересказанных по очереди цитат:
+«Кэш — это промежуточное хранилище [1.1]. Он хранит ответы базы [1.2]. Записи живут 60 секунд [2.1].»
+Хорошо — объяснение, цитаты только подтверждают:
+«Кэш нужен, чтобы не ходить в базу за одним и тем же: повторный запрос отдаётся из памяти [1.2]. Цена этого — данные могут отставать от базы до минуты, поэтому для свежих значений кэш не подходит [2.1].»
+
 Формат ответа — строго три блока с этими заголовками:
-Ответ: <ответ на вопрос; после каждого утверждения — номер цитаты, которая его подтверждает: [1.1], [1.2], [2.1]>
+Ответ: <объяснение своими словами с номерами цитат после ключевых утверждений>
 Источники:
 - [n] <документ › раздел> · chunk <chunk_id> — строка на каждый фрагмент, из которого есть цитаты
 Цитаты:
 - [n.m] «<дословный кусок текста фрагмента n>» — m — номер цитаты внутри фрагмента n: [1.1], [1.2], [2.1]
 
 Правила:
+- не переводи и не пересказывай цитаты фраза за фразой и не вставляй их в «Ответ» — цитаты стоят только в своём блоке;
 - у каждой цитаты свой номер [n.m]: две цитаты из фрагмента 1 — это [1.1] и [1.2], не две [1];
 - цитату копируй из текста фрагмента символ в символ — не пересказывай и не переводи; длинное место сократи многоточием «…» между дословными частями;
 - фрагменты, не относящиеся к вопросу, игнорируй и в источники не включай;
@@ -69,6 +96,8 @@ impl Quote {
 /// Итог проверки ответа модели.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AnswerCheck {
+    /// Ответ с цитатами (строгий формат) — иначе свободный ответ со ссылками [n].
+    pub with_quotes: bool,
     /// Модель сама сказала «не знаю» — во фрагментах ответа нет.
     pub unknown: bool,
     /// Фрагменты, на которые ссылается ответ, — по ним собран блок «Источники».
@@ -87,13 +116,13 @@ impl AnswerCheck {
             return "ответ: модель не нашла ответа во фрагментах — «не знаю»".into();
         }
         let refs: String = self.cited.iter().map(|n| format!("[{n}]")).collect();
+        let mark = if self.problems.is_empty() { "✓" } else { "⚠" };
+        if !self.with_quotes {
+            return format!("ответ: {mark} источники {refs}");
+        }
         let model_quotes: Vec<&Quote> = self.quotes.iter().filter(|q| !q.auto).collect();
         let verified = model_quotes.iter().filter(|q| q.verified).count();
-        let mut s = format!(
-            "ответ: {} источники {refs}, цитаты {verified}/{} дословно",
-            if self.problems.is_empty() { "✓" } else { "⚠" },
-            model_quotes.len()
-        );
+        let mut s = format!("ответ: {mark} источники {refs}, цитаты {verified}/{} дословно", model_quotes.len());
         let auto = self.quotes.iter().filter(|q| q.auto).count();
         if auto > 0 {
             s.push_str(&format!(", {auto} подставлено из фрагментов"));
@@ -122,7 +151,8 @@ pub fn fix_request(problems: &[String]) -> String {
     let list: String = problems.iter().map(|p| format!("\n- {p}")).collect();
     format!(
         "Ответ не прошёл проверку:{list}\n\nПерепиши его в формате «Ответ / Источники / Цитаты» по правилам выше. \
-         У каждой цитаты свой номер [n.m], цитаты бери из текста фрагментов дословно. \
+         «Ответ» — объяснение своими словами, цитаты — только в своём блоке; у каждой цитаты свой номер [n.m], \
+         цитаты бери из текста фрагментов дословно. \
          Если во фрагментах ответа нет — «Ответ: Не знаю.» и просьба уточнить вопрос."
     )
 }
@@ -352,8 +382,8 @@ pub fn check(text: &str, ctx: &RagContext) -> AnswerCheck {
     let parsed = Parsed::parse(text);
     let answer = parsed.answer_text();
     let total = ctx.sources.len();
-    let mut check = AnswerCheck::default();
-    if parsed.answer.is_none() {
+    let mut check = AnswerCheck { with_quotes: ctx.quotes, ..AnswerCheck::default() };
+    if ctx.quotes && parsed.answer.is_none() {
         check.problems.push("нет блока «Ответ:»".into());
     }
     if answer.is_empty() {
@@ -365,11 +395,25 @@ pub fn check(text: &str, ctx: &RagContext) -> AnswerCheck {
     }
 
     let answer_refs = refs(&answer);
+    let valid = |n: usize| (1..=total).contains(&n);
+    // Без цитат — только ссылки: источники строятся по ним, несуществующий
+    // номер — замечание в строке RAG, повтора ради него нет.
+    if !ctx.quotes {
+        let mut bad: Vec<usize> = answer_refs.iter().map(|r| r.n).filter(|&n| !valid(n)).collect();
+        bad.dedup();
+        for n in bad {
+            check.problems.push(format!("ссылка на несуществующий фрагмент [{n}] — их {total}"));
+        }
+        check.cited = answer_refs.iter().map(|r| r.n).filter(|&n| valid(n)).collect();
+        check.cited.sort_unstable();
+        check.cited.dedup();
+        return check;
+    }
+
     let source_refs: Vec<Ref> = parsed.sources.iter().flatten().flat_map(|l| refs(l)).collect();
     let raw_quotes: Vec<(Option<Ref>, String)> =
         parsed.quotes.iter().flatten().filter_map(|l| parse_quote(l)).collect();
 
-    let valid = |n: usize| (1..=total).contains(&n);
     let mut bad: Vec<usize> = answer_refs
         .iter()
         .chain(&source_refs)
@@ -416,6 +460,23 @@ pub fn check(text: &str, ctx: &RagContext) -> AnswerCheck {
         }
         check.quotes.push(Quote { n: r.n, m, text: text.clone(), verified: lines.is_some(), lines, auto: false });
     }
+    // «Ответ» — объяснение, а не цитаты: длинная цитата в нём дословно —
+    // ошибка (перевод цитат код не распознаёт — его держат правила).
+    let mut answer_plain = answer.clone();
+    for r in &answer_refs {
+        answer_plain = answer_plain.replace(&r.label(), "");
+    }
+    let answer_norm = normalize(&answer_plain);
+    for q in check.quotes.iter().filter(|q| q.verified) {
+        let quote = normalize(&q.text);
+        let quote = quote.trim_matches(|c: char| c.is_whitespace() || ".,;:!?".contains(c));
+        if quote.split(' ').count() >= 6 && answer_norm.contains(quote) {
+            check.problems.push(format!(
+                "«Ответ» повторяет цитату {} дословно — объясни своими словами, цитата остаётся в блоке «Цитаты»",
+                q.label()
+            ));
+        }
+    }
     if repeated {
         check.problems.push("у нескольких цитат одного фрагмента один номер — нужны [n.1], [n.2]".into());
     }
@@ -447,8 +508,9 @@ pub fn check(text: &str, ctx: &RagContext) -> AnswerCheck {
 pub fn finalize(text: &str, ctx: &RagContext, check: &mut AnswerCheck) -> String {
     let parsed = Parsed::parse(text);
     let answer = parsed.answer_text();
+    let head = if check.with_quotes { "Ответ: " } else { "" };
     if check.unknown {
-        let mut s = format!("Ответ: {answer}");
+        let mut s = format!("{head}{answer}");
         if !answer.contains('?') && !answer.to_lowercase().contains("уточн") {
             s.push_str("\n\nУточните, пожалуйста, вопрос: о каком документе или разделе речь, какие термины там используются?");
         }
@@ -458,6 +520,9 @@ pub fn finalize(text: &str, ctx: &RagContext, check: &mut AnswerCheck) -> String
     // что ушли ей: ответ построен на них.
     if check.cited.is_empty() {
         check.cited = ctx.sources.iter().map(|s| s.n).collect();
+    }
+    if !check.with_quotes {
+        return format!("{answer}\n\nИсточники:{}", sources_block(ctx, &check.cited));
     }
     for n in check.cited.clone() {
         if check.quotes.iter().any(|q| q.n == n && q.verified) {
@@ -471,14 +536,7 @@ pub fn finalize(text: &str, ctx: &RagContext, check: &mut AnswerCheck) -> String
     }
     check.quotes.sort_by_key(|q| (q.n, q.m));
 
-    let mut s = format!("Ответ: {answer}\n\nИсточники:");
-    for &n in &check.cited {
-        let src = &ctx.sources[n - 1];
-        // Имя и chunk_id — кодом: ответ рендерится как Markdown, и `_` в
-        // «AI_SDLC.txt … AI_SDLC.txt@v1» стал бы курсивом.
-        let location = src.location().replacen(&src.name, &format!("`{}`", src.name), 1);
-        s.push_str(&format!("\n- [{n}] {location} · chunk `{}`", display_source(&src.chunk_id)));
-    }
+    let mut s = format!("Ответ: {answer}\n\nИсточники:{}", sources_block(ctx, &check.cited));
     s.push_str("\n\nЦитаты:");
     for q in &check.quotes {
         let place = match q.lines {
@@ -492,6 +550,19 @@ pub fn finalize(text: &str, ctx: &RagContext, check: &mut AnswerCheck) -> String
         } else if !q.verified {
             s.push_str(&format!(" ⚠ нет дословно во фрагменте [{}]", q.n));
         }
+    }
+    s
+}
+
+/// Строки блока «Источники» — из данных поиска.
+fn sources_block(ctx: &RagContext, cited: &[usize]) -> String {
+    let mut s = String::new();
+    for &n in cited {
+        let src = &ctx.sources[n - 1];
+        // Имя и chunk_id — кодом: ответ рендерится как Markdown, и `_` в
+        // «AI_SDLC.txt … AI_SDLC.txt@v1» стал бы курсивом.
+        let location = src.location().replacen(&src.name, &format!("`{}`", src.name), 1);
+        s.push_str(&format!("\n- [{n}] {location} · chunk `{}`", display_source(&src.chunk_id)));
     }
     s
 }
@@ -536,8 +607,31 @@ mod tests {
                 src(2, "Журналы", "Журналы пишутся в каталог logs."),
             ],
             candidates: 2,
+            quotes: true,
             ..RagContext::default()
         }
+    }
+
+    #[test]
+    fn free_answer_keeps_its_text_and_gets_sources() {
+        let ctx = RagContext { quotes: false, ..ctx() };
+        let text = "Порт берётся из переменной APP_PORT, а без неё сервер слушает 8080 [1]. Журналы — отдельно [7].";
+        let mut check = check(text, &ctx);
+        assert!(!check.with_quotes && check.cited == vec![1]);
+        assert_eq!(check.problems, vec!["ссылка на несуществующий фрагмент [7] — их 2".to_string()]);
+        let out = finalize(text, &ctx, &mut check);
+        assert_eq!(
+            out,
+            format!("{text}\n\nИсточники:\n- [1] `guide.md` › Настройка · строки 10–15 · chunk `guide.md@v1/structure/0001`")
+        );
+        assert!(check.quotes.is_empty());
+        assert_eq!(check.summary(), "ответ: ⚠ источники [1]");
+
+        // Без формата нет и замечаний о нём; «не знаю» — с просьбой уточнить.
+        let mut unknown = super::check("Не знаю — во фрагментах нет версии протокола.", &ctx);
+        assert!(unknown.unknown && unknown.problems.is_empty());
+        let out = finalize("Не знаю — во фрагментах нет версии протокола.", &ctx, &mut unknown);
+        assert!(out.starts_with("Не знаю") && out.contains("Уточните"));
     }
 
     #[test]
@@ -559,6 +653,19 @@ mod tests {
         assert!(out.contains("- [1.2] строка 11: «по умолчанию 8080.»"), "{out}");
         assert!(!out.contains("⚠"));
         assert_eq!(check.summary(), "ответ: ✓ источники [1], цитаты 2/2 дословно");
+    }
+
+    #[test]
+    fn answer_copying_a_quote_is_a_problem() {
+        let text = "Ответ: Порт сервера задаётся переменной APP_PORT, по умолчанию 8080 [1.1].\nИсточники:\n- [1]\n\
+                    Цитаты:\n- [1.1] «Порт сервера задаётся переменной APP_PORT, по умолчанию 8080.»";
+        let check = check(text, &ctx());
+        assert_eq!(check.problems.len(), 1, "{:?}", check.problems);
+        assert!(check.problems[0].contains("повторяет цитату [1.1] дословно"));
+        // Короткий термин из цитаты в ответе — не копирование.
+        let text = "Ответ: Порт берётся из APP_PORT, а если её нет — 8080 [1.1].\nИсточники:\n- [1]\n\
+                    Цитаты:\n- [1.1] «Порт сервера задаётся переменной APP_PORT, по умолчанию 8080.»";
+        assert!(super::check(text, &ctx()).problems.is_empty());
     }
 
     #[test]

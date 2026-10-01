@@ -3002,6 +3002,8 @@
       </select></label>
     <label title="Кандидаты с оценкой реранкера ниже порога отбрасываются: у llm — оценка модели 0–1, у heuristic — близость с бонусом; 0 — без порога">порог реранкера
       <input type="number" id="agent-rag-rmin" min="0" max="1" step="0.05"></label>
+    <label class="inline" title="Ответ блоками «Ответ / Источники / Цитаты» с дословными цитатами из фрагментов и их проверкой. Выключено — модель отвечает своими словами со ссылками [n], к ответу добавляются источники">
+      <input type="checkbox" id="agent-rag-quotes"> с цитатами</label>
     <button type="button" class="settings-btn" id="agent-rag-apply">Применить</button>
     <span class="card-hint">вопрос → [переписывание] → топ-N по близости → порог близости → [реранкер] → порог реранкера → топ-K в контекст</span>
   </div>
@@ -4407,6 +4409,7 @@ const agentRagFields = {
   rewrite: document.getElementById('agent-rag-rewrite'),
   rerank: document.getElementById('agent-rag-rerank'),
   rmin: document.getElementById('agent-rag-rmin'),
+  quotes: document.getElementById('agent-rag-quotes'),
 };
 const agentChatStatusDot = document.getElementById('agent-chat-status-dot');
 const agentChatNameEl = document.getElementById('agent-chat-name');
@@ -5615,7 +5618,8 @@ function renderAgentMessage(msg) {
       if (rag.below_threshold) stages.push(`${afterThreshold} после порога`);
       if (belowRerank) stages.push(`${afterThreshold - belowRerank} после реранкера`);
       stages.push(`${rag.sources.length} фрагм.`);
-      head.textContent = `📚 RAG (${label}): ${stages.join(' → ')} — ответ, источники и цитаты по номерам [n]`;
+      head.textContent = `📚 RAG (${label}): ${stages.join(' → ')} — `
+        + (rag.quotes ? 'ответ, источники и цитаты по номерам [n]' : 'источники по номерам [n]');
     }
     if (rag.query) {
       const q = document.createElement('div');
@@ -5667,12 +5671,15 @@ function renderAgentMessage(msg) {
     if (check) {
       const div = document.createElement('div');
       div.className = check.problems.length ? 'rag-warn' : 'rag-query';
+      const refs = check.cited.map((n) => `[${n}]`).join('');
       if (check.unknown) {
         div.textContent = 'ответ: модель не нашла ответа во фрагментах — «не знаю»';
+      } else if (!check.with_quotes) {
+        div.textContent = `ответ: ${check.problems.length ? '⚠' : '✓'} источники ${refs}`;
       } else {
         const own = check.quotes.filter((q) => !q.auto);
         const auto = check.quotes.length - own.length;
-        let text = `ответ: ${check.problems.length ? '⚠' : '✓'} источники ${check.cited.map((n) => `[${n}]`).join('')}, `
+        let text = `ответ: ${check.problems.length ? '⚠' : '✓'} источники ${refs}, `
           + `цитаты ${own.filter((q) => q.verified).length}/${own.length} дословно`;
         if (auto) text += `, ${auto} подставлено из фрагментов`;
         if (check.retried) text += ', после повтора';
@@ -6049,6 +6056,7 @@ async function setAgentRag(enabled) {
         rewrite: agentRagFields.rewrite.checked,
         rerank: agentRagFields.rerank.value,
         rerank_min: agentRagFields.rerank.value === 'none' ? null : num(agentRagFields.rmin),
+        quotes: agentRagFields.quotes.checked,
       }),
     });
     const data = await res.json();
@@ -6093,6 +6101,7 @@ function fillAgentRagPanel(rag) {
   agentRagFields.rewrite.checked = !!r.rewrite;
   agentRagFields.rerank.value = r.rerank || 'none';
   agentRagFields.rmin.value = r.rerank_min ?? 0;
+  agentRagFields.quotes.checked = !!r.quotes;
   agentRagFields.rmin.disabled = agentRagFields.rerank.value === 'none';
 }
 
@@ -6105,6 +6114,7 @@ function ragDescribe(rag) {
     s += `, rerank ${rag.rerank}`;
     if (rag.rerank_min > 0) s += ` ≥ ${rag.rerank_min.toFixed(2)}`;
   }
+  if (rag.quotes) s += ', с цитатами';
   return s;
 }
 

@@ -101,9 +101,9 @@
 //! Агент отвечает с базой документов или без неё (см. llm_core::rag::retrieve):
 //! Ctrl+R в чате включает режим с параметрами по умолчанию и выключает его,
 //! `rag on [стратегия] [k=N] [n=20] [min=0.5] [rewrite] [rerank=heuristic|llm]
-//! [rmin=0.5]` / `rag off` на экране памяти (F3) задают параметры: топ-N
+//! [rmin=0.5] [quotes]` / `rag off` на экране памяти (F3) задают параметры: топ-N
 //! кандидатов до фильтра, топ-K после, порог близости, переписывание запроса,
-//! реранкер и его порог. Режим виден в шапке чата, найденные фрагменты —
+//! реранкер и его порог, ответ с цитатами. Режим виден в шапке чата, найденные фрагменты —
 //! строкой «RAG» перед ответом: этапы поиска (кандидатов → после порога →
 //! после реранкера), переписанный запрос и источники с близостью, оценкой
 //! реранкера и прежним местом; номера [n] в ответе ссылаются на них.
@@ -3224,7 +3224,7 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
              task approve · task reject <причина> · task finish · task invariant set/remove <id> [текст] · \
              task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
              profile new <имя> · invariants new <id> · invariants remove <id> · \
-             rag on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] · rag off · \
+             rag on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes] · rag off · \
              schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
                 .to_string(),
             Color::DarkGray,
