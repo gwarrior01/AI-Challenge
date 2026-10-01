@@ -23,6 +23,7 @@
 //! Все интерфейсы (TUI, CLI) работают через [`run_command`] — одни и те же
 //! команды с одним и тем же результатом.
 
+pub mod answer;
 pub mod browse;
 pub mod chunking;
 pub mod corpus;
@@ -101,6 +102,34 @@ impl RagConfig {
     }
 }
 
+/// Как документ называется в выводе: загруженный — без папки загрузок
+/// (`rag/uploads/отчёт.pdf` → `отчёт.pdf`), файл корпуса — своим путём
+/// (`core/src/agent.rs`). Годится и для `chunk_id` — он начинается с пути.
+/// Папка загрузок — служебная, человеку и модели она ничего не говорит.
+pub fn display_source(source: &str) -> &str {
+    source.strip_prefix(uploads_prefix()).unwrap_or(source)
+}
+
+/// `rag/uploads/` — с чего начинаются пути загруженных документов.
+pub fn uploads_prefix() -> &'static str {
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let cfg = RagConfig::from_env();
+        format!("{}/", cfg.source_of(&cfg.uploads).trim_end_matches('/'))
+    })
+}
+
+/// Документ из ввода команды: путь как в индексе или имя загруженного
+/// документа, как его показывает [`display_source`].
+fn resolve_source(cfg: &RagConfig, input: &str) -> Result<String> {
+    let store = Store::open(&cfg.db_path)?;
+    if !store.versions(input)?.is_empty() {
+        return Ok(input.to_string());
+    }
+    let uploaded = format!("{}/{input}", cfg.source_of(&cfg.uploads).trim_end_matches('/'));
+    Ok(if store.versions(&uploaded)?.is_empty() { input.to_string() } else { uploaded })
+}
+
 const META_MODEL: &str = "embedding_model";
 const META_DIM: &str = "embedding_dim";
 const META_INDEXED_AT: &str = "indexed_at";
@@ -144,7 +173,7 @@ impl IndexReport {
     pub fn describe(&self) -> String {
         let mut out = if self.single {
             match self.new_versions.first() {
-                Some((source, version)) => format!("{source}: новая версия v{version}"),
+                Some((source, version)) => format!("{}: новая версия v{version}", display_source(source)),
                 None => "Документ не изменился с действующей версии".to_string(),
             }
         } else {
@@ -157,13 +186,13 @@ impl IndexReport {
         };
         let listed = if self.single { &[][..] } else { &self.new_versions[..] };
         for (source, version) in listed {
-            out.push_str(&format!("\n  + {source} → v{version}"));
+            out.push_str(&format!("\n  + {} → v{version}", display_source(source)));
         }
         for source in &self.removed {
-            out.push_str(&format!("\n  − {source}: нет в корпусе, версия снята с поиска"));
+            out.push_str(&format!("\n  − {}: нет в корпусе, версия снята с поиска", display_source(source)));
         }
         for (source, err) in &self.failed {
-            out.push_str(&format!("\n  ! {source}: {err}"));
+            out.push_str(&format!("\n  ! {}: {err}", display_source(source)));
         }
         if !self.missing_roots.is_empty() {
             out.push_str(&format!("\n  (нет путей корпуса: {})", self.missing_roots.join(", ")));
@@ -551,7 +580,7 @@ impl Removed {
     pub fn describe(&self) -> String {
         let mut out = format!(
             "{} удалён из индекса: версий {}, чанков {}, векторов {}.",
-            self.source, self.versions, self.chunks, self.vectors
+            display_source(&self.source), self.versions, self.chunks, self.vectors
         );
         if self.file_deleted {
             out.push_str(" Загруженный файл удалён.");
@@ -568,7 +597,7 @@ impl Removed {
 pub fn remove_document(cfg: &RagConfig, source: &str) -> Result<Removed> {
     let mut store = Store::open(&cfg.db_path)?;
     let (versions, chunks, vectors) =
-        store.delete_document(source)?.ok_or_else(|| anyhow!("документа «{source}» нет в индексе (путь — как в списке docs)"))?;
+        store.delete_document(source)?.ok_or_else(|| anyhow!("документа «{}» нет в индексе (имя — как в списке docs)", display_source(source)))?;
     let path = cfg.base.join(source);
     let uploaded = path.starts_with(&cfg.uploads);
     let file_deleted = uploaded && std::fs::remove_file(&path).is_ok();
@@ -930,7 +959,7 @@ fn compare_report(d: &CompareData) -> Report {
                     "- **{}** ({}): топ-1 — `{}` · {} · строки {}–{} · score {:.3}\n  > {}\n",
                     s.name(),
                     mark(r),
-                    top.hit.version.source,
+                    display_source(&top.hit.version.source),
                     top.hit.chunk.section.as_deref().unwrap_or("без раздела"),
                     top.hit.chunk.start_line,
                     top.hit.chunk.end_line,
@@ -1084,7 +1113,10 @@ pub async fn run_command(cfg: &RagConfig, args: &[&str], progress: Progress<'_>)
             Ok(format!("{}\n\n{}", report.describe(), status(cfg)?))
         }
         Some("search") => {
-            let (opts, query) = parse_search(&args[1..])?;
+            let (mut opts, query) = parse_search(&args[1..])?;
+            if let Some(source) = &opts.source {
+                opts.source = Some(resolve_source(cfg, source)?);
+            }
             let opts = SearchOptions {
                 strategies: if opts.strategies.is_empty() {
                     indexed_strategies(cfg)?
@@ -1112,12 +1144,12 @@ pub async fn run_command(cfg: &RagConfig, args: &[&str], progress: Progress<'_>)
         }
         Some("remove") => {
             let source = args.get(1).ok_or_else(|| anyhow!("укажите документ: remove <путь>"))?;
-            Ok(remove_document(cfg, source)?.describe())
+            Ok(remove_document(cfg, &resolve_source(cfg, source)?)?.describe())
         }
         Some("docs") => docs(cfg),
         Some("versions") => {
             let source = args.get(1).ok_or_else(|| anyhow!("укажите документ: versions <путь>"))?;
-            versions(cfg, source)
+            versions(cfg, &resolve_source(cfg, source)?)
         }
         Some("compare") => {
             let embedder = Embedder::from_env()?;
@@ -1209,11 +1241,11 @@ fn format_search(query: &str, results: &[(Strategy, Vec<SearchHit>)]) -> String 
                 "\n{}. {:.3}  {} · {} · строки {}–{}\n   {} · v{}{} · {} симв.\n   {}",
                 i + 1,
                 h.score,
-                v.source,
+                display_source(&v.source),
                 c.section.as_deref().unwrap_or("без раздела"),
                 c.start_line,
                 c.end_line,
-                c.chunk_id,
+                display_source(&c.chunk_id),
                 v.version,
                 if v.status == "current" { String::new() } else { format!(" ({})", v.status) },
                 c.char_len,
@@ -1272,11 +1304,10 @@ fn status(cfg: &RagConfig) -> Result<String> {
 }
 
 fn corpus_label(cfg: &RagConfig) -> String {
-    let uploads = cfg.source_of(&cfg.uploads);
     if cfg.corpus.is_empty() {
-        format!("только загрузки ({uploads})")
+        "только загруженные документы".to_string()
     } else {
-        format!("{} + загрузки ({uploads})", cfg.corpus.join(", "))
+        format!("{} + загруженные документы", cfg.corpus.join(", "))
     }
 }
 
@@ -1291,7 +1322,7 @@ fn docs(cfg: &RagConfig) -> Result<String> {
         let counts = store.chunk_counts(v.version_id)?;
         let count = |s: Strategy| counts.iter().find(|(n, _)| n == s.name()).map(|(_, c)| c.to_string()).unwrap_or_else(|| "—".into());
         rows.push(vec![
-            v.source.clone(),
+            display_source(&v.source).to_string(),
             format!("v{}", v.version),
             match v.status.as_str() {
                 "current" => String::new(),
@@ -1320,7 +1351,7 @@ fn versions(cfg: &RagConfig, source: &str) -> Result<String> {
     let store = Store::open(&cfg.db_path)?;
     let all = store.versions(source)?;
     if all.is_empty() {
-        bail!("документа «{source}» нет в индексе (путь — как в списке docs)");
+        bail!("документа «{}» нет в индексе (имя — как в списке docs)", display_source(source));
     }
     let mut rows = Vec::new();
     for v in &all {
@@ -1336,7 +1367,8 @@ fn versions(cfg: &RagConfig, source: &str) -> Result<String> {
         ]);
     }
     Ok(format!(
-        "{source} — {}\n{}",
+        "{} — {}\n{}",
+        display_source(source),
         all[0].title,
         text_table(&["версия", "статус", "sha256", "git", "проиндексирована", "байт", "чанки"], &rows).trim_end()
     ))

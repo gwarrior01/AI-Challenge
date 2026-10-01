@@ -2045,7 +2045,7 @@ fn draw_rag(frame: &mut Frame, state: &DrawState) {
         Some((text, _)) => (format!(" {} {text}", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow),
         None if state.rag_running => (format!(" {} выполняется…", SPINNER_FRAMES[state.spinner_frame]), Color::Yellow),
         None => (
-            " Например: add ~/Downloads/отчёт.pdf fixed size=800 overlap=100 · search -s structure таймаут MCP · versions README.md · remove rag/uploads/отчёт.pdf".to_string(),
+            " Например: add ~/Downloads/отчёт.pdf fixed size=800 overlap=100 · search -s structure таймаут MCP · versions README.md · remove отчёт.pdf".to_string(),
             Color::DarkGray,
         ),
     };

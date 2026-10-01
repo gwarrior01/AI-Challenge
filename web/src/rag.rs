@@ -24,7 +24,7 @@ pub struct RagJob {
     /// Номер задачи — страница отличает новую задачу от прошлой.
     pub id: u64,
     pub running: bool,
-    /// Что делается: «векторизация rag/uploads/x.pdf», «индексация корпуса».
+    /// Что делается: «векторизация x.pdf», «индексация корпуса».
     pub title: String,
     /// Документ, если задача про один документ.
     pub source: Option<String>,
@@ -326,7 +326,7 @@ async fn rechunk(State(state): State<AppState>, Json(req): Json<RechunkRequest>)
     };
     let cfg = RagConfig::from_env();
     if !cfg.base.join(&req.source).is_file() {
-        return error(format!("файла {} нет на диске — загрузите его заново", req.source));
+        return error(format!("файла {} нет на диске — загрузите его заново", llm_core::rag::display_source(&req.source)));
     }
     let file_name = req.source.rsplit('/').next().unwrap_or(&req.source).to_string();
     let Some(id) = start_job(&state, format!("Нарезка {file_name}: {}", strategy.name()), Some(req.source.clone())) else {

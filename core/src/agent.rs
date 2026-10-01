@@ -2227,7 +2227,7 @@ impl Agent {
         // базы документов. Служебному продолжению поиск не нужен — это не
         // вопрос, а инструкция автомата; отказ перескочить этап модели не
         // отправляется вовсе.
-        let rag_context = match &config.rag {
+        let mut rag_context = match &config.rag {
             Some(settings) if !matches!(origin, Origin::Continuation) && stage_skip_refusal.is_none() => {
                 // Переписывание запроса и реранкер llm — той же моделью, что отвечает.
                 let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
@@ -2240,6 +2240,10 @@ impl Agent {
             Some(ctx) => messages.push(ChatMessage::user(crate::rag::retrieve::augment_prompt(prompt, ctx))),
             None => messages.push(ChatMessage::user(prompt)),
         }
+        // Ни один фрагмент не прошёл порог релевантности — «не знаю» и просьба
+        // уточнить вопрос, без модели: иначе она ответила бы из общих знаний.
+        // Как и отказ перескочить этап, — готовый ответ вместо запроса.
+        let refusal = stage_skip_refusal.clone().or_else(|| rag_context.as_ref().and_then(crate::rag::answer::refusal));
 
         let options = ChatOptions {
             max_tokens: config.max_tokens,
@@ -2256,7 +2260,7 @@ impl Agent {
         // стоявшая на паузе к началу запроса, не отслеживается: на паузе с
         // агентом можно разговаривать, он лишь не двигает задачу.
         let pause_watch = active_task.as_ref().filter(|t| !t.paused).map(|t| t.name.clone());
-        let (completion, tool_calls) = if let Some(refusal) = &stage_skip_refusal {
+        let (completion, tool_calls) = if let Some(refusal) = &refusal {
             let completion = crate::ChatCompletion {
                 content: refusal.clone(),
                 usage: None,
@@ -2312,6 +2316,11 @@ impl Agent {
 
         let user_message = ChatMessage::user(prompt.to_string());
         let mut completion = completion;
+        if refusal.is_none() {
+            if let Some(ctx) = rag_context.as_mut().filter(|ctx| !ctx.sources.is_empty()) {
+                completion.content = self.checked_rag_answer(&model, &messages, &options, ctx, completion.content).await;
+            }
+        }
         if let Origin::Scheduled { label } = origin {
             // Модель всё же могла начать ответ со своего «⏰ …» — не дублируем.
             let body = match completion.content.trim_start().strip_prefix(SCHEDULED_MARK) {
@@ -2325,7 +2334,7 @@ impl Agent {
 
         let summary_covers = self.update_summary_if_needed(&config).await;
         let facts_updated = if config.context_strategy == ContextStrategy::Facts
-            && stage_skip_refusal.is_none()
+            && refusal.is_none()
             && from_human
         {
             self.update_facts_after_message(&config, &user_message, &assistant_message).await
@@ -2369,6 +2378,45 @@ impl Agent {
             tool_calls: tool_calls.into_iter().filter(|call| call.server.is_some()).collect(),
             rag: rag_context,
         })
+    }
+
+    /// Ответ RAG-режима в обязательном формате «Ответ / Источники / Цитаты»
+    /// (см. [`crate::rag::answer`]): ответ модели проверяется, при ошибках модель
+    /// один раз просят исправить его, затем блоки собираются кодом — источники
+    /// из данных поиска, цитаты с отметкой проверки. Итог проверки — в
+    /// `ctx.check`, токены повтора — в `ctx.tokens`.
+    async fn checked_rag_answer(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &ChatOptions,
+        ctx: &mut crate::rag::RagContext,
+        content: String,
+    ) -> String {
+        use crate::rag::answer;
+        let mut content = content;
+        let mut check = answer::check(&content, ctx);
+        if !check.problems.is_empty() {
+            let mut retry = messages.to_vec();
+            retry.push(ChatMessage::assistant(content.clone()));
+            retry.push(ChatMessage::user(answer::fix_request(&check.problems)));
+            match self.client.chat_with_model(model, &retry, options).await {
+                Ok(fixed) => {
+                    ctx.tokens += fixed.usage.map(|u| u.total_tokens as u64).unwrap_or(0);
+                    let fixed_check = answer::check(&fixed.content, ctx);
+                    // Повтор бывает и хуже — тогда остаётся первый ответ.
+                    if fixed_check.problems.len() <= check.problems.len() {
+                        content = fixed.content;
+                        check = fixed_check;
+                    }
+                }
+                Err(err) => ctx.warnings.push(format!("повторный запрос на исправление ответа не удался: {err:#}")),
+            }
+            check.retried = true;
+        }
+        let content = answer::finalize(&content, ctx, &mut check);
+        ctx.check = Some(check);
+        content
     }
 
     /// Дописывает реплику человека и/или ответ агента в активную ветку — и в
