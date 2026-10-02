@@ -108,6 +108,16 @@
 //! после реранкера), переписанный запрос и источники с близостью, оценкой
 //! реранкера и прежним местом; номера [n] в ответе ссылаются на них.
 //!
+//! ## Агент сам ведёт задачу (Ctrl+G в чате агента)
+//!
+//! Агент присоединён к общей задаче (нет её — заводит свою, без этапов) и
+//! после каждой реплики обновляет её цель и заметки: что пользователь уже
+//! уточнил, ограничения и термины (см. llm_core::task_tracking). Задача уходит
+//! в каждый запрос; в RAG-режиме поиск идёт по запросу с учётом диалога.
+//! Ctrl+G включает и выключает ведение, в шапке — «🎯 цель: …», после ответа,
+//! изменившего задачу, — её цель и заметки. На F3 — в разделе «Рабочая»,
+//! команды `track on|off`; `task finish` — завершить и начать новую.
+//!
 //! ## MCP (F4 с любого экрана)
 //!
 //! Экран MCP-серверов (см. llm_core::mcp) из файла `mcp.json` (или
@@ -540,6 +550,8 @@ struct DrawState<'a> {
     /// перерисовке, поэтому смена этапа посреди ответа (move_stage) видна
     /// в шапке сразу, а не после ответа.
     agent_task: Option<llm_core::TaskState>,
+    /// Память задачи агента, чей диалог открыт, — `None`, если она выключена.
+    agent_tracked_goal: Option<Option<String>>,
     /// Число записей в истории диалога открытого агента (см. [`Agent::history`])
     /// — показывается в кратком виде на экране памяти ([`Screen::AgentMemory`])
     /// как обзор краткосрочной памяти; `None` вне экранов чата/памяти агента.
@@ -884,6 +896,15 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                 .and_then(|a| a.task_state()),
             _ => None,
         };
+        // Цель задачи, которую агент ведёт сам: Some(None) — ведёт, цели ещё нет.
+        let screen_agent_tracked_goal = match &screen {
+            Screen::AgentChat => agent_chat_name
+                .as_ref()
+                .and_then(|n| agent_manager.get(n))
+                .filter(|a| a.config().track_task)
+                .map(|a| a.task_state().and_then(|t| t.goal)),
+            _ => None,
+        };
 
         let mcp_servers = mcp.servers();
         if mcp_selected >= mcp_servers.len() {
@@ -920,6 +941,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             agent_chat_name: agent_chat_name.as_deref(),
             agent_chat_running,
             agent_task: screen_agent_task,
+            agent_tracked_goal: screen_agent_tracked_goal,
             agent_history_len: screen_agent_history_len,
             memory_status: memory_status.as_ref().map(|(text, is_error)| (text.as_str(), *is_error)),
             shared_tasks: &screen_shared_tasks,
@@ -1277,6 +1299,27 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                             let text = match toggle_task_mode(&agent) {
                                                 Ok(text) => text,
                                                 Err(err) => format!("не удалось переключить режим задачи: {err}"),
+                                            };
+                                            agent_histories.entry(name).or_default().push(HistoryItem {
+                                                role: Role::System,
+                                                text,
+                                                debug: None,
+                                                tokens: None,
+                                                cost: None,
+                                                cost_approx: false,
+                                            });
+                                            follow_bottom = true;
+                                        }
+                                    }
+                                }
+                                // Ctrl+G — агент сам ведёт задачу вкл/выкл (цель, уточнения, ограничения, термины).
+                                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(name) = agent_chat_name.clone() {
+                                        if let Some(agent) = agent_manager.get(&name) {
+                                            let enable = !agent.config().track_task;
+                                            let text = match track_command(&agent, if enable { "on" } else { "off" }) {
+                                                Ok(text) => text,
+                                                Err(err) => format!("не удалось переключить ведение задачи: {err}"),
                                             };
                                             agent_histories.entry(name).or_default().push(HistoryItem {
                                                 role: Role::System,
@@ -1793,6 +1836,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         }
                     }
                     AppEvent::AgentResponse { name, result } => {
+                        // Цель и заметки задачи, если ответ их изменил.
+                        let task_tracked = match &result {
+                            Ok(reply) if reply.task_tracked => agent_manager
+                                .get(&name)
+                                .and_then(|agent| agent.task_state())
+                                .map(|task| format!("задача «{}»\n{}", task.name, llm_core::Tracked::of(&task).render())),
+                            _ => None,
+                        };
                         let entry = agent_histories.entry(name.clone()).or_default();
                         // Показанные по ходу обмена строки вызовов заменяются итоговыми
                         // (ниже), а при оборванном ответе помечаются прерванными.
@@ -1895,6 +1946,18 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                             "Контекст сжат в сводку — она теперь охватывает {} более ранних сообщений.",
                                             summary_covers.unwrap_or(0)
                                         ),
+                                        debug: None,
+                                        tokens: None,
+                                        cost: None,
+                                        cost_approx: false,
+                                    });
+                                }
+                                // Задача изменилась — её цель и заметки: видно, что цель
+                                // держится, а уточнения копятся.
+                                if let Some(tracked) = task_tracked {
+                                    entry.push(HistoryItem {
+                                        role: Role::Compression,
+                                        text: format!("🎯 {tracked}"),
                                         debug: None,
                                         tokens: None,
                                         cost: None,
@@ -2856,6 +2919,14 @@ fn task_stage_spans(task: Option<&llm_core::TaskState>, working: bool) -> Vec<Sp
     spans
 }
 
+/// Первые `max` символов строки с «…», если она длиннее.
+fn short_text(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
+}
+
 fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let area = frame.area();
     let chunks = layout_chunks_with_input_height(area, INPUT_HEIGHT_AGENT_CHAT);
@@ -2875,13 +2946,17 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
         Some(rag) => header_spans.push(Span::styled(format!("  ·  {}", rag.describe()), Style::default().fg(Color::Yellow))),
         None => header_spans.push(Span::styled("  ·  без RAG", Style::default().fg(Color::DarkGray))),
     }
+    if let Some(goal) = state.agent_tracked_goal.as_ref() {
+        let goal = goal.as_deref().map(|g| short_text(g, 60)).unwrap_or_else(|| "пока не задана".to_string());
+        header_spans.push(Span::styled(format!("  ·  🎯 цель: {goal}"), Style::default().fg(Color::Green)));
+    }
     let task_mode = state.agents.iter().find(|a| a.config.name == name).is_some_and(|a| a.config.task_mode);
     if task_mode {
         header_spans.extend(task_stage_spans(state.agent_task.as_ref(), this_agent_waiting));
     } else {
         header_spans.push(Span::styled("  ·  чат, без этапов", Style::default().fg(Color::DarkGray)));
     }
-    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  Ctrl+T этапы  ·  Ctrl+R RAG  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
+    header_spans.push(Span::raw("  ·  Ctrl+S старт/стоп  ·  Ctrl+T этапы  ·  Ctrl+R RAG  ·  Ctrl+G вести задачу  ·  F3 память  ·  F4 MCP  ·  F5 расписание"));
     let header = Paragraph::new(Line::from(header_spans))
     .block(
         Block::default()
@@ -3055,8 +3130,24 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled("Рабочая — данные ОБЩЕЙ задачи", section_style)));
+    let tracking = info.is_some_and(|i| i.config.track_task);
+    if tracking {
+        lines.push(Line::from(
+            "  🎯 агент сам ведёт задачу: цель, уточнения, ограничения, термины — после каждой реплики · track off (Ctrl+G в чате)",
+        ));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  агент задачу сам не ведёт — данные только явно · track on (Ctrl+G в чате) — вести цель, уточнения, ограничения, термины",
+            hint_style,
+        )));
+    }
     if info.is_some_and(|i| i.config.task_mode) {
         lines.push(Line::from("  режим задачи: включён — работа по этапам · task mode off (Ctrl+T в чате) — обычный чат"));
+    } else if tracking {
+        lines.push(Line::from(Span::styled(
+            "  режим задачи: выключен — задача действует без этапов · task mode on (Ctrl+T в чате)",
+            hint_style,
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             "  режим задачи: выключен — агент отвечает как обычный чат, задача ниже не действует · task mode on (Ctrl+T в чате)",
@@ -3075,6 +3166,10 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
                 .unwrap_or_default();
             if !members.is_empty() {
                 lines.push(Line::from(Span::styled(format!("  участники: {members}"), hint_style)));
+            }
+            for (title, items) in task.notes.sections() {
+                lines.push(Line::from(Span::styled(format!("  {title}:"), Style::default().fg(Color::Yellow))));
+                lines.extend(items.iter().map(|item| Line::from(format!("    - {item}"))));
             }
             let stage_style = if task.paused {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -3225,7 +3320,7 @@ fn draw_agent_memory(frame: &mut Frame, state: &DrawState) {
              task forbid/allow/require-approval/unrequire-approval <из> <в> · profile <профиль|none> · \
              profile new <имя> · invariants new <id> · invariants remove <id> · \
              rag on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes] · rag off · \
-             schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
+             track on|off · schedule add <интервал> [промпт] · schedule remove|on|off|run <id>"
                 .to_string(),
             Color::DarkGray,
         ),
@@ -3361,6 +3456,23 @@ fn toggle_rag(agent: &llm_core::Agent) -> Result<String> {
     };
     agent.set_config(config)?;
     Ok(text)
+}
+
+/// `track on|off` (F3) и Ctrl+G в чате. Возвращает строку для показа.
+fn track_command(agent: &llm_core::Agent, action: &str) -> Result<String> {
+    match action {
+        "on" => {
+            let task = agent.set_track_task(true)?.map(|t| t.name).unwrap_or_default();
+            Ok(format!(
+                "🎯 Агент ведёт задачу «{task}» — цель, уточнения, ограничения и термины обновляются после каждой реплики."
+            ))
+        }
+        "off" => {
+            agent.set_track_task(false)?;
+            Ok("Агент больше не ведёт задачу сам (задача сохранена — task finish на F3, чтобы завершить).".to_string())
+        }
+        _ => anyhow::bail!("укажите действие: track on|off"),
+    }
 }
 
 fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, String> {
@@ -3589,7 +3701,8 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
             agent.set_config(config).map_err(|err| err.to_string())?;
             Ok(text)
         }
-        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile/invariants/rag")),
+        Some("track") => track_command(agent, tokens.get(1).copied().unwrap_or_default()).map_err(|err| err.to_string()),
+        Some(other) => Err(format!("неизвестная команда «{other}» — remember/forget/task/profile/invariants/rag/track")),
         None => Ok(String::new()),
     }
 }

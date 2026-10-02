@@ -213,6 +213,14 @@ pub struct AgentConfig {
     /// Создание задачи и присоединение к ней включают режим сами.
     #[serde(default)]
     pub task_mode: bool,
+    /// Агент сам ведёт задачу диалога (см. [`crate::task_tracking`]): `true` —
+    /// он всегда присоединён к общей задаче (нет её — заводит свою, этапы при
+    /// этом не включаются), после каждой реплики человека модель обновляет её
+    /// цель и заметки (уточнения, ограничения, термины), и задача уходит в
+    /// каждый запрос, с `task_mode` и без; в RAG-режиме поиск тогда идёт по
+    /// запросу с учётом диалога.
+    #[serde(default)]
+    pub track_task: bool,
 }
 
 impl AgentConfig {
@@ -231,6 +239,7 @@ impl AgentConfig {
             profile: None,
             rag: None,
             task_mode: false,
+            track_task: false,
         }
     }
 }
@@ -368,6 +377,9 @@ pub struct AgentReply {
     /// true, если в рамках обработки этого запроса был обновлён набор фактов
     /// (стратегия [`ContextStrategy::Facts`]).
     pub facts_updated: bool,
+    /// true, если после этого обмена модель изменила цель или заметки задачи
+    /// (см. [`AgentConfig::track_task`]).
+    pub task_tracked: bool,
     /// Сырые JSON запроса к LLM и его ответа за этот обмен (как в
     /// [`crate::ChatCompletion`]) — для отладочного просмотра в интерфейсах,
     /// по галочке "показывать JSON запроса/ответа".
@@ -949,11 +961,35 @@ impl Agent {
     /// planning. Возвращает задачу, по которой агент теперь работает.
     pub fn enable_task_mode(&self) -> Result<TaskState> {
         self.set_task_mode(true)?;
-        if self.task_state().is_none() && self.task_start(&self.name, None).is_err() {
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-            self.task_start(&format!("{}-{stamp}", self.name), None)?;
+        self.ensure_task()
+    }
+
+    /// Задача агента; нет её — заводит новую с именем агента (занято чужой
+    /// задачей — с меткой времени), режим этапов не трогает.
+    fn ensure_task(&self) -> Result<TaskState> {
+        if let Some(task) = self.task_state() {
+            return Ok(task);
         }
+        let mut name = self.name.clone();
+        if self.db.shared_task_exists(&name)? {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            name = format!("{}-{stamp}", self.name);
+        }
+        self.db.create_shared_task(&name, None)?;
+        self.db.set_agent_task(&self.name, &name)?;
         self.task_state().ok_or_else(|| anyhow!("не удалось завести задачу агенту «{}»", self.name))
+    }
+
+    /// Включает или выключает ведение задачи агентом ([`AgentConfig::track_task`]).
+    /// Включение присоединяет к задаче (нет её — заводит, без этапов) и
+    /// возвращает её; выключение задачу не трогает.
+    pub fn set_track_task(&self, on: bool) -> Result<Option<TaskState>> {
+        let mut config = self.config();
+        if config.track_task != on {
+            config.track_task = on;
+            self.set_config(config)?;
+        }
+        if on { self.ensure_task().map(Some) } else { Ok(None) }
     }
 
     /// Задача, по которой агент работает прямо сейчас: присоединённая задача,
@@ -2131,9 +2167,9 @@ impl Agent {
         // Долговременная и рабочая память (см. crate::memory) подмешиваются в
         // запрос независимо от `context_strategy` — та управляет только тем,
         // как в запрос попадает КРАТКОСРОЧНАЯ память (история диалога ниже);
-        // это ортогональная ось и её выключить нельзя, зато обе заполняются
-        // только явно (Agent::remember/task_set), поэтому попадание сюда
-        // лишнего исключено самой моделью данных, а не проверкой здесь.
+        // это ортогональная ось и её выключить нельзя. Обе заполняются явно
+        // (Agent::remember/task_set); исключение — цель и заметки задачи, если
+        // агент сам ведёт задачу (AgentConfig::track_task).
         if !long_term.is_empty() {
             messages.push(ChatMessage::system(crate::memory::format_long_term_block(&long_term)));
         }
@@ -2179,6 +2215,29 @@ impl Agent {
 
         let window = config.window_size.unwrap_or_else(context::sliding_window_size);
         let window_raw = window * context::RAW_MESSAGES_PER_EXCHANGE;
+
+        // Агент сам ведёт задачу: она в запросе и без режима этапов (с ним её
+        // блок уже добавлен выше, вместе с заметками), а уточняющий вопрос
+        // ищется вместе с тем, к чему он относится.
+        let tracked_task = if config.track_task && from_human {
+            match self.ensure_task() {
+                Ok(task) => Some(task),
+                Err(err) => {
+                    eprintln!("не удалось завести задачу агенту «{}»: {err:#}", self.name);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(task), None) = (&tracked_task, &active_task) {
+            messages.push(ChatMessage::system(crate::memory::format_tracked_task_block(task)));
+        }
+        let search_context = tracked_task.as_ref().and_then(|task| {
+            let branches = self.branches.lock().expect("ветки агента отравлены паникой");
+            let history: Vec<ChatMessage> = branches.current_messages().iter().map(|(m, _)| m.clone()).collect();
+            crate::task_tracking::search_context(&crate::task_tracking::Tracked::of(task), &history)
+        });
 
         {
             let branches = self.branches.lock().expect("ветки агента отравлены паникой");
@@ -2232,7 +2291,7 @@ impl Agent {
                 // Переписывание запроса и реранкер llm — той же моделью, что отвечает.
                 let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
                 let llm = crate::rag::rerank::LlmStep { client: &self.client, model: &model, reasoning: config.reasoning };
-                Some(crate::rag::retrieve::retrieve(prompt, settings, Some(&llm)).await)
+                Some(crate::rag::retrieve::retrieve(prompt, settings, Some(&llm), search_context.as_deref()).await)
             }
             _ => None,
         };
@@ -2303,6 +2362,7 @@ impl Agent {
                         summarized: false,
                         summary_covers: None,
                         facts_updated: false,
+                        task_tracked: false,
                         request_json: String::new(),
                         response_json: String::new(),
                         cost: None,
@@ -2341,6 +2401,15 @@ impl Agent {
         } else {
             false
         };
+        // Цель и заметки задачи — по каждой реплике человека, и при «не знаю»
+        // тоже: уточнение («у нас банк, 40 разработчиков») в базе может не
+        // найтись, но запомнить его нужно.
+        let task_tracked = match &tracked_task {
+            Some(task) if stage_skip_refusal.is_none() => {
+                self.update_tracked_task(&config, task, prompt, &assistant_message.content).await
+            }
+            _ => false,
+        };
 
         let mut text = completion.content;
         if config.show_tokens {
@@ -2371,6 +2440,7 @@ impl Agent {
             summarized: summary_covers.is_some(),
             summary_covers,
             facts_updated,
+            task_tracked,
             request_json: completion.request_json,
             response_json: completion.response_json,
             cost,
@@ -2529,6 +2599,33 @@ impl Agent {
             Err(err) => {
                 eprintln!("не удалось построить сводку контекста для агента «{}»: {err:#}", self.name);
                 None
+            }
+        }
+    }
+
+    /// Обновляет цель и заметки задачи по обмену отдельным запросом к
+    /// модели; `true`, если они изменились. Ошибка, как и у фактов, только
+    /// логируется — ответ уже получен, а задача остаётся прежней.
+    async fn update_tracked_task(&self, config: &AgentConfig, task: &TaskState, user: &str, assistant: &str) -> bool {
+        use crate::task_tracking::{update, Tracked};
+        let previous = Tracked::of(task);
+        let model = config.model.clone().unwrap_or_else(|| self.client.model().to_string());
+        match update(&self.client, &model, config.reasoning, &previous, user, assistant).await {
+            Ok(tracked) if tracked != previous => {
+                // Пустая цель от модели не стирает заданную человеком.
+                let goal = if tracked.goal.is_empty() { task.goal.clone() } else { Some(tracked.goal) };
+                match self.db.save_task_tracking(&task.name, goal.as_deref(), &tracked.notes) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        eprintln!("не удалось сохранить задачу «{}»: {err:#}", task.name);
+                        false
+                    }
+                }
+            }
+            Ok(_) => false,
+            Err(err) => {
+                eprintln!("не удалось обновить задачу «{}» агента «{}»: {err:#}", task.name, self.name);
+                false
             }
         }
     }
@@ -2768,6 +2865,9 @@ impl Db {
         if !existing.iter().any(|c| c == "interrupted_prompt") {
             conn.execute("ALTER TABLE shared_tasks ADD COLUMN interrupted_prompt TEXT", [])?;
         }
+        if !existing.iter().any(|c| c == "notes_json") {
+            conn.execute("ALTER TABLE shared_tasks ADD COLUMN notes_json TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -2983,11 +3083,12 @@ impl Db {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
         let conn = self.conn();
         let row: Option<SharedTaskRow> = match conn.query_row(
             "SELECT goal, stage, current_step, expected_action, paused, pending_stage, pending_outcome, \
-             interrupted_prompt FROM shared_tasks WHERE name = ?1",
+             interrupted_prompt, notes_json FROM shared_tasks WHERE name = ?1",
             [task_name],
             |row| {
                 let paused: i64 = row.get(4)?;
@@ -3000,6 +3101,7 @@ impl Db {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         ) {
@@ -3016,9 +3118,15 @@ impl Db {
             pending_stage_raw,
             pending_outcome,
             interrupted_prompt,
+            notes_json,
         )) = row
         else {
             return Ok(None);
+        };
+        let notes = match notes_json {
+            Some(json) => serde_json::from_str(&json)
+                .with_context(|| format!("не удалось разобрать notes_json задачи «{task_name}»"))?,
+            None => Default::default(),
         };
         let stage: Stage = stage_raw
             .parse()
@@ -3103,6 +3211,7 @@ impl Db {
             name: task_name.to_string(),
             goal,
             data,
+            notes,
             stage,
             current_step,
             expected_action,
@@ -3223,6 +3332,21 @@ impl Db {
 
     /// Создаёт новую общую задачу — вызывающая сторона уже проверила, что
     /// задачи с таким именем ещё нет ([`Db::shared_task_exists`]).
+    /// Цель и заметки задачи, которые ведёт модель (см. [`crate::task_tracking`]).
+    fn save_task_tracking(
+        &self,
+        task_name: &str,
+        goal: Option<&str>,
+        notes: &crate::task_tracking::TaskNotes,
+    ) -> Result<()> {
+        let json = serde_json::to_string(notes)?;
+        self.conn().execute(
+            "UPDATE shared_tasks SET goal = ?2, notes_json = ?3 WHERE name = ?1",
+            rusqlite::params![task_name, goal, json],
+        )?;
+        Ok(())
+    }
+
     fn create_shared_task(&self, task_name: &str, goal: Option<&str>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO shared_tasks (name, goal) VALUES (?1, ?2)",
@@ -3893,6 +4017,38 @@ mod tests {
 
     fn task(agent: &Agent) -> TaskState {
         agent.task_state().expect("агент должен быть присоединён к задаче")
+    }
+
+    /// Ведение задачи заводит общую задачу без этапов; цель и заметки модели
+    /// хранятся в ней, переживают перезапуск и уходят модели в блоке задачи.
+    #[test]
+    fn tracking_keeps_goal_and_notes_in_the_shared_task() {
+        let store = TempStore::new();
+        let (_m, agent) = open_agent(&store);
+        let created = agent.set_track_task(true).unwrap().unwrap();
+        assert_eq!(created.name, "tester");
+        assert!(!agent.config().task_mode, "ведение задачи не включает этапы");
+
+        let notes = crate::task_tracking::TaskNotes {
+            constraints: vec!["каждое изменение проходит аудит".into()],
+            ..Default::default()
+        };
+        agent.db.save_task_tracking("tester", Some("план перехода на AI-native SDLC"), &notes).unwrap();
+        agent.task_set("команда", "12 человек").unwrap();
+
+        let (_m, agent) = open_agent(&store);
+        let task = task(&agent);
+        assert_eq!((task.goal.as_deref(), &task.notes), (Some("план перехода на AI-native SDLC"), &notes));
+        let block = crate::memory::format_tracked_task_block(&task);
+        for part in ["Цель: план перехода на AI-native SDLC", "- команда = 12 человек", "Ограничения:\n- каждое изменение проходит аудит"] {
+            assert!(block.contains(part), "{part}\n---\n{block}");
+        }
+        assert!(crate::memory::format_task_block(&task).contains("каждое изменение проходит аудит"));
+
+        // Завершённая задача — следующий диалог начнётся с новой.
+        agent.task_finish().unwrap();
+        assert!(agent.task_state().is_none());
+        assert!(agent.set_track_task(true).unwrap().unwrap().notes.is_empty());
     }
 
     // --- Недопустимые переходы ---

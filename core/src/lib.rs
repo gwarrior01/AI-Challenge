@@ -39,6 +39,9 @@ pub mod pdf;
 
 pub mod rag;
 
+pub mod task_tracking;
+pub use task_tracking::{TaskNotes, Tracked};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

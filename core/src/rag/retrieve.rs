@@ -219,6 +219,9 @@ pub struct RagContext {
     pub sources: Vec<RagSource>,
     /// Переписанный запрос, если переписывание включено и удалось.
     pub query: Option<String>,
+    /// Запрос составлен с учётом диалога (цель и заметки задачи, прошлый обмен, см.
+    /// [`crate::task_tracking::search_context`]) — поиск шёл только по нему.
+    pub contextual: bool,
     /// Реранкер, который действительно отработал (`none`, если выключен или
     /// упал — тогда порядок по близости).
     pub rerank: Rerank,
@@ -287,7 +290,9 @@ impl RagContext {
     /// `structure · rewrite · rerank llm`
     pub fn label(&self) -> String {
         let mut s = self.strategy.clone();
-        if self.query.is_some() {
+        if self.contextual {
+            s.push_str(" · с учётом диалога");
+        } else if self.query.is_some() {
             s.push_str(" · rewrite");
         }
         if self.rerank != Rerank::None {
@@ -330,18 +335,33 @@ impl RagSource {
 /// [`RagContext::error`], чтобы недоступный сервер эмбеддингов не оставлял
 /// человека вовсе без ответа. `llm` — модель для переписывания запроса и
 /// реранкера `llm`; без неё эти шаги пропускаются с предупреждением.
-pub async fn retrieve(question: &str, settings: &RagSettings, llm: Option<&LlmStep<'_>>) -> RagContext {
+///
+/// `dialog` — контекст диалога (цель и заметки задачи, прошлый обмен): с ним запрос
+/// всегда переписывается по контексту, независимо от `settings.rewrite`, и
+/// ищется только он — короткий уточняющий вопрос сам по себе находит
+/// случайные фрагменты.
+pub async fn retrieve(
+    question: &str,
+    settings: &RagSettings,
+    llm: Option<&LlmStep<'_>>,
+    dialog: Option<&str>,
+) -> RagContext {
     let strategy = settings.strategy.clone().unwrap_or_default();
-    match try_retrieve(question, settings, llm).await {
+    match try_retrieve(question, settings, llm, dialog).await {
         Ok(ctx) => ctx,
         Err(err) => RagContext { strategy, error: Some(format!("{err:#}")), ..RagContext::default() },
     }
 }
 
-async fn try_retrieve(question: &str, settings: &RagSettings, llm: Option<&LlmStep<'_>>) -> Result<RagContext> {
+async fn try_retrieve(
+    question: &str,
+    settings: &RagSettings,
+    llm: Option<&LlmStep<'_>>,
+    dialog: Option<&str>,
+) -> Result<RagContext> {
     let cfg = RagConfig::from_env();
     let embedder = Embedder::from_env()?;
-    retrieve_in(&cfg, &embedder, question, settings, llm).await
+    retrieve_in(&cfg, &embedder, question, settings, llm, dialog).await
 }
 
 async fn retrieve_in(
@@ -350,6 +370,7 @@ async fn retrieve_in(
     question: &str,
     settings: &RagSettings,
     llm: Option<&LlmStep<'_>>,
+    dialog: Option<&str>,
 ) -> Result<RagContext> {
     let strategy = resolve_strategy(cfg, settings)?;
     let mut ctx = RagContext {
@@ -363,12 +384,15 @@ async fn retrieve_in(
     // Переписывание: ищем и по вопросу, и по запросу — переписанный запрос
     // может потерять то, что было в вопросе дословно.
     let mut queries = vec![question.to_string()];
-    if settings.rewrite {
+    if settings.rewrite || dialog.is_some() {
         match llm {
-            Some(llm) => match rerank::rewrite_query(llm, question).await {
+            Some(llm) => match rerank::rewrite_query(llm, question, dialog).await {
                 Ok((query, tokens)) => {
                     ctx.tokens += tokens;
-                    if query != question {
+                    if dialog.is_some() {
+                        ctx.contextual = true;
+                        queries = vec![query.clone()];
+                    } else if query != question {
                         queries.push(query.clone());
                     }
                     ctx.query = Some(query);
@@ -394,10 +418,12 @@ async fn retrieve_in(
     if settings.rerank != Rerank::None && !kept.is_empty() {
         let texts: Vec<&str> = kept.iter().map(|(_, h)| h.hit.chunk.context_text()).collect();
         let cosines: Vec<f32> = kept.iter().map(|(_, h)| h.score).collect();
+        // Реранкеру — тот же вопрос, что искали: с учётом диалога он полнее.
+        let asked = if ctx.contextual { ctx.query.as_deref().unwrap_or(question) } else { question };
         match settings.rerank {
             Rerank::Heuristic => rerank_scores = Some(rerank::heuristic_scores(&queries, &cosines, &texts)),
             Rerank::Llm => match llm {
-                Some(llm) => match rerank::llm_scores(llm, question, &texts).await {
+                Some(llm) => match rerank::llm_scores(llm, asked, &texts).await {
                     Ok((scores, tokens)) => {
                         ctx.tokens += tokens;
                         rerank_scores = Some(scores);
@@ -616,7 +642,7 @@ mod tests {
         super::super::index(&cfg, &embedder, &[Strategy::Structure], &|_| {}).await.unwrap();
 
         let strict = RagSettings { min_score: 1.0, ..RagSettings::default() };
-        let ctx = retrieve_in(&cfg, &embedder, "Как приготовить борщ?", &strict, None).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, "Как приготовить борщ?", &strict, None, None).await.unwrap();
         assert!(ctx.sources.is_empty() && !ctx.nearest.is_empty());
         assert!(ctx.nearest[0].source.starts_with("rag/uploads/"), "в индексе путь полный");
         let shown = format!(
@@ -695,13 +721,13 @@ mod tests {
 
         // Без второго этапа — все кандидаты по близости, топ-K.
         let plain = RagSettings { k: 2, min_score: 0.0, ..RagSettings::default() };
-        let ctx = retrieve_in(&cfg, &embedder, question, &plain, Some(&llm)).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, question, &plain, Some(&llm), None).await.unwrap();
         assert_eq!((ctx.sources.len(), ctx.rerank, ctx.query.as_deref()), (2, Rerank::None, None));
         assert!(ctx.candidates >= 3 && ctx.sources.iter().all(|s| s.rerank_score.is_none()));
 
         // Порог близости выше любой близости — контекст пуст.
         let strict = RagSettings { min_score: 1.0, ..plain.clone() };
-        let ctx = retrieve_in(&cfg, &embedder, question, &strict, Some(&llm)).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, question, &strict, Some(&llm), None).await.unwrap();
         assert!(ctx.sources.is_empty() && ctx.below_threshold == ctx.candidates);
         // Ближайшие кандидаты — для просьбы уточнить вопрос; модель не нужна.
         assert_eq!(ctx.nearest.len(), 3);
@@ -710,7 +736,7 @@ mod tests {
 
         // Rewrite + llm с порогом: остаётся только фрагмент с ответом.
         let full = RagSettings { k: 3, rewrite: true, rerank: Rerank::Llm, rerank_min: 0.5, min_score: 0.0, ..RagSettings::default() };
-        let ctx = retrieve_in(&cfg, &embedder, question, &full, Some(&llm)).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, question, &full, Some(&llm), None).await.unwrap();
         assert_eq!(ctx.query.as_deref(), Some("APP_PORT server port"));
         assert_eq!(ctx.rerank, Rerank::Llm);
         assert_eq!(ctx.sources.len(), 1, "{:?}", ctx.summary_lines());
@@ -721,13 +747,39 @@ mod tests {
 
         // Эвристика поднимает фрагмент с идентификатором из переписанного запроса.
         let heuristic = RagSettings { k: 1, rewrite: true, rerank: Rerank::Heuristic, min_score: 0.0, ..RagSettings::default() };
-        let ctx = retrieve_in(&cfg, &embedder, question, &heuristic, Some(&llm)).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, question, &heuristic, Some(&llm), None).await.unwrap();
         assert!(ctx.sources[0].text.contains("APP_PORT"), "{:?}", ctx.summary_lines());
 
         // Без модели rewrite и llm пропускаются с предупреждением, поиск идёт.
-        let ctx = retrieve_in(&cfg, &embedder, question, &full, None).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, question, &full, None, None).await.unwrap();
         assert_eq!((ctx.rerank, ctx.query.as_deref(), ctx.warnings.len()), (Rerank::None, None, 2));
         assert_eq!(ctx.sources.len(), 3);
+        std::fs::remove_dir_all(&cfg.base).unwrap();
+    }
+
+    /// С контекстом диалога запрос переписывается по нему даже без `rewrite`,
+    /// и ищется только переписанный запрос.
+    #[tokio::test]
+    async fn dialog_context_rewrites_follow_up_question() {
+        let (cfg, embedder) = indexed().await;
+        let client = crate::LlmClient::for_tests_at(
+            &mock_chat(|prompt| {
+                if prompt.contains("Контекст диалога:\nПрошлый вопрос: Где журналы?") && prompt.contains("Последнее сообщение: а каталог?") {
+                    "журналы каталог logs".into()
+                } else {
+                    "мимо".into()
+                }
+            })
+            .await,
+        );
+        let llm = LlmStep { client: &client, model: "test-model", reasoning: None };
+        let settings = RagSettings { k: 2, min_score: 0.0, ..RagSettings::default() };
+        let ctx = retrieve_in(&cfg, &embedder, "а каталог?", &settings, Some(&llm), Some("Прошлый вопрос: Где журналы?"))
+            .await
+            .unwrap();
+        assert_eq!((ctx.query.as_deref(), ctx.contextual), (Some("журналы каталог logs"), true));
+        assert_eq!(ctx.label(), "structure · с учётом диалога");
+        assert_eq!(ctx.sources.len(), 2);
         std::fs::remove_dir_all(&cfg.base).unwrap();
     }
 
@@ -737,7 +789,7 @@ mod tests {
         let client = crate::LlmClient::for_tests_at(&mock_chat(|_| "не знаю".into()).await);
         let llm = LlmStep { client: &client, model: "test-model", reasoning: None };
         let settings = RagSettings { k: 2, rerank: Rerank::Llm, rerank_min: 0.9, min_score: 0.0, ..RagSettings::default() };
-        let ctx = retrieve_in(&cfg, &embedder, "Где пишутся журналы?", &settings, Some(&llm)).await.unwrap();
+        let ctx = retrieve_in(&cfg, &embedder, "Где пишутся журналы?", &settings, Some(&llm), None).await.unwrap();
         assert_eq!((ctx.rerank, ctx.sources.len(), ctx.below_rerank), (Rerank::None, 2, 0));
         assert!(ctx.warnings[0].contains("реранкер llm не сработал"), "{:?}", ctx.warnings);
         std::fs::remove_dir_all(&cfg.base).unwrap();
