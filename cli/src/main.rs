@@ -54,6 +54,8 @@
 //!   llm-cli agent rag <имя> on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes]
 //!                                         -- отвечать с базой документов (llm_core::rag::retrieve)
 //!   llm-cli agent rag <имя> off                    -- отвечать без базы документов
+//!   llm-cli agent track <имя> [on|off]             -- агент сам ведёт задачу: цель, уточнения, ограничения,
+//!                                         -- термины (llm_core::task_tracking); в чате — /track [on|off]
 //!   llm-cli agent profiles create <профиль>        -- создать новый профиль (пустой шаблон) на диске
 //!   llm-cli agent invariants                       -- список жёстких инвариантов (общих для всех агентов)
 //!   llm-cli agent invariants show <id>             -- показать текст одного инварианта
@@ -842,6 +844,15 @@ async fn run_agent_cli(args: &[String]) -> Result<()> {
             println!("{}", set_rag(&agent, &words)?);
             Ok(())
         }
+        Some("track") => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow!("укажите имя агента: llm-cli agent track <имя> [on|off]"))?;
+            let agent = manager.get(&name).ok_or_else(|| anyhow!("агент «{name}» не найден"))?;
+            println!("{}", set_track_task(&agent, args.get(2).map(String::as_str))?);
+            Ok(())
+        }
         Some("profile") => {
             let name = args.get(1).cloned().ok_or_else(|| {
                 anyhow!("укажите имя агента: llm-cli agent profile <имя> [<профиль|none>]")
@@ -1055,6 +1066,7 @@ fn print_memory_overview(agent: &Agent) {
     println!();
 
     println!("-- Рабочая (данные общей задачи, к которой присоединён этот агент) --");
+    println!("{}", track_status(agent));
     match agent.task_state() {
         Some(task) => print_task(&task),
         None => println!(
@@ -1164,6 +1176,9 @@ fn print_task(task: &llm_core::TaskState) {
             println!("  - [{id}] {text}");
         }
     }
+    if !task.notes.is_empty() {
+        println!("{}", task.notes.render());
+    }
     if task.data.is_empty() {
         println!("(данных пока нет)");
     } else {
@@ -1229,6 +1244,7 @@ fn print_agent_usage() {
          \x20 llm-cli agent profiles create <профиль>                  (создать новый профиль — пустой шаблон)\n\
          \x20 llm-cli agent rag <имя> [on [стратегия] [k=N] [n=N] [min=0.5] [rewrite] [rerank=heuristic|llm] [rmin=0.5] [quotes] | off]\n\
          \x20     (RAG-режим: с базой документов или без; n — кандидатов до фильтра, k — фрагментов после)\n\
+         \x20 llm-cli agent track <имя> [on|off]                       (агент сам ведёт задачу: цель, уточнения, ограничения, термины)\n\
          \x20 llm-cli agent invariants                                 (жёсткие правила, общие для ВСЕХ агентов)\n\
          \x20 llm-cli agent invariants show <id>                       (показать текст одного инварианта)\n\
          \x20 llm-cli agent invariants create <id>                     (создать новый инвариант — пустой шаблон)\n\
@@ -1352,6 +1368,44 @@ fn set_rag(agent: &Agent, words: &[&str]) -> Result<String> {
     Ok(text)
 }
 
+/// Ведёт ли агент задачу сам (см. [`llm_core::AgentConfig::track_task`]).
+fn track_status(agent: &Agent) -> String {
+    if agent.config().track_task {
+        "🎯 Агент сам ведёт задачу: цель, уточнения, ограничения и термины обновляются после каждой реплики \
+         (track off — выключить, task finish — завершить и начать новую)."
+            .to_string()
+    } else {
+        "Агент задачу сам не ведёт — данные только явно (track on — вести цель, уточнения, ограничения, термины).".to_string()
+    }
+}
+
+/// Цель и заметки задачи агента текстом — `None`, если задачи нет или в ней пусто.
+fn tracked_text(agent: &Agent) -> Option<String> {
+    let task = agent.task_state()?;
+    let text = llm_core::Tracked::of(&task).render();
+    (!text.is_empty()).then(|| format!("задача «{}»\n{text}", task.name))
+}
+
+/// `track [on|off]` — показать, включить или выключить ведение задачи агентом;
+/// общая часть `agent track` и команды `/track` в чате.
+fn set_track_task(agent: &Agent, action: Option<&str>) -> Result<String> {
+    match action {
+        None => {}
+        Some("on") => {
+            agent.set_track_task(true)?;
+        }
+        Some("off") => {
+            agent.set_track_task(false)?;
+        }
+        Some(other) => bail!("непонятное действие «{other}» — track [on|off]"),
+    }
+    let mut text = track_status(agent);
+    if let Some(tracked) = agent.config().track_task.then(|| tracked_text(agent)).flatten() {
+        text.push_str(&format!("\n{tracked}"));
+    }
+    Ok(text)
+}
+
 /// Интерактивный чат с конкретным запущенным агентом. Завершается по Ctrl+D или
 /// командам `stop`/`exit`, при этом агент останавливается и состояние сохраняется.
 /// Запрос агенту, печатающий вызовы MCP-инструментов в момент, когда они
@@ -1458,6 +1512,14 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
             continue;
         }
 
+        if let Some(rest) = prompt.strip_prefix("/track") {
+            match set_track_task(&agent, rest.split_whitespace().next()) {
+                Ok(text) => println!("{text}"),
+                Err(err) => eprintln!("Ошибка: {err:#}"),
+            }
+            continue;
+        }
+
         // Вызовы инструментов печатаются по ходу обмена (см. ask_printing_tool_calls),
         // поэтому reply.tool_calls здесь повторно не выводится.
         match ask_printing_tool_calls(&agent, prompt).await {
@@ -1499,6 +1561,11 @@ async fn run_agent_chat(manager: &AgentManager, agent: Arc<Agent>) -> Result<()>
                 }
                 if let (true, Some(n)) = (reply.summarized, reply.summary_covers) {
                     println!("[🗜️ сводка контекста пересчитана — покрывает {n} сообщений]");
+                }
+                if reply.task_tracked {
+                    if let Some(text) = tracked_text(&agent) {
+                        println!("[🎯 {text}]");
+                    }
                 }
                 if reply.facts_updated {
                     if let Some(facts) = agent.info().facts {

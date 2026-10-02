@@ -346,6 +346,8 @@ async fn create_agent(
         rag: None,
         // Новый агент — обычный чат; этапы включаются кнопкой «🧭 Этапы» в чате.
         task_mode: false,
+        // Ведение задачи — кнопкой «🎯 Цель» в чате.
+        track_task: false,
     };
     match state.agents.create(config) {
         Ok(info) => Json(serde_json::json!({ "agent": info })),
@@ -396,6 +398,22 @@ async fn set_agent_task_mode(
         return Json(serde_json::json!({ "error": err.to_string() }));
     }
     Json(serde_json::json!({ "agent": agent.info() }))
+}
+
+/// Агент сам ведёт задачу (см. llm_core::task_tracking): вкл — присоединяет к
+/// задаче (нет её — заводит, без этапов), выкл — задачу не трогает.
+async fn set_agent_track(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetTaskModeRequest>,
+) -> Json<serde_json::Value> {
+    let Some(agent) = state.agents.get(&name) else {
+        return Json(serde_json::json!({ "error": format!("агент «{name}» не найден") }));
+    };
+    match agent.set_track_task(req.enabled) {
+        Ok(_) => Json(serde_json::json!({ "agent": agent.info() })),
+        Err(err) => Json(serde_json::json!({ "error": err.to_string() })),
+    }
 }
 
 /// Включает или выключает RAG-режим агента — на лету, как стратегию и профиль.
@@ -1004,6 +1022,8 @@ async fn ask_agent(
                 "summarized": reply.summarized,
                 "summary_covers": reply.summary_covers,
                 "facts_updated": reply.facts_updated,
+                // Модель изменила цель или заметки задачи (агент сам ведёт задачу).
+                "task_tracked": reply.task_tracked,
                 "requestJson": reply.request_json,
                 "responseJson": reply.response_json,
                 "compression": info.compression,
@@ -1313,6 +1333,7 @@ async fn main() -> Result<()> {
         .route("/api/agents/:name/profile", post(set_agent_profile))
         .route("/api/agents/:name/rag", post(set_agent_rag))
         .route("/api/agents/:name/task-mode", post(set_agent_task_mode))
+        .route("/api/agents/:name/track", post(set_agent_track))
         .route("/api/profiles", get(list_profiles).post(create_profile))
         .route(
             "/api/invariants",

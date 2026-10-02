@@ -236,6 +236,10 @@ pub struct TaskState {
     pub name: String,
     pub goal: Option<String>,
     pub data: BTreeMap<String, String>,
+    /// Что пользователь уточнил, ограничения и термины — их (и цель) ведёт
+    /// модель, если агент сам ведёт задачу (см. [`crate::task_tracking`]).
+    #[serde(default)]
+    pub notes: crate::task_tracking::TaskNotes,
     #[serde(default)]
     pub stage: Stage,
     #[serde(default)]
@@ -649,9 +653,45 @@ pub fn format_task_block(task: &TaskState) -> String {
     format!(
         "Рабочая память текущей задачи «{}»{goal_suffix} — общая для всех агентов, присоединившихся \
          к этой задаче (данные явно сохранены человеком, видны всем участникам и будут \
-         удалены для всех сразу при завершении задачи):\n\n{}\n\n{body}{invariants_suffix}",
+         удалены для всех сразу при завершении задачи):\n\n{}\n\n{body}{}{invariants_suffix}",
         task.name,
         format_stage_block(task),
+        format_notes_suffix(task),
+    )
+}
+
+/// Заметки задачи (уточнения, ограничения, термины) — продолжение блока
+/// задачи; пустая строка, если их нет.
+fn format_notes_suffix(task: &TaskState) -> String {
+    if task.notes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nЗафиксировано в диалоге (ведётся по ходу разговора — держись этого, даже если ранних сообщений \
+         уже нет в контексте):\n{}\n\nОтвечай применительно к цели задачи: учитывай уточнения пользователя, \
+         соблюдай ограничения, понимай термины так, как они зафиксированы.",
+        task.notes.render()
+    )
+}
+
+/// Задача без режима этапов (агент сам ведёт задачу, но `task_mode`
+/// выключен): цель, данные, заметки и инварианты задачи — без автомата и его
+/// инструментов.
+pub fn format_tracked_task_block(task: &TaskState) -> String {
+    let goal = task.goal.as_deref().unwrap_or("пока не зафиксирована");
+    let data = if task.data.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = task.data.iter().map(|(k, v)| format!("- {k} = {v}")).collect();
+        format!("\n\nДанные задачи (сохранены явно):\n{}", lines.join("\n"))
+    };
+    let invariants = format_task_invariants_block(task);
+    let invariants = if invariants.is_empty() { String::new() } else { format!("\n\n{invariants}") };
+    format!(
+        "Задача этого диалога «{}». Цель: {goal}. Если новый вопрос уводит от цели — ответь на него и коротко \
+         свяжи ответ с целью.{data}{}{invariants}",
+        task.name,
+        format_notes_suffix(task),
     )
 }
 

@@ -96,9 +96,29 @@ fn rewrite_prompt(question: &str) -> String {
     )
 }
 
-/// Поисковый запрос по вопросу и расход токенов. Пустой ответ — ошибка.
-pub async fn rewrite_query(llm: &LlmStep<'_>, question: &str) -> Result<(String, u64)> {
-    let (reply, tokens) = llm.ask(rewrite_prompt(question)).await.context("переписывание запроса")?;
+/// Запрос по последнему сообщению с учётом диалога: в отличие от
+/// [`rewrite_prompt`], отсылки («это», «второй вариант», «а сроки?»)
+/// разворачиваются по контексту, а цель диалога попадает в запрос.
+fn contextual_prompt(question: &str, dialog: &str) -> String {
+    format!(
+        "Сформулируй поисковый запрос для векторного поиска по базе документов (документация и исходный код, \
+         часто на английском) по ПОСЛЕДНЕМУ сообщению пользователя. Запрос должен быть понятен без диалога: \
+         разверни местоимения и отсылки к сказанному раньше, добавь предмет разговора из контекста, если в \
+         сообщении его нет. Оставь ключевые термины, имена, идентификаторы и числа; добавь перевод ключевых терминов \
+         на английский; убери вежливые и служебные слова. Не отвечай на вопрос. \
+         Выведи только запрос одной строкой, без пояснений и кавычек.\n\n\
+         Контекст диалога:\n{dialog}\n\nПоследнее сообщение: {question}"
+    )
+}
+
+/// Поисковый запрос по вопросу и расход токенов. С `dialog` — запрос с
+/// учётом контекста диалога (см. [`contextual_prompt`]). Пустой ответ — ошибка.
+pub async fn rewrite_query(llm: &LlmStep<'_>, question: &str, dialog: Option<&str>) -> Result<(String, u64)> {
+    let prompt = match dialog {
+        Some(dialog) => contextual_prompt(question, dialog),
+        None => rewrite_prompt(question),
+    };
+    let (reply, tokens) = llm.ask(prompt).await.context("переписывание запроса")?;
     let query = clean_rewrite(&reply);
     if query.is_empty() {
         bail!("модель вернула пустой запрос");

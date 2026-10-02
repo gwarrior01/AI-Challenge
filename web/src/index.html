@@ -2514,6 +2514,30 @@
     color: var(--accent);
   }
 
+  #agent-track-toggle.on {
+    border-color: rgba(34, 197, 94, 0.7);
+    color: rgb(34, 197, 94);
+  }
+
+  /* Задача, которую агент ведёт сам, — над лентой чата: цель, уточнения, ограничения, термины. */
+  .agent-tracked-task {
+    padding: 8px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .agent-tracked-task[hidden] { display: none; }
+  .agent-tracked-task .tm-head { display: flex; gap: 10px; align-items: baseline; }
+  .agent-tracked-task .tm-goal { color: var(--text); font-weight: 600; }
+  .agent-tracked-task .tm-goal.empty { color: var(--muted); font-weight: 400; }
+  .agent-tracked-task .tm-head .rag-link { margin-left: auto; }
+  .agent-tracked-task details summary { cursor: pointer; color: var(--muted); }
+  .agent-tracked-task .tm-section { margin: 4px 0 0; color: var(--muted); }
+  .agent-tracked-task ul { margin: 2px 0 0; padding-left: 18px; color: var(--text); }
+
   #agent-rag-toggle.on {
     border-color: rgba(234, 179, 8, 0.7);
     color: rgb(234, 179, 8);
@@ -2957,6 +2981,7 @@
     </div>
     <button type="button" class="settings-btn" id="agent-chat-toggle"></button>
     <button type="button" class="settings-btn" id="agent-task-mode-toggle" title="Режим задачи: агент ведёт работу по этапам planning → execution → validation → done с утверждением переходов. Выключен — обычный чат; задача при этом сохраняется и продолжится при включении">🧭 Этапы</button>
+    <button type="button" class="settings-btn" id="agent-track-toggle" title="Агент сам ведёт задачу: после каждой реплики фиксирует в ней цель диалога, ваши уточнения, ограничения и термины и держит их в каждом запросе; в RAG-режиме поиск учитывает диалог. Этапы при этом не включаются">🎯 Цель</button>
     <button type="button" class="settings-btn" id="agent-rag-toggle" title="RAG-режим: к каждому вопросу добавляются найденные фрагменты базы документов (вкладка RAG)">📚 RAG</button>
     <select id="agent-rag-strategy" class="settings-btn" title="Стратегия нарезки, по чанкам которой ищет RAG-режим">
       <option value="auto">авто</option>
@@ -2985,6 +3010,7 @@
     <span class="ctx-pending-badge" id="agent-ctx-pending" hidden></span>
     <span class="ctx-pending-badge" id="agent-cost-badge" hidden></span>
   </div>
+  <div class="agent-tracked-task" id="agent-tracked-task" hidden></div>
   <div class="agent-rag-panel" id="agent-rag-panel" hidden>
     <label title="Сколько ближайших по эмбеддингу чанков берёт первый этап — до фильтра и реранкинга">кандидатов (топ-N)
       <input type="number" id="agent-rag-n" min="1" max="50" step="1"></label>
@@ -4402,6 +4428,8 @@ const agentRagToggleBtn = document.getElementById('agent-rag-toggle');
 const agentRagStrategyEl = document.getElementById('agent-rag-strategy');
 const agentRagSettingsBtn = document.getElementById('agent-rag-settings');
 const agentRagPanel = document.getElementById('agent-rag-panel');
+const agentTrackBtn = document.getElementById('agent-track-toggle');
+const agentTrackedTaskEl = document.getElementById('agent-tracked-task');
 const agentRagFields = {
   n: document.getElementById('agent-rag-n'),
   k: document.getElementById('agent-rag-k'),
@@ -5601,7 +5629,8 @@ function renderAgentMessage(msg) {
     }
     // Метка и этапы — как RagContext::label/stages в core (TUI, CLI).
     let label = rag.strategy;
-    if (rag.query) label += ' · rewrite';
+    if (rag.contextual) label += ' · с учётом диалога';
+    else if (rag.query) label += ' · rewrite';
     if (rag.rerank && rag.rerank !== 'none') label += ` · rerank ${rag.rerank}`;
     const candidates = rag.candidates || 0;
     const belowRerank = rag.below_rerank || 0;
@@ -5893,6 +5922,10 @@ function updateAgentChatHeader(name) {
   agentTaskModeBtn.hidden = !info;
   agentTaskModeBtn.classList.toggle('on', !!(info && info.config.task_mode));
   agentTaskModeBtn.textContent = info && info.config.task_mode ? '🧭 Этапы: вкл' : '🧭 Этапы: выкл';
+  agentTrackBtn.hidden = !info;
+  agentTrackBtn.classList.toggle('on', !!(info && info.config.track_task));
+  agentTrackBtn.textContent = info && info.config.track_task ? '🎯 Цель: вкл' : '🎯 Цель: выкл';
+  renderTrackedTask(info && info.config.track_task ? info.task : null);
   agentRagToggleBtn.hidden = !info;
   agentRagToggleBtn.classList.toggle('on', !!rag);
   agentRagToggleBtn.textContent = rag ? '📚 RAG: вкл' : '📚 RAG: выкл';
@@ -6035,6 +6068,120 @@ agentTaskModeBtn.addEventListener('click', async () => {
     agentTaskModeBtn.disabled = false;
   }
 });
+
+// Задача, которую агент ведёт сам (llm_core::task_tracking), — полоска над
+// чатом: цель всегда на виду, уточнения/ограничения/термины и явные данные
+// задачи раскрываются. null — агент задачу не ведёт.
+const TASK_NOTE_SECTIONS = [
+  ['clarified', 'Уточнено'],
+  ['constraints', 'Ограничения'],
+  ['terms', 'Термины'],
+];
+
+function trackedTaskText(task) {
+  const notes = task.notes || {};
+  const lines = [`Задача «${task.name}»`];
+  if (task.goal) lines.push(`Цель: ${task.goal}`);
+  for (const [key, title] of TASK_NOTE_SECTIONS) {
+    if ((notes[key] || []).length) lines.push(`${title}:\n` + notes[key].map((i) => `- ${i}`).join('\n'));
+  }
+  return lines.join('\n');
+}
+
+function renderTrackedTask(task) {
+  const tracking = !!(currentAgentChatName && (findAgentInfo(currentAgentChatName) || {}).config?.track_task);
+  agentTrackedTaskEl.hidden = !tracking;
+  agentTrackedTaskEl.replaceChildren();
+  if (!tracking) return;
+  const notes = (task && task.notes) || {};
+  const data = Object.entries((task && task.data) || {});
+  const head = document.createElement('div');
+  head.className = 'tm-head';
+  const goal = document.createElement('span');
+  goal.className = 'tm-goal' + (task && task.goal ? '' : ' empty');
+  goal.textContent = task && task.goal ? `🎯 ${task.goal}` : '🎯 Цель пока не зафиксирована — появится по ходу диалога';
+  head.appendChild(goal);
+  const hint = document.createElement('span');
+  hint.className = 'card-hint';
+  const counts = TASK_NOTE_SECTIONS.map(([key, title]) => `${title.toLowerCase()}: ${(notes[key] || []).length}`);
+  hint.textContent = (task ? `задача «${task.name}» · ` : '') + counts.join(' · ');
+  head.appendChild(hint);
+  if (task) {
+    const finish = document.createElement('button');
+    finish.type = 'button';
+    finish.className = 'rag-link';
+    finish.textContent = 'завершить задачу';
+    finish.title = 'Завершить задачу (для всех её участников) — следующий вопрос начнёт новую, например с другой целью';
+    finish.addEventListener('click', finishTrackedTask);
+    head.appendChild(finish);
+  }
+  agentTrackedTaskEl.appendChild(head);
+
+  if (!TASK_NOTE_SECTIONS.some(([key]) => (notes[key] || []).length) && !data.length) return;
+  const details = document.createElement('details');
+  details.open = agentTrackedTaskOpen;
+  details.addEventListener('toggle', () => { agentTrackedTaskOpen = details.open; });
+  const summary = document.createElement('summary');
+  summary.textContent = 'уточнения, ограничения, термины, данные';
+  details.appendChild(summary);
+  const sections = TASK_NOTE_SECTIONS.map(([key, title]) => [title, notes[key] || []]);
+  sections.push(['Данные задачи (сохранены явно)', data.map(([k, v]) => `${k} = ${v}`)]);
+  for (const [title, items] of sections) {
+    if (!items.length) continue;
+    const h = document.createElement('div');
+    h.className = 'tm-section';
+    h.textContent = title;
+    const ul = document.createElement('ul');
+    for (const item of items) {
+      const li = document.createElement('li');
+      li.textContent = item;
+      ul.appendChild(li);
+    }
+    details.append(h, ul);
+  }
+  agentTrackedTaskEl.appendChild(details);
+}
+let agentTrackedTaskOpen = false;
+
+function pushAgentNotice(name, notice) {
+  agentChats[name].push(notice);
+  if (currentAgentChatName === name) {
+    agentChatMainEl.appendChild(renderAgentMessage(notice));
+    agentChatMainEl.scrollTop = agentChatMainEl.scrollHeight;
+  }
+}
+
+async function finishTrackedTask() {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const data = await postAgentMemory(name, 'task/finish', {});
+  pushAgentNotice(name, data.error
+    ? { role: 'error', text: data.error }
+    : { role: 'notice', text: '🎯 Задача завершена — следующий вопрос начнёт новую.' });
+  renderTaskBar(null);
+  await refreshAfterMemoryAction(name);
+}
+
+agentTrackBtn.addEventListener('click', async () => {
+  const name = currentAgentChatName;
+  if (!name) return;
+  const info = findAgentInfo(name);
+  const enabled = !(info && info.config.track_task);
+  agentTrackBtn.disabled = true;
+  try {
+    const data = await postAgentMemory(name, 'track', { enabled });
+    const task = data.agent ? data.agent.task : null;
+    pushAgentNotice(name, data.error
+      ? { role: 'error', text: data.error }
+      : { role: 'notice', text: enabled
+          ? `🎯 Агент ведёт задачу «${task ? task.name : ''}» — цель, уточнения, ограничения и термины обновляются после каждой реплики.`
+          : '🎯 Агент больше не ведёт задачу сам (задача сохранена).' });
+    await fetchAgents();
+  } finally {
+    agentTrackBtn.disabled = false;
+  }
+});
+
 
 // Параметры поиска — из панели ⚙ (её поля заполняются из настроек агента,
 // так что смена стратегии или включение их не сбрасывает).
@@ -6238,6 +6385,15 @@ async function sendAgentChatMessage(promptOverride, { continuation = false } = {
             typeof data.summary_covers === 'number' ? data.summary_covers : '…'
           } более ранних сообщений.`,
         };
+        agentChats[name].push(notice);
+        if (currentAgentChatName === name) {
+          agentChatMainEl.appendChild(renderAgentMessage(notice));
+        }
+      }
+      // Задача, которую агент ведёт сам, — полоска над чатом и метка в ленте.
+      if (currentAgentChatName === name) renderTrackedTask(data.task || null);
+      if (data.task_tracked && data.task) {
+        const notice = { role: 'compression', text: '🎯 ' + trackedTaskText(data.task) };
         agentChats[name].push(notice);
         if (currentAgentChatName === name) {
           agentChatMainEl.appendChild(renderAgentMessage(notice));
