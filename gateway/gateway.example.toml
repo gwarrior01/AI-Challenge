@@ -1,0 +1,35 @@
+# Конфигурация llm-gateway. Рабочая копия — gateway/gateway.toml (в .gitignore, там
+# настоящие ключи); на сервере она лежит в /etc/llm/gateway.toml.
+
+listen = "0.0.0.0:8080"
+backend = "http://127.0.0.1:8081"
+model = "qwen2.5-1.5b-instruct"
+
+# Контекст одного слота llama-server = CTX_SIZE / PARALLEL (6144 / 3).
+max_context_tokens = 2048
+max_output_tokens = 512
+default_max_tokens = 256
+
+# Одновременно в модели (= PARALLEL), сколько может ждать, сколько ждать.
+max_concurrent = 3
+max_queue = 6
+queue_timeout_secs = 120
+request_timeout_secs = 300
+
+default_rpm = 20
+per_user_parallel = 1
+
+# Ключ: openssl rand -hex 24
+[[users]]
+name = "admin"
+key = "replace-with-random-key-1"
+admin = true
+
+[[users]]
+name = "alice"
+key = "replace-with-random-key-2"
+rpm = 30
+
+[[users]]
+name = "bob"
+key = "replace-with-random-key-3"

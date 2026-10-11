@@ -18,3 +18,4 @@ rag/index.db-journal
 rag/index.db-wal
 rag/index.db-shm
 rag/uploads/
+gateway/gateway.toml

@@ -1,0 +1,22 @@
+[Unit]
+Description=llama.cpp server (локальная LLM, только localhost)
+After=network-online.target
+
+[Service]
+User=llm
+EnvironmentFile=/etc/llm/llama.env
+# Слушает только 127.0.0.1: снаружи модель доступна лишь через llm-gateway.
+# --parallel даёт независимые слоты, continuous batching обслуживает их одновременно;
+# --no-kv-unified — у каждого слота свои CTX_SIZE/PARALLEL токенов (на это рассчитывает шлюз).
+# Без mlock: CPU-сборка переупаковывает веса (repack) в свою копию, и mlock удержал бы
+# в RAM ещё и исходный mmap — на 2 ГБ памяти это две копии модели и уход в swap.
+ExecStart=/bin/sh -c 'exec /opt/llm/llama/current/llama-server \
+  --model "$MODEL" --alias "$MODEL_ALIAS" \
+  --host 127.0.0.1 --port 8081 \
+  --parallel "$PARALLEL" --ctx-size "$CTX_SIZE" --cont-batching --no-kv-unified \
+  --threads "$THREADS" --no-webui'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
