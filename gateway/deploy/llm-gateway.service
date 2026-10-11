@@ -1,0 +1,14 @@
+[Unit]
+Description=llm-gateway: OpenAI-совместимый шлюз с ключами и лимитами перед llama-server
+After=network-online.target llama-server.service
+Wants=llama-server.service
+
+[Service]
+User=llm
+ExecStart=/opt/llm/gateway/llm-gateway serve --config /etc/llm/gateway.toml
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

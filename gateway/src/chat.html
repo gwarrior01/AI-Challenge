@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Локальная LLM</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#deded9; --accent:#2f6fde; --err:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151514; --fg:#e8e8e3; --muted:#9a9a93; --card:#1f1f1d; --line:#33332f; --accent:#6d9cf0; --err:#ef6f5e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:flex; flex-direction:column; height:100vh; gap:12px; }
+  header { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0 auto 0 0; }
+  input, textarea, button { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  input { width:240px; max-width:100%; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  #log { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 12px; border-radius:10px; background:var(--card); border:1px solid var(--line); white-space:pre-wrap; }
+  .user { align-self:flex-end; max-width:85%; }
+  .assistant { align-self:flex-start; max-width:95%; }
+  .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .error { color:var(--err); border-color:var(--err); }
+  form { display:flex; gap:8px; }
+  textarea { flex:1; resize:none; height:64px; }
+  #status { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Локальная LLM</h1>
+    <span id="status">…</span>
+    <input id="key" type="password" placeholder="API-ключ" autocomplete="off">
+    <button id="reset" type="button">Новый чат</button>
+  </header>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="input" placeholder="Сообщение… (Enter — отправить, Shift+Enter — перенос)"></textarea>
+    <button class="primary" id="send">Отправить</button>
+  </form>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let history = [];
+let busy = false;
+try { $('key').value = localStorage.getItem('llm-key') || ''; } catch (_) {}
+$('key').addEventListener('change', () => { try { localStorage.setItem('llm-key', $('key').value.trim()); } catch (_) {} });
+
+fetch('/health').then(r => r.json()).then(h => {
+  $('status').textContent = `${h.model} · модель: ${h.backend} · занято слотов: ${h.active}`;
+}).catch(() => { $('status').textContent = 'шлюз недоступен'; });
+
+function bubble(role, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  el.textContent = text;
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+  return el;
+}
+
+$('reset').onclick = () => { history = []; $('log').innerHTML = ''; };
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('form').requestSubmit(); }
+});
+
+$('form').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('input').value.trim();
+  if (!text || busy) return;
+  busy = true; $('send').disabled = true; $('input').value = '';
+  bubble('user', text);
+  history.push({ role: 'user', content: text });
+  const out = bubble('assistant', '…');
+  const started = performance.now();
+  let answer = '', usage = null, first = null;
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + $('key').value.trim() },
+      body: JSON.stringify({ messages: history, stream: true }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(`${resp.status}: ${err.error?.message || resp.statusText}`);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        const chunk = JSON.parse(data);
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) { if (first === null) first = performance.now(); answer += delta; out.textContent = answer; }
+        if (chunk.usage) usage = chunk.usage;
+        $('log').scrollTop = $('log').scrollHeight;
+      }
+    }
+    history.push({ role: 'assistant', content: answer });
+    const secs = (performance.now() - started) / 1000;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const gen = first ? (performance.now() - first) / 1000 : secs;
+    meta.textContent = usage
+      ? `${secs.toFixed(1)} с · промпт ${usage.prompt_tokens} · ответ ${usage.completion_tokens} ток · ${(usage.completion_tokens / Math.max(gen, 0.01)).toFixed(1)} ток/с`
+      : `${secs.toFixed(1)} с`;
+    out.appendChild(meta);
+  } catch (err) {
+    history.pop();
+    out.textContent = err.message;
+    out.classList.add('error');
+  } finally {
+    busy = false; $('send').disabled = false; $('input').focus();
+  }
+};
+</script>
+</body>
+</html>

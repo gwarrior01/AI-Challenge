@@ -1,6 +1,6 @@
 # LLM Agent in Rust
 
-A Cargo workspace made up of four crates:
+A Cargo workspace made up of these crates (plus the MCP servers under `mcp/`):
 
 | Crate      | Purpose                                                              |
 |------------|-----------------------------------------------------------------------|
@@ -8,6 +8,7 @@ A Cargo workspace made up of four crates:
 | `cli`      | `llm-cli` — minimal console agent (the main deliverable)             |
 | `web`      | `llm-web` — web chat UI (axum), port `8080`                          |
 | `tui`      | `llm-tui` — terminal chat UI (ratatui)                                |
+| `gateway`  | `llm-gateway` — private AI service: OpenAI-compatible gateway with keys and limits in front of a local llama.cpp model on a VPS |
 
 The client talks to any **OpenAI-compatible** HTTP API (`/chat/completions`): OpenAI, OpenRouter, Ollama, LM Studio, etc. all work. The API address and key are supplied via environment variables rather than hardcoded.
 
@@ -513,6 +514,35 @@ question → search query with the task and the previous exchange → search →
 | Web | **🎯 Цель: вкл/выкл** in the agent chat header (`POST /api/agents/:name/track` `{enabled}`) | a strip above the chat: the goal, counts, expandable clarifications/constraints/terms/data, «завершить задачу»; a note in the chat after each change |
 | CLI | `llm-cli agent track <name> [on\|off]`; `/track …` inside `agent chat` | `[🎯 задача «…» …]` after the answer; the notes in `agent task <name> show` and `agent memory <name>` |
 
+### Private AI service: a local LLM on a VPS
+
+`gateway/` turns a small VPS (1 vCPU, 2 GB RAM, no GPU) into a private, OpenAI-compatible AI service that several users share. The model runs in **llama.cpp** (`llama-server`, Qwen2.5-1.5B-Instruct Q4_K_M, 3 slots × 2048 tokens, continuous batching) bound to localhost; in front of it, **`llm-gateway`** (axum) is the only thing reachable from the network:
+
+```text
+client (llm-cli/web/tui, curl, any OpenAI SDK, chat page at GET /)
+   │ HTTP :8080, Authorization: Bearer <user key>
+   ▼
+llm-gateway — key → user, rpm per user, context limit, queue to the model's slots, /stats
+   │ 127.0.0.1:8081 (ufw: only 22 and 8080 are open)
+   ▼
+llama-server — 3 parallel slots
+```
+
+- **API** — `POST /v1/chat/completions` (plain and `stream: true`; SSE is passed through as is, `usage` is requested in the last chunk), `GET /v1/models`, `GET /health` (no key), `GET /stats` (per-user counters: the admin sees everyone, a user only themselves), `GET /` — a minimal chat page. Errors use the OpenAI format (`{"error":{"message","type","code"}}`), so SDKs handle them. The client's `model` is ignored — there is one model.
+- **Limits** (`gateway.toml`): the prompt is counted with the model's own chat template and tokenizer (`/apply-template` + `/tokenize` of llama-server) and, with `max_tokens`, must fit one slot's context — otherwise `400 context_length_exceeded`; `max_tokens` defaults to 256 and is capped at 512; a sliding one-minute window of `rpm` requests per key → `429 rate_limit_exceeded` with `Retry-After`; one request per user at a time (the rest of theirs wait, so one user can't take all slots), 3 in the model, up to 6 waiting for at most 120 s → `503 server_busy`.
+- **Deploy** — the gateway is cross-compiled locally into a static linux binary (`cargo zigbuild --target x86_64-unknown-linux-musl`; no TLS in it, so nothing but a linker is needed). `gateway/deploy/setup.sh` prepares the server once (swap, prebuilt llama.cpp, the models, systemd units, ufw); `gateway/deploy/push.sh` builds and ships the binary and `gateway/gateway.toml` (git-ignored — real keys; template: `gateway/gateway.example.toml`) and restarts the service.
+- **Checking it** — `llm-gateway loadtest --url http://host:8080 --keys k1,k2,k3` runs all users at once and then the limits (bad key, too long a prompt, rpm), printing a Markdown report. Results, the model choice and its measurements: [`gateway/report.md`](gateway/report.md) — 3 users × 3 requests, 0 errors, ~15 s per 64-token answer, 12.7 tok/s in total.
+
+```bash
+SSH="ssh -i ~/.ssh/key user@host" SETUP=1 gateway/deploy/push.sh   # first time; later without SETUP
+```
+
+The repo's own interfaces need no changes — point them at the service:
+
+```bash
+LLM_API_URL=http://<vps>:8080/v1 LLM_API_KEY=<user key> LLM_MODEL=qwen2.5-1.5b-instruct LLM_CONTEXT_WINDOW=2048 llm-tui
+```
+
 ## Installing Rust
 
 If Rust isn't installed yet:
@@ -674,7 +704,7 @@ Press `F2` to switch to the **Агенты** screen — the same named-agent reg
 cargo build --release
 ```
 
-Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`.
+Binaries will appear in `target/release/`: `llm-cli`, `llm-web`, `llm-tui`, `llm-gateway`. The VPS build of the gateway is `cargo zigbuild --release -p llm-gateway --target x86_64-unknown-linux-musl` (see "Private AI service" above).
 
 ## Project structure
 
@@ -690,6 +720,7 @@ mcp/              — this repo's own MCP servers, one folder each:
   documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page, src/rag.rs: the RAG tab's API
 tui/              — llm-tui: terminal interface (ratatui)
+gateway/          — llm-gateway: private AI service over a local LLM — src/proxy.rs — the OpenAI-compatible endpoints, src/limits.rs — rpm and the queue to the slots, src/config.rs — gateway.toml, src/loadtest.rs — the network check, src/chat.html — the chat page; deploy/ — server setup, systemd units, push.sh; report.md — measurements
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template
 rag/              — eval.json — control questions for comparing chunking strategies, compare.md — the comparison report (index.db — the index itself, uploads/ — uploaded documents; both git-ignored)
 invariants/       — hard invariant markdown files (see "Invariants: hard rules the assistant refuses to break" above), one per rule — this repo ships stack.md/storage.md/secrets.md as filled-in examples

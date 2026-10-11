@@ -1,0 +1,21 @@
+[package]
+name = "llm-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "llm-gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# TLS не нужен: llama-server на localhost, сервис отдаётся по HTTP. Без TLS бинарник
+# собирается под linux одним линкером (cargo zigbuild), без openssl/ring.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+futures-util = "0.3"
+bytes = "1"
