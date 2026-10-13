@@ -284,6 +284,7 @@ async fn ask(
         top_p: req.top_p,
         response_format,
         reasoning: req.reasoning,
+        ..ChatOptions::default()
     };
 
     let model: &str = if req.analysis { state.analysis_model.as_str() } else { state.client.model() };

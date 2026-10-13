@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use llm_core::rag::{self, Embedder, RagConfig, Strategy};
-use llm_core::{LlmClient, McpManager, McpStatus, ToolCallRecord};
+use llm_core::{ChatCompletion, ChatOptions, LlmClient, McpManager, McpStatus, RequestMessage, ToolCallRecord, ToolDefinition};
 
 /// Конфигурация MCP ассистента по умолчанию.
 pub const DEFAULT_MCP_CONFIG: &str = "assistant/mcp.json";
@@ -31,6 +31,9 @@ pub const DEFAULT_CODE_DB: &str = "rag/code.db";
 /// Нарезка обоих индексов: разделы Markdown по заголовкам, у кода — элементы
 /// (`impl Agent › fn run`).
 pub const STRATEGY: Strategy = Strategy::Structure;
+
+/// Сколько ждать ответа модели на один запрос по умолчанию (`ASSISTANT_LLM_TIMEOUT`, секунды).
+pub const DEFAULT_LLM_TIMEOUT_SEC: u64 = 180;
 
 /// Сколько ждать сервер git, который ещё подключается.
 const CONNECT_WAIT: Duration = Duration::from_secs(60);
@@ -164,6 +167,28 @@ pub async fn sync_index(cfg: &RagConfig, embedder: &Embedder) -> Result<Option<S
         note = Some(format!("{name} пересобран моделью {} — {}", embedder.model(), note.unwrap_or_default()));
     }
     Ok(note)
+}
+
+/// Запрос к модели с пределом времени: у HTTP-клиента ядра таймаута нет, и
+/// повисший ответ провайдера иначе держал бы команду бесконечно.
+pub async fn chat(
+    client: &LlmClient,
+    wire: &[RequestMessage],
+    tools: &[ToolDefinition],
+    options: &ChatOptions,
+) -> Result<ChatCompletion> {
+    let secs: u64 = env_or("ASSISTANT_LLM_TIMEOUT", "").parse().unwrap_or(DEFAULT_LLM_TIMEOUT_SEC).max(5);
+    // Отладка: `ASSISTANT_DUMP_DIR=<папка>` — каждый запрос к модели пишется туда JSON-файлом.
+    if let Ok(dir) = std::env::var("ASSISTANT_DUMP_DIR") {
+        let body = serde_json::json!({ "model": client.model(), "messages": wire, "tools": tools.iter().map(|t| &t.name).collect::<Vec<_>>() });
+        let name = format!("request-{}.json", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), serde_json::to_string_pretty(&body).unwrap_or_default());
+    }
+    match tokio::time::timeout(Duration::from_secs(secs), client.chat_with_tools(client.model(), wire, tools, false, options)).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("модель не ответила за {secs} с (предел — ASSISTANT_LLM_TIMEOUT)"),
+    }
 }
 
 pub fn record(server: &str, tool: &str, arguments: &str, result: &str, is_error: bool) -> ToolCallRecord {

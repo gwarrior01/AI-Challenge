@@ -32,12 +32,13 @@ use llm_core::{ChatMessage, ChatOptions, RequestMessage, ToolCallRecord, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::context::{code_config, docs_config, env_or, short, sync_index, Assistant, Progress, STRATEGY};
+use crate::context::{chat, code_config, docs_config, env_or, short, sync_index, Assistant, Progress, STRATEGY};
 
 /// Базовая ветка по умолчанию.
 pub const DEFAULT_BASE: &str = "main";
 /// Подсказка для интерфейсов.
-pub const USAGE: &str = "/review [base | base..head | --wip] — ревью ветки относительно base (main), двух веток или незакоммиченного";
+pub const USAGE: &str = "/review [base | base..head | --wip] [путь…] — ревью ветки относительно base (main), двух веток или \
+незакоммиченного; пути (файлы, каталоги) сужают ревью, `--` перед путями — если путь можно спутать с веткой";
 
 /// Сколько файлов ревьюить за раз — остальные перечисляются как пропущенные.
 const MAX_FILES: usize = 30;
@@ -120,6 +121,46 @@ impl Target {
             Target::Wip => "незакоммиченные изменения ↔ HEAD".to_string(),
         }
     }
+}
+
+/// Аргументы `/review` словами → цель и пути. Первое слово — цель (`main`,
+/// `main..feature`, `--wip`), если только это не существующий файл или
+/// каталог (`is_path`): тогда цель по умолчанию, а слово — путь. Всё после
+/// `--` — пути.
+pub fn parse_args(words: &[&str], default_base: &str, is_path: impl Fn(&str) -> bool) -> Result<(Target, Vec<String>)> {
+    let (head, tail) = match words.iter().position(|w| *w == "--") {
+        Some(i) => (&words[..i], &words[i + 1..]),
+        None => (words, &[][..]),
+    };
+    let (target, mut paths): (Target, Vec<&str>) = match head.split_first() {
+        None => (Target::parse("", default_base)?, Vec::new()),
+        Some((first, rest)) => {
+            let looks_like_target = matches!(*first, "--wip" | "wip") || first.contains("..");
+            if !looks_like_target && is_path(first) {
+                (Target::parse("", default_base)?, head.to_vec())
+            } else {
+                (Target::parse(first, default_base)?, rest.to_vec())
+            }
+        }
+    };
+    paths.extend_from_slice(tail);
+    let paths = paths.iter().map(|p| clean_scope(p)).filter(|p| !p.is_empty()).collect();
+    Ok((target, paths))
+}
+
+/// `./core/src/` → `core/src`; `.` — весь репозиторий (пусто).
+fn clean_scope(p: &str) -> String {
+    let p = p.trim().trim_start_matches("./").trim_end_matches('/');
+    if p == "." {
+        String::new()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Файл попадает в ревью с путями `paths` (пусто — все файлы).
+fn in_scope(file: &str, paths: &[String]) -> bool {
+    paths.is_empty() || paths.iter().any(|p| file == p || file.starts_with(&format!("{p}/")))
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +437,8 @@ impl FileSection {
 
 /// Ревью цели — см. документацию модуля. Ошибка — если нет git, нечего
 /// ревьюить или модель не ответила.
-pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Result<Review> {
+/// `paths` — файлы и каталоги, которыми ограничено ревью (пусто — все изменения цели).
+pub async fn run(a: &Assistant, target: &Target, paths: &[String], progress: Progress<'_>) -> Result<Review> {
     a.ensure_git().await.map_err(|e| anyhow!(e))?;
     let mut log: Vec<ToolCallRecord> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -414,16 +456,29 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
             let skipped = skip_reason(&path, f.added);
             ReviewFile { path, added: f.added, deleted: f.deleted, untracked: false, skipped }
         })
+        .filter(|f| in_scope(&f.path, paths))
         .collect();
     if target.with_untracked() {
-        for path in &stat.untracked {
+        for path in stat.untracked.iter().filter(|p| in_scope(p, paths)) {
             let skipped = skip_reason(path, Some(0));
             files.push(ReviewFile { path: path.clone(), added: None, deleted: Some(0), untracked: true, skipped });
         }
     }
     if files.is_empty() {
-        bail!("нечего ревьюить: {} — изменений нет", stat.compared);
+        match paths.is_empty() {
+            true => bail!("нечего ревьюить: {} — изменений нет", stat.compared),
+            false => bail!("нечего ревьюить: в {} изменений нет ({})", paths.join(", "), stat.compared),
+        }
     }
+    // С путями итоги считаются по выбранным файлам, а не по всему диффу.
+    let (added, deleted) = match paths.is_empty() {
+        true => (stat.added, stat.deleted),
+        false => files.iter().fold((0, 0), |(a, d), f| (a + f.added.unwrap_or(0), d + f.deleted.unwrap_or(0))),
+    };
+    let label = match paths.is_empty() {
+        true => target.label(),
+        false => format!("{} · {}", target.label(), paths.join(", ")),
+    };
     let mut count = 0;
     for f in files.iter_mut().filter(|f| f.skipped.is_none()) {
         count += 1;
@@ -506,10 +561,11 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
     let budget: usize = env_or("ASSISTANT_REVIEW_MAX_CHARS", "").parse().unwrap_or(DEFAULT_MAX_CHARS).max(4_000);
     let batches = batch(&mut sections, budget, &mut notes);
     let all_files: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    let options = ChatOptions { temperature: Some(0.1), ..ChatOptions::default() };
+    let options = review_options();
     let mut usage = None;
     let mut summaries = Vec::new();
     let mut merged = ModelReview::default();
+    let mut failed = 0;
     for (i, part) in batches.iter().enumerate() {
         progress(if batches.len() > 1 {
             format!("модель смотрит часть {} из {}…", i + 1, batches.len())
@@ -517,22 +573,16 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
             "модель смотрит изменения…".into()
         });
         let part_sections: Vec<&FileSection> = part.iter().map(|&k| &sections[k]).collect();
-        let prompt = user_prompt(target, &stat.compared, &all_files, &part_sections, &docs, &code, &related);
+        let prompt = user_prompt(&label, &stat.compared, &all_files, &part_sections, &docs, &code, &related);
         let mut wire: Vec<RequestMessage> =
             [ChatMessage::system(system_prompt()), ChatMessage::user(prompt)].iter().map(RequestMessage::from).collect();
-        let first = a.client.chat_with_tools(a.client.model(), &wire, &[], false, &options).await?;
-        usage = sum_usage(usage, first.usage);
-        let parsed = match parse_model(&first.content) {
-            Ok(r) => Ok(r),
+        let parsed = match ask_part(a, &mut wire, &options, &mut usage).await {
+            Ok(parsed) => parsed,
             Err(err) => {
-                // Одна попытка исправить формат.
-                wire.push(RequestMessage::from(&ChatMessage::assistant(first.content.clone())));
-                wire.push(RequestMessage::from(&ChatMessage::user(format!(
-                    "Ответ не разобран как JSON ({err}). Верни то же ревью строго одним JSON-объектом по схеме, без текста вокруг."
-                ))));
-                let retry = a.client.chat_with_tools(a.client.model(), &wire, &[], false, &options).await?;
-                usage = sum_usage(usage, retry.usage);
-                parse_model(&retry.content).map_err(|_| retry.content)
+                // Часть не удалась — остальные всё равно смотрим.
+                notes.push(format!("часть {}: {}", i + 1, short(&format!("{err:#}"), 200)));
+                failed += 1;
+                continue;
             }
         };
         match parsed {
@@ -551,6 +601,9 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
             }
         }
     }
+    if failed == batches.len() {
+        bail!("модель не ответила ни на одну часть ревью: {}", notes.join("; "));
+    }
     let finish = |items: Vec<Finding>| {
         let mut items = dedup(items);
         items.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.file.cmp(&b.file)).then_with(|| a.line.cmp(&b.line)));
@@ -558,12 +611,12 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
     };
     notes.dedup();
     Ok(Review {
-        target: target.label(),
+        target: label,
         compared: stat.compared,
         model: a.client.model().to_string(),
         files,
-        added: stat.added,
-        deleted: stat.deleted,
+        added,
+        deleted,
         summary: summaries.join("\n\n"),
         bugs: finish(merged.bugs),
         architecture: finish(merged.architecture),
@@ -575,6 +628,48 @@ pub async fn run(a: &Assistant, target: &Target, progress: Progress<'_>) -> Resu
         tool_calls: log,
         usage,
     })
+}
+
+/// Параметры запроса ревью. Рассуждения модели выключены
+/// (`ASSISTANT_REVIEW_REASONING=on` — включить): на ревью они дают в разы
+/// больше токенов, а без стриминга OpenRouter может не дождаться ответа и за
+/// несколько минут. Выключаются параметром OpenRouter — другим провайдерам
+/// незнакомое поле не отправляется.
+fn review_options() -> ChatOptions {
+    let mut options = ChatOptions { temperature: Some(0.1), ..ChatOptions::default() };
+    let reasoning = matches!(env_or("ASSISTANT_REVIEW_REASONING", "off").as_str(), "on" | "1" | "true");
+    if !reasoning && env_or("LLM_API_URL", "").contains("openrouter.ai") {
+        options.extra.insert("reasoning".into(), json!({ "enabled": false }));
+    }
+    options
+}
+
+/// Запрос одной части: при сбое или таймауте — ещё одна попытка; ответ не
+/// JSON — одна просьба исправить формат. `Err(raw)` внутри `Ok` — модель
+/// ответила, но не JSON (её текст идёт в итог как есть).
+async fn ask_part(
+    a: &Assistant,
+    wire: &mut Vec<RequestMessage>,
+    options: &ChatOptions,
+    usage: &mut Option<Usage>,
+) -> Result<Result<ModelReview, String>> {
+    let first = match chat(&a.client, wire, &[], options).await {
+        Ok(c) => c,
+        Err(_) => chat(&a.client, wire, &[], options).await?,
+    };
+    *usage = sum_usage(*usage, first.usage);
+    match parse_model(&first.content) {
+        Ok(r) => Ok(Ok(r)),
+        Err(err) => {
+            wire.push(RequestMessage::from(&ChatMessage::assistant(first.content.clone())));
+            wire.push(RequestMessage::from(&ChatMessage::user(format!(
+                "Ответ не разобран как JSON ({err}). Верни то же ревью строго одним JSON-объектом по схеме, без текста вокруг."
+            ))));
+            let retry = chat(&a.client, wire, &[], options).await?;
+            *usage = sum_usage(*usage, retry.usage);
+            Ok(parse_model(&retry.content).map_err(|_| retry.content))
+        }
+    }
 }
 
 fn parse_git<T: for<'de> Deserialize<'de>>(result: Result<String, String>, tool: &str) -> Result<T> {
@@ -909,7 +1004,7 @@ fn system_prompt() -> String {
 }
 
 fn user_prompt(
-    target: &Target,
+    label: &str,
     compared: &str,
     all_files: &[&str],
     sections: &[&FileSection],
@@ -917,7 +1012,7 @@ fn user_prompt(
     code: &[RagSource],
     related: &BTreeMap<String, Vec<String>>,
 ) -> String {
-    let mut s = format!("Ревью: {} ({compared}).\nВсе изменённые файлы: {}\n", target.label(), all_files.join(", "));
+    let mut s = format!("Ревью: {label} ({compared}).\nИзменённые файлы в ревью: {}\n", all_files.join(", "));
     if sections.len() < all_files.len() {
         let here: Vec<&str> = sections.iter().map(|s| s.path.as_str()).collect();
         s.push_str(&format!("В этой части — только: {}\n", here.join(", ")));
@@ -964,6 +1059,34 @@ mod tests {
         assert_eq!(Target::parse("main...", "x").unwrap(), Target::Range { base: "main".into(), head: "HEAD".into() });
         assert_eq!(Target::parse("..feature", "main").unwrap(), Target::Range { base: "main".into(), head: "feature".into() });
         assert!(Target::parse("main feature", "main").is_err());
+    }
+
+    #[test]
+    fn parses_args_with_paths() {
+        let is_path = |p: &str| matches!(p, "assistant/src/tui.rs" | "core/src/rag" | "docs");
+        let parse = |s: &str| parse_args(&s.split_whitespace().collect::<Vec<_>>(), "main", is_path).unwrap();
+        assert_eq!(parse(""), (Target::Branch { base: "main".into() }, vec![]));
+        assert_eq!(parse("--wip assistant/src/tui.rs"), (Target::Wip, vec!["assistant/src/tui.rs".to_string()]));
+        assert_eq!(parse("dev ./core/src/rag/"), (Target::Branch { base: "dev".into() }, vec!["core/src/rag".to_string()]));
+        // Первое слово — существующий путь: цель по умолчанию.
+        assert_eq!(parse("assistant/src/tui.rs docs"), (Target::Branch { base: "main".into() }, vec!["assistant/src/tui.rs".to_string(), "docs".to_string()]));
+        // `--` — всё дальше пути, даже если похоже на ветку.
+        assert_eq!(
+            parse("main..feature -- docs"),
+            (Target::Range { base: "main".into(), head: "feature".into() }, vec!["docs".to_string()])
+        );
+        assert_eq!(parse("-- dev"), (Target::Branch { base: "main".into() }, vec!["dev".to_string()]));
+        assert_eq!(parse("main ."), (Target::Branch { base: "main".into() }, vec![]));
+    }
+
+    #[test]
+    fn scope_matches_files_and_dirs() {
+        let paths = vec!["core/src/rag".to_string(), "README.md".to_string()];
+        assert!(in_scope("core/src/rag/mod.rs", &paths));
+        assert!(in_scope("README.md", &paths));
+        assert!(!in_scope("core/src/ragged.rs", &paths));
+        assert!(!in_scope("docs/README.md", &paths));
+        assert!(in_scope("anything.rs", &[]));
     }
 
     #[test]
