@@ -194,7 +194,7 @@ async fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, assis
                 AppEvent::Review(result) => {
                     match result {
                         Ok(review) => {
-                            app.entries.push(mcp_summary_entry(&review.tool_calls, "вызывал код ревью"));
+                            app.entries.push(mcp_summary_entry(&review.tool_calls, ""));
                             for note in &review.notes {
                                 app.entries.push(Entry { kind: Kind::Context, text: format!("⚠ {note}") });
                             }
@@ -333,8 +333,8 @@ fn submit(app: &mut App, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
                     Ok(reply) => {
                         let mut out = vec![Entry { kind: Kind::Context, text: reply.context_lines().join("\n") }];
                         for (i, call) in reply.tool_calls.iter().enumerate() {
-                            // Первым идёт git_branch, который код вызывает сам до вопроса модели.
-                            let who = if i == 0 && call.tool == "git_branch" { "вызвал код" } else { "вызвала модель" };
+                            // Первым идёт git_branch, который код вызывает сам до вопроса модели, — без подписи.
+                            let who = if i == 0 && call.tool == "git_branch" { "" } else { "вызвала модель" };
                             out.push(mcp_entry(call, who));
                         }
                         out.push(Entry { kind: Kind::Answer, text: with_usage(reply.text, reply.usage) });
@@ -410,7 +410,16 @@ fn mcp_entry(call: &ToolCallRecord, who: &str) -> Entry {
     };
     Entry {
         kind,
-        text: format!("{server} › {}({args})  {mark} · {who}\n  ↳ {}", call.tool, call.result_preview(180)),
+        text: format!("{server} › {}({args})  {mark}{}\n  ↳ {}", call.tool, caller(who), call.result_preview(180)),
+    }
+}
+
+/// ` · вызвала модель` — кто вызвал; пусто — вызов сделал сам ассистент, без подписи.
+fn caller(who: &str) -> String {
+    if who.is_empty() {
+        String::new()
+    } else {
+        format!(" · {who}")
     }
 }
 
@@ -436,7 +445,7 @@ fn mcp_summary_entry(calls: &[ToolCallRecord], who: &str) -> Entry {
     let mark = if errors > 0 { format!("✗ ошибок {errors}") } else { "✓".into() };
     Entry {
         kind: if errors > 0 { Kind::McpError } else { Kind::Mcp },
-        text: format!("{server} › вызовов {}  {mark} · {who}\n  ↳ {}", calls.len(), list.join(", ")),
+        text: format!("{server} › вызовов {}  {mark}{}\n  ↳ {}", calls.len(), caller(who), list.join(", ")),
     }
 }
 
@@ -761,16 +770,16 @@ mod tests {
 
     #[test]
     fn mcp_calls_are_marked() {
-        let e = mcp_entry(&call("git_branch", "{}", false), "вызвал код");
+        let e = mcp_entry(&call("git_branch", "{}", false), "");
         assert!(e.kind == Kind::Mcp);
-        assert_eq!(e.text, "git › git_branch()  ✓ · вызвал код\n  ↳ {\"branch\": \"day-30\"}");
+        assert_eq!(e.text, "git › git_branch()  ✓\n  ↳ {\"branch\": \"day-30\"}");
         let e = mcp_entry(&call("read_file", r#"{"path":"x"}"#, true), "вызвала модель");
         assert!(e.kind == Kind::McpError);
         assert!(e.text.starts_with(r#"git › read_file({"path":"x"})  ✗ ошибка · вызвала модель"#));
 
         let calls = [call("git_diff", "{}", false), call("read_file", "{}", false), call("read_file", "{}", true)];
-        let e = mcp_summary_entry(&calls, "вызывал код ревью");
-        assert_eq!(e.text, "git › вызовов 3  ✗ ошибок 1 · вызывал код ревью\n  ↳ git_diff ×1, read_file ×2 (ошибок 1)");
+        let e = mcp_summary_entry(&calls, "");
+        assert_eq!(e.text, "git › вызовов 3  ✗ ошибок 1\n  ↳ git_diff ×1, read_file ×2 (ошибок 1)");
 
         let mut rag = call("search_docs", r#"{"query":"RAG"}"#, false);
         rag.server = Some(help::RAG_SERVER.into());
