@@ -135,7 +135,7 @@ fn mcp_tools_offered(task: Option<&TaskState>) -> bool {
 /// Складывает метрики токенов/стоимости двух обменов — используется, чтобы
 /// показать пользователю честную сумму по всем кругам вызова инструментов
 /// внутри одного обмена ([`Agent::run_tool_loop`]), а не только последний.
-fn sum_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
+pub fn sum_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
     fn add_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
         match (a, b) {
             (Some(a), Some(b)) => Some(a + b),

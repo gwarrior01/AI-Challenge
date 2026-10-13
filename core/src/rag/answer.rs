@@ -557,7 +557,7 @@ pub fn finalize(text: &str, ctx: &RagContext, check: &mut AnswerCheck) -> String
 }
 
 /// Строки блока «Источники» — из данных поиска.
-fn sources_block(ctx: &RagContext, cited: &[usize]) -> String {
+pub fn sources_block(ctx: &RagContext, cited: &[usize]) -> String {
     let mut s = String::new();
     for &n in cited {
         let src = &ctx.sources[n - 1];

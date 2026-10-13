@@ -19,3 +19,12 @@ rag/index.db-wal
 rag/index.db-shm
 rag/uploads/
 gateway/gateway.toml
+rag/project.db
+rag/project.db-journal
+rag/project.db-wal
+rag/project.db-shm
+rag/code.db
+rag/code.db-journal
+rag/code.db-wal
+rag/code.db-shm
+review.md

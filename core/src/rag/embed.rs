@@ -116,16 +116,33 @@ impl Embedder {
     async fn request(&self, input: &[String]) -> Result<Embedded> {
         let url = format!("{}/embeddings", self.base_url);
         let body = serde_json::json!({ "model": self.model, "input": input });
-        let mut request = self.http.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request.send().await.with_context(|| format!("нет связи с сервером эмбеддингов {url}"))?;
-        let status = response.status();
-        let raw = response.text().await.context("не удалось прочитать ответ сервера эмбеддингов")?;
-        if !status.is_success() {
-            bail!("сервер эмбеддингов ({}) вернул ошибку {status}: {}", self.model, raw.trim());
-        }
+        // Перегрузка (429) и сбои сервера (5xx) у облачных провайдеров бывают
+        // короткими — повторяем с растущей паузой (или сколько скажет Retry-After).
+        let mut attempt = 0;
+        let raw = loop {
+            let mut request = self.http.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            let response = request.send().await.with_context(|| format!("нет связи с сервером эмбеддингов {url}"))?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let raw = response.text().await.context("не удалось прочитать ответ сервера эмбеддингов")?;
+            if status.is_success() {
+                break raw;
+            }
+            let transient = status.as_u16() == 429 || status.is_server_error();
+            if !transient || attempt >= MAX_RETRIES {
+                bail!("сервер эмбеддингов ({}) вернул ошибку {status}: {}", self.model, raw.trim());
+            }
+            let wait = retry_after.unwrap_or(2u64 << attempt).min(30);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            attempt += 1;
+        };
         let parsed: Response = serde_json::from_str(&raw)
             .with_context(|| format!("не удалось разобрать ответ сервера эмбеддингов: {}", preview(&raw)))?;
         if parsed.data.len() != input.len() {
@@ -146,6 +163,9 @@ impl Embedder {
         Ok(Embedded { vectors, tokens })
     }
 }
+
+/// Сколько раз повторять запрос после 429/5xx (паузы 2, 4, 8, 16 с).
+const MAX_RETRIES: u32 = 4;
 
 fn preview(raw: &str) -> String {
     match raw.char_indices().nth(300) {
