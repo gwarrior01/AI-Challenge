@@ -225,6 +225,21 @@ fn vector_key(model: &str, prefix: &str, text: &str) -> String {
     corpus::sha256_hex(format!("{model}\n{prefix}{text}").as_bytes())
 }
 
+/// Очищает индекс, если он собран не той моделью эмбеддингов, что задана
+/// сейчас. Годится для индекса, который целиком выводится из файлов и
+/// пересобирается сам (документация проекта для ассистента разработчика), —
+/// не для общего индекса с загруженными документами. `true` — очищен.
+pub fn reset_if_model_changed(cfg: &RagConfig, embedder: &Embedder) -> Result<bool> {
+    let mut store = Store::open(&cfg.db_path)?;
+    match store.meta(META_MODEL)? {
+        Some(indexed) if indexed != embedder.model() => {
+            store.reset()?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Индекс собран той же моделью, что задана сейчас: векторы разных
 /// моделей сравнивать нельзя.
 fn check_model(store: &Store, embedder: &Embedder) -> Result<()> {

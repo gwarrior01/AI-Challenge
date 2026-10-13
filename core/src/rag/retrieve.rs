@@ -364,7 +364,10 @@ async fn try_retrieve(
     retrieve_in(&cfg, &embedder, question, settings, llm, dialog).await
 }
 
-async fn retrieve_in(
+/// [`retrieve`] по заданному индексу и эмбеддеру, с ошибкой наружу — так ищет
+/// ассистент разработчика по своему индексу документации проекта
+/// (крейт `assistant`).
+pub async fn retrieve_in(
     cfg: &RagConfig,
     embedder: &Embedder,
     question: &str,
@@ -458,7 +461,8 @@ async fn retrieve_in(
     Ok(ctx)
 }
 
-fn to_source(n: usize, before: usize, h: &super::SearchHit, rerank_score: Option<f32>) -> RagSource {
+/// Найденный чанк — фрагмент для контекста модели под номером `n`.
+pub fn to_source(n: usize, before: usize, h: &super::SearchHit, rerank_score: Option<f32>) -> RagSource {
     let c = &h.hit.chunk;
     // Текст без пустых строк по краям, а первая строка — та, с которой он
     // теперь начинается: по ней считаются строки цитат.
@@ -481,7 +485,7 @@ fn to_source(n: usize, before: usize, h: &super::SearchHit, rerank_score: Option
 }
 
 /// Первые `max` символов строки — для сообщений об ошибках.
-pub(crate) fn short(s: &str, max: usize) -> String {
+pub fn short(s: &str, max: usize) -> String {
     let t: String = s.chars().take(max).collect();
     if t.len() < s.len() {
         format!("{t}…")
