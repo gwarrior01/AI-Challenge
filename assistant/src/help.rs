@@ -290,7 +290,7 @@ pub async fn ask(a: &Assistant, question: &str, progress: Progress<'_>) -> Resul
         // Последний круг — без инструментов: ответ текстом по тому, что уже есть.
         let offered: &[ToolDefinition] = if round == MAX_TOOL_ROUNDS { &[] } else { &tools };
         progress("модель думает…".into());
-        let completion = client.chat_with_tools(client.model(), &wire, offered, false, &options).await?;
+        let completion = crate::context::chat(client, &wire, offered, &options).await?;
         usage = sum_usage(usage, completion.usage);
         if !completion.content.trim().is_empty() {
             parts.push(completion.content.clone());

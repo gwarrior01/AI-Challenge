@@ -38,6 +38,7 @@ const COMMANDS: &str = "Команды:
   /review [base]                — ревью текущей ветки с незакоммиченным против base (по умолчанию main)
   /review <base>..<head>        — ревью ветки head против base (только закоммиченное)
   /review --wip                 — ревью только незакоммиченного
+  /review [цель] <путь…>        — ревью только этих файлов и каталогов (/review --wip assistant/src/tui.rs)
   /save [файл]                  — сохранить последнее ревью в Markdown (по умолчанию review.md)
   /diff [цель]                  — какие файлы изменены и дифф (цель — как у /review), без модели
   /status                       — git status
@@ -53,7 +54,7 @@ const COMMANDS: &str = "Команды:
 /// Команды TUI и подсказки к ним — для подсветки ввода и строки состояния.
 const COMMAND_HINTS: &[(&str, &str)] = &[
     ("help", "/help <вопрос> — вопрос о проекте: поиск в документации и коде (RAG) и git (MCP); без вопроса — обзор"),
-    ("review", "/review [base | base..head | --wip] — ревью ветки против base (main), двух веток или незакоммиченного"),
+    ("review", "/review [base | base..head | --wip] [путь…] — ревью ветки против base (main), двух веток или незакоммиченного; пути сужают ревью"),
     ("save", "/save [файл] — сохранить последнее ревью (review.md; .json — в JSON)"),
     ("diff", "/diff [base | base..head | --wip] — изменённые файлы и дифф, без модели"),
     ("status", "/status — git status: что изменено и не закоммичено"),
@@ -346,20 +347,23 @@ fn submit(app: &mut App, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
             });
         }
         "review" => {
-            let target = match Target::parse(&rest, &default_base) {
-                Ok(t) => t,
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let is_path = |p: &str| std::path::Path::new(p).exists();
+            let (target, paths) = match review::parse_args(&words, &default_base, is_path) {
+                Ok(parsed) => parsed,
                 Err(err) => {
                     app.entries.push(Entry { kind: Kind::Error, text: format!("{err:#}\n{}", review::USAGE) });
                     return false;
                 }
             };
-            app.busy = Some(format!("ревью: {}…", target.label()));
+            let scope = if paths.is_empty() { String::new() } else { format!(" · {}", paths.join(", ")) };
+            app.busy = Some(format!("ревью: {}{scope}…", target.label()));
             tokio::spawn(async move {
                 let progress_tx = tx.clone();
                 let progress = move |msg: String| {
                     let _ = progress_tx.send(AppEvent::Progress(msg));
                 };
-                let result = review::run(&a, &target, &progress).await.map_err(|e| format!("{e:#}"));
+                let result = review::run(&a, &target, &paths, &progress).await.map_err(|e| format!("{e:#}"));
                 let _ = tx.send(AppEvent::Review(result));
             });
         }

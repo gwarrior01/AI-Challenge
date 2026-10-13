@@ -3,8 +3,9 @@
 //! ```text
 //! code-assistant                         — TUI: /help, /review, /diff, /status, /files, /log, /save
 //! code-assistant help [вопрос]           — ответ о проекте (README + docs/ через RAG, git через MCP)
-//! code-assistant review [цель] [флаги]   — ревью без интерфейса (годится для CI)
+//! code-assistant review [цель] [путь…] [флаги]   — ревью без интерфейса (годится для CI)
 //!     цель: <base> (по умолчанию main) | <base>..<head> | --wip
+//!     путь: файлы и каталоги, которыми ограничено ревью (или --path <путь>, или после --)
 //!     --base <ветка> --head <ветка>      — то же, что <base>..<head>
 //!     --format md|json                   — текст ревью или JSON (по умолчанию md)
 //!     --out <файл>                       — записать в файл (иначе stdout)
@@ -31,12 +32,18 @@ const USAGE: &str = "code-assistant — ассистент разработчи�
 
   code-assistant                         TUI (команды — /? внутри)
   code-assistant help [вопрос]           вопрос о проекте: README + docs/ (RAG) и git (MCP)
-  code-assistant review [цель] [флаги]   ревью изменений без интерфейса
+  code-assistant review [цель] [путь…] [флаги]   ревью изменений без интерфейса
 
 Цель ревью:
   <base>             текущая ветка с незакоммиченным против точки ответвления от base (по умолчанию main)
   <base>..<head>     закоммиченное в head против base (или --base <base> --head <head>)
   --wip              только незакоммиченное
+
+Пути (необязательно): файлы и каталоги, которыми ограничено ревью —
+  code-assistant review --wip assistant/src/tui.rs
+  code-assistant review main core/src/rag docs
+  code-assistant review main..feature -- assistant/      (-- — всё дальше пути)
+  --path <путь>      то же флагом, можно несколько раз
 
 Флаги ревью:
   --format md|json                   текст ревью (Markdown) или JSON, по умолчанию md
@@ -99,22 +106,29 @@ async fn cli_help(question: &str) -> Result<()> {
 #[derive(Debug, PartialEq)]
 struct ReviewArgs {
     target: Target,
+    paths: Vec<String>,
     json: bool,
     out: Option<String>,
     fail_on: Option<Severity>,
 }
 
-fn parse_review_args(args: &[String], default_base: &str) -> Result<ReviewArgs> {
-    let mut positional: Option<String> = None;
+/// `is_path` — существует ли такой файл или каталог (см. [`review::parse_args`]).
+fn parse_review_args(args: &[String], default_base: &str, is_path: impl Fn(&str) -> bool) -> Result<ReviewArgs> {
+    let mut words: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
     let (mut base, mut head, mut wip) = (None, None, false);
     let (mut json, mut out, mut fail_on) = (false, None, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().cloned().with_context(|| format!("{name}: не указано значение"));
         match arg.as_str() {
+            "--" => {
+                paths.extend(it.by_ref().cloned());
+            }
             "--wip" => wip = true,
             "--base" => base = Some(value("--base")?),
             "--head" => head = Some(value("--head")?),
+            "--path" => paths.push(value("--path")?),
             "--out" => out = Some(value("--out")?),
             "--format" => {
                 json = match value("--format")?.as_str() {
@@ -131,29 +145,44 @@ fn parse_review_args(args: &[String], default_base: &str) -> Result<ReviewArgs> 
                 }
             }
             flag if flag.starts_with("--") => bail!("неизвестный флаг «{flag}»\n\n{USAGE}"),
-            _ if positional.is_none() => positional = Some(arg.clone()),
-            _ => bail!("лишний аргумент «{arg}»"),
+            _ => words.push(arg.clone()),
         }
     }
-    let target = match (wip, positional, base, head) {
-        (true, None, None, None) => Target::Wip,
-        (true, ..) => bail!("--wip не сочетается с другими целями"),
-        (false, Some(_), Some(_), _) | (false, Some(_), _, Some(_)) => bail!("цель — либо позиционно, либо --base/--head"),
-        (false, Some(p), None, None) => Target::parse(&p, default_base)?,
-        (false, None, base, Some(head)) => Target::Range { base: base.unwrap_or_else(|| default_base.into()), head },
-        (false, None, Some(base), None) => Target::Branch { base },
-        (false, None, None, None) => Target::Branch { base: default_base.into() },
+    let flags = wip || base.is_some() || head.is_some();
+    let target = if flags {
+        // Цель задана флагами — все слова пути.
+        paths.splice(0..0, words.drain(..));
+        match (wip, base, head) {
+            (true, None, None) => Target::Wip,
+            (true, ..) => bail!("--wip не сочетается с --base/--head"),
+            (false, base, Some(head)) => Target::Range { base: base.unwrap_or_else(|| default_base.into()), head },
+            (false, Some(base), None) => Target::Branch { base },
+            (false, None, None) => unreachable!("flags"),
+        }
+    } else {
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let (target, scoped) = review::parse_args(&refs, default_base, &is_path)?;
+        paths.splice(0..0, scoped);
+        target
     };
-    Ok(ReviewArgs { target, json, out, fail_on })
+    let paths = paths
+        .iter()
+        .map(|p| p.trim().trim_start_matches("./").trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty() && p != ".")
+        .collect();
+    Ok(ReviewArgs { target, paths, json, out, fail_on })
 }
 
 async fn cli_review(args: &[String]) -> Result<ExitCode> {
     let default_base = context::env_or("ASSISTANT_REVIEW_BASE", review::DEFAULT_BASE);
-    let args = parse_review_args(args, &default_base)?;
+    let args = parse_review_args(args, &default_base, |p| std::path::Path::new(p).exists())?;
     let a = Assistant::from_env()?;
-    eprintln!("ревью: {}", args.target.label());
+    match args.paths.is_empty() {
+        true => eprintln!("ревью: {}", args.target.label()),
+        false => eprintln!("ревью: {} · {}", args.target.label(), args.paths.join(", ")),
+    }
     let progress = |msg: String| eprintln!("… {msg}");
-    let review = review::run(&a, &args.target, &progress).await?;
+    let review = review::run(&a, &args.target, &args.paths, &progress).await?;
     let text = if args.json { review.to_json() } else { review.to_markdown() };
     match &args.out {
         Some(path) => {
@@ -186,21 +215,41 @@ mod tests {
         s.split_whitespace().map(str::to_string).collect()
     }
 
+    fn parse(s: &str) -> Result<ReviewArgs> {
+        parse_review_args(&args(s), "main", |p| matches!(p, "assistant/src/tui.rs" | "docs"))
+    }
+
     #[test]
     fn review_args() {
-        let r = parse_review_args(&args(""), "main").unwrap();
-        assert_eq!(r, ReviewArgs { target: Target::Branch { base: "main".into() }, json: false, out: None, fail_on: None });
-        let r = parse_review_args(&args("main..feature --format json --out r.json --fail-on high"), "main").unwrap();
+        let r = parse("").unwrap();
+        assert_eq!(
+            r,
+            ReviewArgs { target: Target::Branch { base: "main".into() }, paths: vec![], json: false, out: None, fail_on: None }
+        );
+        let r = parse("main..feature --format json --out r.json --fail-on high").unwrap();
         assert_eq!(r.target, Target::Range { base: "main".into(), head: "feature".into() });
         assert!(r.json);
         assert_eq!(r.out.as_deref(), Some("r.json"));
         assert_eq!(r.fail_on, Some(Severity::High));
-        let r = parse_review_args(&args("--head feature"), "dev").unwrap();
+        let r = parse_review_args(&args("--head feature"), "dev", |_| false).unwrap();
         assert_eq!(r.target, Target::Range { base: "dev".into(), head: "feature".into() });
-        assert_eq!(parse_review_args(&args("--wip"), "main").unwrap().target, Target::Wip);
-        assert!(parse_review_args(&args("--wip main"), "main").is_err());
-        assert!(parse_review_args(&args("--format xml"), "main").is_err());
-        assert!(parse_review_args(&args("--fail-on"), "main").is_err());
-        assert!(parse_review_args(&args("--oops"), "main").is_err());
+        assert_eq!(parse("--wip").unwrap().target, Target::Wip);
+        assert!(parse("--wip --base main").is_err());
+        assert!(parse("--format xml").is_err());
+        assert!(parse("--fail-on").is_err());
+        assert!(parse("--oops").is_err());
+    }
+
+    #[test]
+    fn review_args_with_paths() {
+        let r = parse("--wip assistant/src/tui.rs").unwrap();
+        assert_eq!((r.target, r.paths), (Target::Wip, vec!["assistant/src/tui.rs".to_string()]));
+        let r = parse("assistant/src/tui.rs --fail-on high").unwrap();
+        assert_eq!((r.target, r.paths), (Target::Branch { base: "main".into() }, vec!["assistant/src/tui.rs".to_string()]));
+        let r = parse("dev ./docs/ --path core/src").unwrap();
+        assert_eq!((r.target, r.paths), (Target::Branch { base: "dev".into() }, vec!["docs".to_string(), "core/src".to_string()]));
+        let r = parse("--format json -- main").unwrap();
+        assert!(r.json);
+        assert_eq!((r.target, r.paths), (Target::Branch { base: "main".into() }, vec!["main".to_string()]));
     }
 }

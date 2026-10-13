@@ -84,6 +84,9 @@ struct ChatRequest<'a> {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
+    /// Параметры конкретного провайдера (см. [`ChatOptions::extra`]) — в корень тела запроса.
+    #[serde(flatten)]
+    extra: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// Описание одного инструмента (function calling, формат OpenAI-совместимого
@@ -194,6 +197,10 @@ pub struct ChatOptions {
     /// Явно включить (`Some(true)`) или выключить (`Some(false)`) режим рассуждений.
     /// `None` — не переопределять, поведение модели по умолчанию.
     pub reasoning: Option<bool>,
+    /// Дополнительные поля тела запроса для конкретного провайдера, как есть
+    /// (например, `"reasoning": {"enabled": false}` у OpenRouter). Пусто — ничего
+    /// не добавляется: строгие API (OpenAI) отклоняют незнакомые поля.
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -451,6 +458,7 @@ impl LlmClient {
             enable_thinking: options.reasoning,
             tools: (!tools.is_empty()).then(|| tools.iter().map(ToolDefinition::to_wire).collect()),
             tool_choice: (!tools.is_empty()).then_some(if require_tool_call { "required" } else { "auto" }),
+            extra: &options.extra,
         };
         let request_json =
             serde_json::to_string_pretty(&body).context("не удалось сериализовать запрос")?;
