@@ -1,4 +1,9 @@
 //! Read-only MCP server that exposes demo CRM users and support tickets.
+//!
+//! By default it speaks stdio: the client starts it as a child process
+//! (`support/mcp.json`, `mcp.example.json`: `cargo run -q -p support-mcp`).
+//! With `--http` it serves Streamable HTTP on `127.0.0.1:8095/mcp`
+//! (`SUPPORT_MCP_ADDR`). Data comes from `support/data` (`SUPPORT_DATA_DIR`).
 
 mod store;
 
@@ -11,18 +16,25 @@ use rmcp::{
     transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
-    ServerHandler,
+    ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use store::{Store, Ticket, User};
+use store::{Store, Ticket, TicketSummary, User};
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8094";
+const DEFAULT_ADDR: &str = "127.0.0.1:8095";
 const DEFAULT_DATA_DIR: &str = "support/data";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IdParams {
     /// Exact identifier, for example TCK-1001 or USR-001.
     id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListParams {
+    /// Only tickets with this status (open, resolved, …); omit for all.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -35,6 +47,11 @@ struct TicketContext {
 struct TicketList {
     user: User,
     tickets: Vec<Ticket>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct TicketIndex {
+    tickets: Vec<TicketSummary>,
 }
 
 #[derive(Clone)]
@@ -92,6 +109,17 @@ impl SupportServer {
         let tickets = self.store.user_tickets(&p.id);
         Ok(Json(TicketList { user, tickets }))
     }
+
+    #[tool(
+        name = "list_tickets",
+        description = "Return a short list of all tickets (id, customer, subject, status, priority), newest first, optionally filtered by status.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_tickets(&self, Parameters(p): Parameters<ListParams>) -> Json<TicketIndex> {
+        Json(TicketIndex {
+            tickets: self.store.tickets(p.status.as_deref()),
+        })
+    }
 }
 
 #[tool_handler]
@@ -107,13 +135,26 @@ impl ServerHandler for SupportServer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let addr = std::env::var("SUPPORT_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into());
     let data_dir = std::env::var("SUPPORT_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.into());
     let store = Store::load(&data_dir)?;
+    // In stdio mode stdout is the protocol channel: diagnostics go to stderr only.
     eprintln!("support-mcp: данные из {data_dir}");
 
+    if !std::env::args().any(|a| a == "--http") {
+        let service = SupportServer { store }
+            .serve(rmcp::transport::stdio())
+            .await?;
+        service.waiting().await?;
+        return Ok(());
+    }
+
+    let addr = std::env::var("SUPPORT_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into());
     let service = StreamableHttpService::new(
-        move || Ok(SupportServer { store: store.clone() }),
+        move || {
+            Ok(SupportServer {
+                store: store.clone(),
+            })
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );

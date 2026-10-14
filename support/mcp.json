@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "support": {
+      "description": "CRM поддержки: пользователи и тикеты из support/data — только чтение (свой сервер mcp/support-mcp, stdio: сервис запускает его сам)",
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "support-mcp"]
+    }
+  }
+}

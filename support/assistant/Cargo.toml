@@ -1,0 +1,16 @@
+[package]
+name = "support-assistant"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "support-assistant"
+path = "src/main.rs"
+
+[dependencies]
+llm-core = { path = "../../core" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
