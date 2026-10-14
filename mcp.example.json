@@ -28,6 +28,11 @@
       "url": "http://127.0.0.1:8093/mcp",
       "timeout_sec": 1800
     },
+    "support": {
+      "description": "CRM поддержки: пользователи и тикеты из support/data — только чтение (свой сервер mcp/support-mcp, stdio: клиент запускает его сам)",
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "support-mcp"]
+    },
     "git": {
       "description": "Git-репозиторий проекта для ассистента разработчика (/help): ветка, статус, файлы, дифф, журнал — только чтение (свой сервер, stdio: клиент запускает его сам)",
       "command": "cargo",

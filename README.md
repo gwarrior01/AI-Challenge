@@ -270,6 +270,18 @@ Every reply carries `now` — the server's time, since the model does not know i
 
 **Self-protection.** A periodic job that fails `SCHEDULER_MAX_FAILURES` times in a row (5) is paused with the reason and a `job_paused` event — e.g. the JVM it watched was restarted and got a new pid. Runs and acknowledged events older than `SCHEDULER_RETENTION_DAYS` (7) are deleted hourly.
 
+#### Support assistant: RAG + CRM over MCP (`support-assistant`, `support-mcp`)
+
+A separate mini-service for user support of the demo product CloudDesk. It works both as a product assistant (features, plans, how-tos — RAG over the product docs and FAQ in `support/knowledge/*.md`, its own index `rag/support.db`) and as support for a specific ticket, taking the customer's data into account (CRM over MCP: own read-only server `mcp/support-mcp`, users and tickets in `support/data/*.json`).
+
+```bash
+cargo run -p support-assistant                  # http://127.0.0.1:8096 — chat page + JSON API
+cargo run -p support-assistant -- ask "Тикет TCK-1001. Почему не работает авторизация?"
+cargo run -p support-assistant -- tickets
+```
+
+Per question: the ticket id (named in the question, passed as `ticket_id`, or remembered by the session) is looked up by code via MCP `get_ticket` — not left to the model; the knowledge base is searched by the question itself and, with a ticket, also by the question plus the ticket's subject and error code; the model gets both, may search again or call `list_user_tickets`/`get_user` itself, and answers with `[n]` citations. Sessions keep the ticket and recent turns, so follow-ups work without repeating the id. The service starts `support-mcp` itself over stdio (`support/mcp.json`); `support-mcp --http` serves Streamable HTTP on `127.0.0.1:8095` instead. API, settings, demo prompts and the video plan: [`docs/day-33-support-assistant.md`](docs/day-33-support-assistant.md).
+
 #### Own MCP server: documents (tool composition)
 
 `mcp/documents-mcp/` is the third own server: three separate tools that form one chain — the first gets the data, the second processes it, the third saves the result. The server has no "run everything" tool on purpose: the chain is composed by the agent, which plans the three calls and then makes them one after another, passing the id from one result into the next call's arguments.
