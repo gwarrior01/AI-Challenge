@@ -270,6 +270,17 @@ Every reply carries `now` — the server's time, since the model does not know i
 
 **Self-protection.** A periodic job that fails `SCHEDULER_MAX_FAILURES` times in a row (5) is paused with the reason and a `job_paused` event — e.g. the JVM it watched was restarted and got a new pid. Runs and acknowledged events older than `SCHEDULER_RETENTION_DAYS` (7) are deleted hourly.
 
+#### Own MCP server: support CRM (RAG + ticket context)
+
+`mcp/support-mcp/` is a read-only demo CRM for the user-support scenario. It reads users and tickets from `support/data/*.json` and exposes three tools: `get_ticket` (ticket plus its customer), `get_user`, and `list_user_tickets`. It listens on `127.0.0.1:8094` by default and is already present in `mcp.example.json`.
+
+```bash
+cargo run -p support-mcp
+llm-cli mcp call support get_ticket '{"id":"TCK-1001"}'
+```
+
+The intended assistant combines two independent context sources: product instructions from the existing RAG index (`support/knowledge/*.md`) and customer-specific facts from this MCP server. Named-agent history keeps follow-up questions in context. A complete setup, demo prompts, expected behavior, and a short video script are in [`docs/day-33-support-assistant.md`](docs/day-33-support-assistant.md).
+
 #### Own MCP server: documents (tool composition)
 
 `mcp/documents-mcp/` is the third own server: three separate tools that form one chain — the first gets the data, the second processes it, the third saves the result. The server has no "run everything" tool on purpose: the chain is composed by the agent, which plans the three calls and then makes them one after another, passing the id from one result into the next call's arguments.

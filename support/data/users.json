@@ -1,0 +1,22 @@
+[
+  {
+    "id": "USR-001",
+    "name": "Анна Смирнова",
+    "email": "anna@example.com",
+    "plan": "Pro",
+    "status": "active",
+    "locale": "ru-RU",
+    "created_at": "2025-05-18T10:20:00Z",
+    "notes": ["Двухфакторная аутентификация включена", "Предпочитает ответы на русском"]
+  },
+  {
+    "id": "USR-002",
+    "name": "Иван Петров",
+    "email": "ivan@example.com",
+    "plan": "Free",
+    "status": "payment_hold",
+    "locale": "ru-RU",
+    "created_at": "2026-02-03T08:00:00Z",
+    "notes": ["Последний платёж отклонён банком"]
+  }
+]
