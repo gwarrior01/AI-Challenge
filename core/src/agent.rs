@@ -464,6 +464,72 @@ impl ToolCallRecord {
             flat
         }
     }
+
+    /// Кратко, без доводов: `сервер › инструмент`.
+    pub fn brief(&self) -> String {
+        match &self.server {
+            Some(server) => format!("{server} › {}", self.tool),
+            None => format!("автомат задачи › {}", self.tool),
+        }
+    }
+
+    /// Доводы целиком, построчно: JSON — с отступами, иначе как прислала модель.
+    pub fn arguments_pretty(&self) -> String {
+        let raw = self.arguments.trim();
+        if raw.is_empty() {
+            return "{}".into();
+        }
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| raw.to_string())
+    }
+}
+
+/// Как интерфейс показывает вызовы инструментов: не показывать, кратко
+/// (`сервер › инструмент`, без доводов) или для отладки — с доводами целиком
+/// и результатом. Влияет только на показ: модель и журнал получают вызов
+/// полностью в любом режиме.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallsView {
+    Hidden,
+    #[default]
+    Brief,
+    Debug,
+}
+
+impl CallsView {
+    /// Следующий режим по кругу: кратко → отладка → скрыты → кратко.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Brief => Self::Debug,
+            Self::Debug => Self::Hidden,
+            Self::Hidden => Self::Brief,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "скрыты",
+            Self::Brief => "кратко",
+            Self::Debug => "отладка",
+        }
+    }
+
+    /// `off`/`hidden`, `brief`/`short`, `debug`/`full` (и по-русски).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "hidden" | "hide" | "скрыть" | "скрыты" | "выкл" => Some(Self::Hidden),
+            "brief" | "short" | "on" | "кратко" => Some(Self::Brief),
+            "debug" | "full" | "отладка" | "полностью" => Some(Self::Debug),
+            _ => None,
+        }
+    }
+
+    /// Начальный режим из `TUI_CALLS` (`off|brief|debug`), иначе — кратко.
+    pub fn from_env() -> Self {
+        std::env::var("TUI_CALLS").ok().as_deref().and_then(Self::parse).unwrap_or_default()
+    }
 }
 
 /// Вызовы инструментов MCP-серверов в текущем (или последнем завершённом)
@@ -3966,6 +4032,27 @@ mod tests {
     //! перезапуска приложения (новый `AgentManager` над тем же файлом БД).
 
     use super::*;
+
+    #[test]
+    fn calls_view_cycles_and_formats() {
+        assert_eq!(CallsView::default(), CallsView::Brief);
+        assert_eq!(CallsView::Brief.next().next().next(), CallsView::Brief);
+        assert_eq!(CallsView::parse("debug"), Some(CallsView::Debug));
+        assert_eq!(CallsView::parse("скрыть"), Some(CallsView::Hidden));
+        assert_eq!(CallsView::parse("?"), None);
+        let call = ToolCallRecord {
+            server: Some("fs".into()),
+            tool: "read_file".into(),
+            arguments: r#"{"path":"a.rs","max_lines":5}"#.into(),
+            result: "ok".into(),
+            is_error: false,
+        };
+        assert_eq!(call.brief(), "fs › read_file");
+        assert_eq!(call.arguments_pretty(), "{\n  \"path\": \"a.rs\",\n  \"max_lines\": 5\n}");
+        let raw = ToolCallRecord { arguments: "not json".into(), server: None, ..call };
+        assert_eq!(raw.arguments_pretty(), "not json");
+        assert_eq!(raw.brief(), "автомат задачи › read_file");
+    }
     use crate::{ToolCallFunction, ToolCallWire};
     use std::sync::atomic::AtomicUsize;
 

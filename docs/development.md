@@ -34,6 +34,7 @@ cargo run -p llm-cli             # REPL; llm-cli agent … / mcp … / rag … /
 | `RAG_CORPUS`, `RAG_DB_PATH`, `RAG_UPLOADS`, `RAG_EVAL`, `RAG_REPORT` | Общий RAG-индекс агентов |
 | `DEVHELP_DOCS`, `DEVHELP_DB`, `DEVHELP_GIT_SERVER` | Ассистент разработчика: корпус (`README.md,docs`), индекс (`rag/project.db`), имя MCP-сервера git (`git`) |
 | `GIT_MCP_REPO`, `GIT_MCP_ADDR` | Сервер git: репозиторий (по умолчанию рабочая директория), адрес для `--http` |
+| `TUI_CALLS` | Начальный режим показа вызовов инструментов во всех TUI: `off`, `brief`, `debug` (по умолчанию `brief`) |
 | `JAVA_PROFILER_MCP_ADDR`, `SCHEDULER_MCP_ADDR`, `SCHEDULER_DB`, `DOCUMENTS_MCP_ADDR`, `DOCUMENTS_DIR` | Адреса и данные своих MCP-серверов |
 
 ## Соглашения

@@ -16,7 +16,7 @@
 | `mcp/documents-mcp/` | `documents-mcp` | MCP-сервер: PDF → Markdown → краткое содержание → файл, три отдельных инструмента; порт 8093 |
 | `mcp/git-mcp/` | `git-mcp` | MCP-сервер: состояние git-репозитория (ветка, статус, файлы, дифф, журнал), только чтение; stdio (или HTTP 8094) |
 | `mcp/fs-mcp/` | `fs-mcp` | MCP-сервер: файлы проекта — список, поиск, чтение, правки через оверлей с диффом, запись на диск по подтверждению; stdio (или HTTP 8097) |
-| `assistant-tui/` | `assistant-tui` | Общие части TUI ассистентов: лента с Markdown и плашками MCP, строка ввода с историей |
+| `assistant-tui/` | `assistant-tui` | Общие части TUI ассистентов: лента с Markdown и плашками MCP (режимы показа вызовов: кратко/отладка/скрыты), прокрутка колесом мыши, строка ввода с историей |
 | `files/assistant/` | `file-assistant` | Ассистент файлов: цель словами → поиск, чтение, правки через `fs-mcp` → отчёт, дифф, `files/runs/` |
 
 Приоритет интерфейсов: **TUI** — главный, затем **веб**, затем **CLI**. Тексты, которые формирует `core` (ошибки, результаты инструментов для модели, блоки промптов, отказы), не называют команды конкретного интерфейса — подсказки вида «нажмите F4» живут в крейте интерфейса.
@@ -26,7 +26,7 @@
 | Файл | Что делает |
 |---|---|
 | `lib.rs` | `LlmClient` — HTTP-клиент `/chat/completions` (`chat`, `chat_with_options`, `chat_with_model`, `chat_with_tools`), `ChatMessage`, `Usage`, `ToolDefinition`, `RequestMessage` |
-| `agent.rs` | Именованные агенты: `Agent`, `AgentConfig`, `AgentManager` (реестр, SQLite `agents.db`), `handle_request` — обработка вопроса, цикл вызова инструментов `run_tool_loop`, конечный автомат задачи (`move_stage`/`update_step`), `ToolCallRecord` |
+| `agent.rs` | Именованные агенты: `Agent`, `AgentConfig`, `AgentManager` (реестр, SQLite `agents.db`), `handle_request` — обработка вопроса, цикл вызова инструментов `run_tool_loop`, конечный автомат задачи (`move_stage`/`update_step`), `ToolCallRecord`, `CallsView` (режимы показа вызовов инструментов) |
 | `context.rs` | Стратегии управления контекстом: `full`, `summary`, `sliding-window`, `facts`, `branching` |
 | `memory.rs` | Модель памяти: краткосрочная (диалог), рабочая (общая задача `TaskState`, этапы `Stage`), долговременная (`LongTermMemory`) |
 | `profile.rs` | Профили персонализации — markdown-файлы в `profiles/` |

@@ -1,10 +1,10 @@
 //! Строка ввода ассистента: редактирование ([`InputLine`]), история по ↑/↓,
 //! подсветка `/команды` (известная — голубым, неизвестная — красным) и
-//! подсказка к ней в строке состояния. Клавиши ленты (PgUp/PgDn,
-//! Ctrl+Home/End, Ctrl+L) обрабатываются здесь же — у всех ассистентов они
-//! одинаковые.
+//! подсказка к ней в строке состояния. Клавиши ленты (колесо мыши, PgUp/PgDn,
+//! Ctrl+Home/End, Ctrl+L, Ctrl+O — режим показа вызовов) обрабатываются здесь
+//! же — у всех ассистентов они одинаковые.
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -13,7 +13,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::feed::Feed;
+use crate::feed::{Feed, WHEEL_STEP};
 use crate::input::InputLine;
 use crate::SPINNER;
 
@@ -53,6 +53,14 @@ impl Prompt {
                 return Action::None;
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => feed.scroll_up(WHEEL_STEP),
+                    MouseEventKind::ScrollDown => feed.scroll_down(WHEEL_STEP),
+                    _ => {}
+                }
+                return Action::None;
+            }
             _ => return Action::None,
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -63,6 +71,7 @@ impl Prompt {
             KeyCode::Esc => return Action::Quit,
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('l') if ctrl => feed.clear(),
+            KeyCode::Char('o') if ctrl => feed.view = feed.view.next(),
             KeyCode::Char('a') if ctrl => input.home(),
             KeyCode::Char('e') if ctrl => input.end(),
             KeyCode::Char('u') if ctrl => input.kill_to_start(),
@@ -84,8 +93,8 @@ impl Prompt {
             KeyCode::End if ctrl => feed.scroll_back = 0,
             KeyCode::Home => input.home(),
             KeyCode::End => input.end(),
-            KeyCode::PageUp => feed.scroll_back += 10,
-            KeyCode::PageDown => feed.scroll_back = feed.scroll_back.saturating_sub(10),
+            KeyCode::PageUp => feed.scroll_up(10),
+            KeyCode::PageDown => feed.scroll_down(10),
             KeyCode::Up if !self.history.is_empty() => {
                 let pos = self.history_pos.map(|p| p.saturating_sub(1)).unwrap_or(self.history.len() - 1);
                 self.history_pos = Some(pos);
@@ -226,5 +235,31 @@ mod tests {
         p.handle(key(KeyCode::Up), &mut feed);
         assert_eq!(p.input.text(), "/help x");
         assert_eq!(p.handle(key(KeyCode::Esc), &mut feed), Action::Quit);
+    }
+
+    #[test]
+    fn wheel_scrolls_and_ctrl_o_cycles_calls_view() {
+        use crossterm::event::{KeyEvent, MouseEvent};
+        use llm_core::CallsView;
+        let mut p = Prompt::new(HINTS);
+        let mut feed = Feed::default();
+        let wheel = |kind| Event::Mouse(MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE });
+        p.handle(wheel(MouseEventKind::ScrollUp), &mut feed);
+        p.handle(wheel(MouseEventKind::ScrollUp), &mut feed);
+        assert_eq!(feed.scroll_back, 2 * WHEEL_STEP);
+        p.handle(wheel(MouseEventKind::ScrollDown), &mut feed);
+        assert_eq!(feed.scroll_back, WHEEL_STEP);
+        for _ in 0..5 {
+            p.handle(wheel(MouseEventKind::ScrollDown), &mut feed);
+        }
+        assert_eq!(feed.scroll_back, 0);
+
+        assert_eq!(feed.view, CallsView::Brief);
+        let ctrl_o = Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        p.handle(ctrl_o.clone(), &mut feed);
+        assert_eq!(feed.view, CallsView::Debug);
+        p.handle(ctrl_o, &mut feed);
+        assert_eq!(feed.view, CallsView::Hidden);
+        assert_eq!(p.input.text(), "", "Ctrl+O не печатает символ");
     }
 }

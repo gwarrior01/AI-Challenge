@@ -1,6 +1,11 @@
 //! Лента ассистента: что спросил пользователь, контекст, вызовы инструментов
 //! (плашки « MCP » и « RAG »), ответы в Markdown, вывод команд с цветом
-//! диффа. Прокрутка — от низа ленты.
+//! диффа. Прокрутка — от низа ленты (колесо мыши, PgUp/PgDn).
+//!
+//! Вызовы хранятся целиком ([`Entry::calls`]), а показываются по режиму
+//! [`CallsView`] ленты: скрыты, кратко (`сервер › инструмент ✓`) или
+//! отладка (доводы целиком и результат). Режим переключается для всей ленты
+//! сразу, в том числе для уже показанных вызовов.
 
 use ratatui::{
     layout::Rect,
@@ -10,7 +15,7 @@ use ratatui::{
     Frame,
 };
 
-use llm_core::{ToolCallRecord, Usage};
+use llm_core::{CallsView, ToolCallRecord, Usage};
 
 use crate::markdown;
 use crate::prompt::{command_at, command_style, highlight, Hints};
@@ -39,20 +44,30 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub kind: Kind,
+    /// Текст записи; у плашки вызова — её краткий вид.
     pub text: String,
+    /// Вызовы инструментов этой плашки (у сводки — все); пусто — не плашка.
+    pub calls: Vec<ToolCallRecord>,
+    /// Кто вызвал: `вызвала команда /apply`; пусто — без подписи.
+    pub who: String,
 }
 
 impl Entry {
     pub fn new(kind: Kind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
+        Self { kind, text: text.into(), calls: Vec::new(), who: String::new() }
     }
 }
+
+/// Сколько строк прокручивает один шаг колеса мыши.
+pub const WHEEL_STEP: usize = 3;
 
 #[derive(Default)]
 pub struct Feed {
     pub entries: Vec<Entry>,
     /// Прокрутка от низа ленты, в строках.
     pub scroll_back: usize,
+    /// Как показывать вызовы инструментов.
+    pub view: CallsView,
 }
 
 impl Feed {
@@ -65,16 +80,25 @@ impl Feed {
         self.scroll_back = 0;
     }
 
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll_back = self.scroll_back.saturating_add(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_back = self.scroll_back.saturating_sub(lines);
+    }
+
     pub fn draw(&self, frame: &mut Frame, area: Rect, hints: Hints) {
         let width = area.width.saturating_sub(2).max(10) as usize;
-        let lines = render_entries(&self.entries, width, hints);
+        let lines = render_entries(&self.entries, width, hints, self.view);
         let height = area.height.saturating_sub(2) as usize;
         let max_scroll = lines.len().saturating_sub(height);
         let top = max_scroll.saturating_sub(self.scroll_back.min(max_scroll));
+        let calls = format!("tools calling: {} (Ctrl+O)", self.view.label());
         let title = if self.scroll_back > 0 && max_scroll > 0 {
-            format!(" Лента — {}/{} (Ctrl+End — в конец) ", top + height.min(lines.len()), lines.len())
+            format!(" Лента — {}/{} (Ctrl+End — в конец) · {calls} ", top + height.min(lines.len()), lines.len())
         } else {
-            " Лента — PgUp/PgDn прокрутка ".to_string()
+            format!(" Лента · {calls} ")
         };
         let feed = Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title))
@@ -83,22 +107,17 @@ impl Feed {
     }
 }
 
-/// Плашка вызова инструмента: `git › read_file({"path":…})  ✓ · вызвала модель`
-/// и ниже — начало результата. `who` пустой — вызов сделал сам ассистент.
+/// Плашка вызова инструмента. Кратко — `git › read_file  ✓`;
+/// в режиме отладки — с доводами и результатом (см. [`render_entries`]).
+/// `who` пустой — вызов сделал сам ассистент.
 pub fn tool_entry(call: &ToolCallRecord, who: &str) -> Entry {
-    let server = call.server.as_deref().unwrap_or("?");
-    let args = match call.arguments.trim() {
-        "" | "{}" => String::new(),
-        a => short(a, 100),
-    };
-    let rag = server == RAG_SERVER;
-    let (kind, mark) = match (rag, call.is_error) {
-        (false, false) => (Kind::Mcp, "✓"),
-        (false, true) => (Kind::McpError, "✗ ошибка"),
-        (true, false) => (Kind::Rag, "✓"),
-        (true, true) => (Kind::RagError, "✗ ошибка"),
-    };
-    Entry::new(kind, format!("{server} › {}({args})  {mark}{}\n  ↳ {}", call.tool, caller(who), call.result_preview(180)))
+    let mark = if call.is_error { "✗ ошибка" } else { "✓" };
+    Entry {
+        kind: call_kind(call),
+        text: format!("{}  {mark}{}", call.brief(), caller(who)),
+        calls: vec![call.clone()],
+        who: who.to_string(),
+    }
 }
 
 /// Вызовы одной плашкой — когда их десятки: `git_diff ×25, read_file ×24`.
@@ -123,13 +142,41 @@ pub fn tool_summary_entry(calls: &[ToolCallRecord], who: &str) -> Entry {
         .map(|(_, tool, n, err)| if *err > 0 { format!("{tool} ×{n} (ошибок {err})") } else { format!("{tool} ×{n}") })
         .collect();
     let mark = if errors > 0 { format!("✗ ошибок {errors}") } else { "✓".into() };
-    Entry::new(
-        if errors > 0 { Kind::McpError } else { Kind::Mcp },
-        format!("{server} › вызовов {}  {mark}{}\n  ↳ {}", calls.len(), caller(who), list.join(", ")),
+    Entry {
+        kind: if errors > 0 { Kind::McpError } else { Kind::Mcp },
+        text: format!("{server} › вызовов {}  {mark}{}\n  ↳ {}", calls.len(), caller(who), list.join(", ")),
+        calls: calls.to_vec(),
+        who: who.to_string(),
+    }
+}
+
+/// Плашка одного вызова для отладки: заголовок, доводы целиком, результат.
+fn debug_text(call: &ToolCallRecord, who: &str) -> String {
+    let mark = if call.is_error { "✗ ошибка" } else { "✓" };
+    let args: Vec<String> = call.arguments_pretty().lines().map(|l| format!("    {l}")).collect();
+    format!(
+        "{}  {mark}{}\n  доводы:\n{}\n  ↳ {}",
+        call.brief(),
+        caller(who),
+        args.join("\n"),
+        call.result_preview(DEBUG_RESULT_CHARS)
     )
 }
 
-/// ` · вызвала модель` — кто вызвал; пусто — без подписи.
+/// Сколько символов результата видно в режиме отладки.
+const DEBUG_RESULT_CHARS: usize = 1_500;
+
+/// Вид плашки вызова: `kind` — по ошибке у самого вызова.
+fn call_kind(call: &ToolCallRecord) -> Kind {
+    match (call.server.as_deref() == Some(RAG_SERVER), call.is_error) {
+        (false, false) => Kind::Mcp,
+        (false, true) => Kind::McpError,
+        (true, false) => Kind::Rag,
+        (true, true) => Kind::RagError,
+    }
+}
+
+/// ` · вызвала команда /apply` — кто вызвал; пусто — без подписи.
 fn caller(who: &str) -> String {
     if who.is_empty() {
         String::new()
@@ -143,15 +190,6 @@ pub fn with_usage(text: String, usage: Option<Usage>) -> String {
     match usage {
         Some(u) => format!("{text}\n\n[токены: {} (запрос {}, ответ {})]", u.total_tokens, u.prompt_tokens, u.completion_tokens),
         None => text,
-    }
-}
-
-fn short(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > max {
-        flat.chars().take(max).collect::<String>() + "…"
-    } else {
-        flat
     }
 }
 
@@ -186,12 +224,26 @@ fn badge_lines(kind: Kind, first: bool, raw: &str, width: usize) -> Vec<Line<'st
         .collect()
 }
 
-pub fn render_entries(entries: &[Entry], width: usize, hints: Hints) -> Vec<Line<'static>> {
+pub fn render_entries(entries: &[Entry], width: usize, hints: Hints, view: CallsView) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
+        let badge = matches!(entry.kind, Kind::Mcp | Kind::McpError | Kind::Rag | Kind::RagError);
+        if badge && view == CallsView::Hidden {
+            continue;
+        }
         match entry.kind {
             Kind::Answer => lines.extend(markdown::render(&entry.text, width)),
-            Kind::Mcp | Kind::McpError | Kind::Rag | Kind::RagError => {
+            _ if badge && view == CallsView::Debug && !entry.calls.is_empty() => {
+                for (n, call) in entry.calls.iter().enumerate() {
+                    if n > 0 {
+                        lines.push(Line::default());
+                    }
+                    for (i, raw) in debug_text(call, &entry.who).lines().enumerate() {
+                        lines.extend(badge_lines(call_kind(call), i == 0, raw, width));
+                    }
+                }
+            }
+            _ if badge => {
                 for (i, raw) in entry.text.lines().enumerate() {
                     lines.extend(badge_lines(entry.kind, i == 0, raw, width));
                 }
@@ -258,14 +310,18 @@ mod tests {
         }
     }
 
+    fn text(lines: &[Line]) -> String {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
     fn tool_calls_are_marked() {
         let e = tool_entry(&call("git_branch", "{}", false), "");
         assert!(e.kind == Kind::Mcp);
-        assert_eq!(e.text, "git › git_branch()  ✓\n  ↳ {\"branch\": \"day-30\"}");
+        assert_eq!(e.text, "git › git_branch  ✓");
         let e = tool_entry(&call("read_file", r#"{"path":"x"}"#, true), "вызвала модель");
         assert!(e.kind == Kind::McpError);
-        assert!(e.text.starts_with(r#"git › read_file({"path":"x"})  ✗ ошибка · вызвала модель"#));
+        assert_eq!(e.text, "git › read_file  ✗ ошибка · вызвала модель");
 
         let calls = [call("git_diff", "{}", false), call("read_file", "{}", false), call("read_file", "{}", true)];
         let e = tool_summary_entry(&calls, "");
@@ -280,6 +336,30 @@ mod tests {
         let lines = badge_lines(Kind::Mcp, true, "git › git_branch()", 80);
         assert_eq!(lines[0].spans[0].content, " MCP ");
         assert_eq!(lines[0].spans[2].content, "git › git_branch()");
+    }
+
+    #[test]
+    fn view_mode_changes_rendering_of_past_calls() {
+        let entries = vec![
+            Entry::new(Kind::User, "найди"),
+            tool_entry(&call("read_file", r#"{"path":"core/src/lib.rs","start_line":40}"#, false), "вызвала модель"),
+            tool_summary_entry(&[call("git_diff", r#"{"base":"main"}"#, false), call("git_log", "{}", false)], ""),
+        ];
+        let brief = text(&render_entries(&entries, 100, &[], CallsView::Brief));
+        assert!(brief.contains("git › read_file  ✓ · вызвала модель"), "{brief}");
+        assert!(!brief.contains("core/src/lib.rs"), "кратко — без доводов: {brief}");
+        assert!(brief.contains("git › вызовов 2"));
+
+        let debug = text(&render_entries(&entries, 100, &[], CallsView::Debug));
+        assert!(debug.contains("\"path\": \"core/src/lib.rs\""), "{debug}");
+        assert!(debug.contains("\"start_line\": 40"));
+        assert!(debug.contains("↳ {\"branch\": \"day-30\"}"));
+        // Сводка раскрывается в отдельные вызовы с доводами.
+        assert!(debug.contains("git › git_diff") && debug.contains("\"base\": \"main\""));
+
+        let hidden = text(&render_entries(&entries, 100, &[], CallsView::Hidden));
+        assert!(hidden.contains("найди"));
+        assert!(!hidden.contains("read_file") && !hidden.contains("вызовов"), "{hidden}");
     }
 
     #[test]

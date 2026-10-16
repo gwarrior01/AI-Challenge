@@ -10,6 +10,8 @@
 //! ```
 //!
 //! Каталог — `FILES_RUNS_DIR` (по умолчанию `files/runs`, в `.gitignore`).
+//! Хранятся только последние `FILES_RUNS_KEEP` запусков (по умолчанию 50):
+//! после сохранения нового самые старые удаляются ([`prune`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +23,8 @@ use crate::session::{env_or, Applied};
 use crate::task::Outcome;
 
 pub const DEFAULT_RUNS_DIR: &str = "files/runs";
+/// Сколько последних запусков хранить по умолчанию (`FILES_RUNS_KEEP`).
+pub const DEFAULT_KEEP: usize = 50;
 
 pub fn runs_dir() -> PathBuf {
     PathBuf::from(env_or("FILES_RUNS_DIR", DEFAULT_RUNS_DIR))
@@ -66,7 +70,35 @@ pub fn save(root: &Path, outcome: &Outcome) -> Result<PathBuf> {
         "applied": null,
     });
     write(&dir, "run.json", &serde_json::to_string_pretty(&meta)?)?;
+    let keep: usize = env_or("FILES_RUNS_KEEP", "").parse().unwrap_or(DEFAULT_KEEP).max(1);
+    // Не удалось убрать старые — не повод терять новый запуск.
+    let _ = prune(root, keep);
     Ok(dir)
+}
+
+/// Оставить в `root` только `keep` последних запусков, остальные удалить.
+/// Запуск — каталог с именем `ГГГГММДД-ЧЧММСС-…` и `run.json` внутри; всё
+/// прочее в каталоге не трогается. Возвращает, сколько удалено.
+pub fn prune(root: &Path, keep: usize) -> Result<usize> {
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(root)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("run.json").is_file())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(is_run_name))
+        .collect();
+    // Имя начинается с времени UTC — по имени и сортируются (новые в конце).
+    runs.sort();
+    let excess = runs.len().saturating_sub(keep);
+    for dir in &runs[..excess] {
+        std::fs::remove_dir_all(dir).with_context(|| format!("не удалось удалить {}", dir.display()))?;
+    }
+    Ok(excess)
+}
+
+/// `20261016-142501-…` — имя каталога запуска.
+fn is_run_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() > 16 && b[..8].iter().all(u8::is_ascii_digit) && b[8] == b'-' && b[9..15].iter().all(u8::is_ascii_digit) && b[15] == b'-'
 }
 
 /// Отметить в `run.json`, что из изменений записано на диск.
@@ -177,5 +209,31 @@ mod tests {
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("run.json")).unwrap()).unwrap();
         assert_eq!(meta["applied"]["written"][0], "CHANGELOG.md");
         assert_eq!(meta["scenario"], "changelog");
+    }
+
+    #[test]
+    fn keeps_only_the_latest_runs() {
+        let root = std::env::temp_dir().join(format!("file-assistant-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for i in 0..5 {
+            let dir = root.join(format!("2026101{i}-120000-task"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("run.json"), "{}").unwrap();
+        }
+        // Чужое не трогается: каталог без run.json и каталог с другим именем.
+        std::fs::create_dir_all(root.join("20261001-000000-без-run")).unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/run.json"), "{}").unwrap();
+
+        assert_eq!(prune(&root, 3).unwrap(), 2);
+        let mut left: Vec<String> =
+            std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["20261001-000000-без-run", "20261012-120000-task", "20261013-120000-task", "20261014-120000-task", "notes"]
+        );
+        assert_eq!(prune(&root, 3).unwrap(), 0);
+        assert!(is_run_name("20261016-110439-usages") && !is_run_name("2026-10-16") && !is_run_name("notes"));
     }
 }

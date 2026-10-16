@@ -38,11 +38,13 @@ const COMMANDS: &str = "Команды:
   /apply [путь…]                     — записать изменения на диск (все или только эти файлы)
   /discard [путь…]                   — отказаться от изменений
   /files [путь]                      — структура проекта или каталога
+  /calls [off|brief|debug]           — вызовы MCP в ленте: скрыть, кратко (без доводов) или для отладки (доводы целиком)
   /clear — очистить ленту · /? — эта справка · /quit или Esc — выход
 Изменения модели не попадают на диск сами: они копятся, пока вы не скажете /apply.
 Каждая задача сохраняется в files/runs/<id>/ — отчёт, changes.patch (git apply), вызовы.
 Ввод: ↑/↓ — история · Alt+←/→ — по словам · Ctrl+U/K — удалить до начала/конца
-Лента: PgUp/PgDn — прокрутка · Ctrl+Home/Ctrl+End — в начало/конец · Ctrl+L — очистить";
+Лента: колесо мыши или PgUp/PgDn — прокрутка · Ctrl+Home/Ctrl+End — в начало/конец · Ctrl+L — очистить
+      Ctrl+O — вызовы: кратко → отладка → скрыты (выделить текст мышью — с Option в iTerm2, Fn в Terminal.app)";
 
 const COMMAND_HINTS: Hints = &[
     ("task", "/task <цель> — задача словами: ассистент сам находит, читает и правит нужные файлы"),
@@ -51,6 +53,7 @@ const COMMAND_HINTS: Hints = &[
     ("apply", "/apply [путь…] — записать ожидающие изменения на диск"),
     ("discard", "/discard [путь…] — отказаться от ожидающих изменений"),
     ("files", "/files [путь] — структура проекта или каталога"),
+    ("calls", "/calls [off | brief | debug] — вызовы MCP: скрыть, кратко или с доводами целиком (Ctrl+O — по кругу)"),
     ("clear", "/clear — очистить ленту"),
     ("quit", "/quit — выход"),
     ("exit", "/exit — выход"),
@@ -91,7 +94,7 @@ async fn event_loop(terminal: &mut Term, session: Arc<Session>) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App {
         session: session.clone(),
-        feed: Feed::default(),
+        feed: Feed { view: llm_core::CallsView::from_env(), ..Feed::default() },
         prompt: Prompt::new(COMMAND_HINTS),
         busy: None,
         spinner: 0,
@@ -99,11 +102,6 @@ async fn event_loop(terminal: &mut Term, session: Arc<Session>) -> Result<()> {
         pending: Pending::default(),
         last_run: None,
     };
-    app.feed.push(
-        Kind::Info,
-        "Поставьте цель словами — ассистент сам найдёт и прочитает нужные файлы, а правки покажет диффом.\n\
-         /scenario — готовые цели · /? — все команды",
-    );
     refresh(&session, &tx);
 
     let mut events = EventStream::new();
@@ -211,6 +209,17 @@ fn submit(app: &mut App, input: String, tx: &mpsc::UnboundedSender<AppEvent>) ->
         "quit" | "exit" | "q" => return true,
         "clear" => {
             app.feed.clear();
+            return false;
+        }
+        "calls" => {
+            let view = if rest.is_empty() { Some(app.feed.view.next()) } else { llm_core::CallsView::parse(&rest) };
+            match view {
+                Some(view) => {
+                    app.feed.view = view;
+                    app.feed.push(Kind::Info, format!("Вызовы инструментов: {}.", view.label()));
+                }
+                None => app.feed.push(Kind::Error, "/calls off | brief | debug — скрыть, кратко или для отладки."),
+            }
             return false;
         }
         "?" | "commands" => {
@@ -321,7 +330,7 @@ fn start_task(app: &mut App, goal: String, scenario: Option<String>, tx: mpsc::U
         let progress = move |step: Step| {
             let _ = progress_tx.send(match step {
                 Step::Status(msg) => AppEvent::Progress(msg),
-                Step::Tool(call) => AppEvent::Entry(tool_entry(&call, "вызвала модель")),
+                Step::Tool(call) => AppEvent::Entry(tool_entry(&call, "")),
             });
         };
         let result = match task::run(&s, &goal, scenario.as_deref(), &progress).await {

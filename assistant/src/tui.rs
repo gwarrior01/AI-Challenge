@@ -38,11 +38,13 @@ const COMMANDS: &str = "Команды:
   /status                       — git status
   /files [путь]                 — структура проекта или каталога
   /log [n]                      — последние коммиты
+  /calls [off|brief|debug]      — вызовы MCP в ленте: скрыть, кратко (без доводов) или для отладки (доводы целиком)
   /clear — очистить ленту · /? — эта справка · /quit или Esc — выход
 Ввод: ←/→ — символ · Alt+←/→ или Ctrl+←/→ — слово · Home/End (Ctrl+A/E) — начало/конец строки ·
       Alt+Backspace (Ctrl+W) — удалить слово · Ctrl+U/K — удалить до начала/конца · ↑/↓ — история
-Лента: PgUp/PgDn — прокрутка · Ctrl+Home/Ctrl+End — в начало/конец · Ctrl+L — очистить
-Вызовы видны в ленте плашками « MCP » (git) и « RAG » (поиск по документации и коду): что, кто вызвал, результат,
+Лента: колесо мыши или PgUp/PgDn — прокрутка · Ctrl+Home/Ctrl+End — в начало/конец · Ctrl+L — очистить
+      Ctrl+O — вызовы: кратко → отладка → скрыты (выделить текст мышью — с Option в iTerm2, Fn в Terminal.app)
+Вызовы видны в ленте плашками « MCP » (git) и « RAG » (поиск по документации и коду): кто вызвал и результат,
 а пока команда идёт — в строке состояния внизу.";
 
 /// Команды TUI и подсказки к ним — для подсветки ввода и строки состояния.
@@ -54,6 +56,7 @@ const COMMAND_HINTS: Hints = &[
     ("status", "/status — git status: что изменено и не закоммичено"),
     ("files", "/files [путь] — структура проекта или каталога"),
     ("log", "/log [n] — последние коммиты"),
+    ("calls", "/calls [off | brief | debug] — вызовы MCP: скрыть, кратко или с доводами целиком (Ctrl+O — по кругу)"),
     ("clear", "/clear — очистить ленту"),
     ("quit", "/quit — выход"),
     ("exit", "/exit — выход"),
@@ -92,7 +95,7 @@ async fn event_loop(terminal: &mut Term, assistant: Arc<Assistant>) -> Result<()
     let mut app = App {
         assistant: assistant.clone(),
         // Лента пустая — справка по /?, подсказки к командам — в строке состояния.
-        feed: Feed::default(),
+        feed: Feed { view: llm_core::CallsView::from_env(), ..Feed::default() },
         prompt: Prompt::new(COMMAND_HINTS),
         busy: None,
         git: "подключаю MCP git…".into(),
@@ -175,6 +178,17 @@ fn submit(app: &mut App, input: String, tx: &mpsc::UnboundedSender<AppEvent>) ->
             app.feed.clear();
             return false;
         }
+        "calls" => {
+            let view = if rest.is_empty() { Some(app.feed.view.next()) } else { llm_core::CallsView::parse(&rest) };
+            match view {
+                Some(view) => {
+                    app.feed.view = view;
+                    app.feed.push(Kind::Info, format!("Вызовы инструментов: {}.", view.label()));
+                }
+                None => app.feed.push(Kind::Error, "/calls off | brief | debug — скрыть, кратко или для отладки."),
+            }
+            return false;
+        }
         "?" | "commands" => {
             app.feed.push(Kind::Info, COMMANDS);
             return false;
@@ -204,10 +218,8 @@ fn submit(app: &mut App, input: String, tx: &mpsc::UnboundedSender<AppEvent>) ->
                 let entries = match help::ask(&a, &rest, &progress).await {
                     Ok(reply) => {
                         let mut out = vec![Entry::new(Kind::Context, reply.context_lines().join("\n"))];
-                        for (i, call) in reply.tool_calls.iter().enumerate() {
-                            // Первым идёт git_branch, который код вызывает сам до вопроса модели, — без подписи.
-                            let who = if i == 0 && call.tool == "git_branch" { "" } else { "вызвала модель" };
-                            out.push(tool_entry(call, who));
+                        for call in &reply.tool_calls {
+                            out.push(tool_entry(call, ""));
                         }
                         out.push(Entry::new(Kind::Answer, with_usage(reply.text, reply.usage)));
                         out

@@ -303,14 +303,14 @@ pub async fn ask(a: &Assistant, question: &str, progress: Progress<'_>) -> Resul
             let (name, args) = (call.function.name.as_str(), call.function.arguments.as_str());
             let (text, is_error, server, tool) = match (name, search.as_mut()) {
                 (SEARCH_DOCS | SEARCH_CODE, Some(search)) => {
-                    progress(format!("RAG · {name}({}) — вызвала модель…", short(args.trim(), 80)));
+                    progress(format!("RAG · {name}({})…", short(args.trim(), 80)));
                     let (text, is_error) = search.run(name, args).await;
                     (text, is_error, RAG_SERVER.to_string(), name.to_string())
                 }
                 _ => {
                     let (server, tool) =
                         mcp.tool_origin(name).unwrap_or_else(|| (git_server.to_string(), name.to_string()));
-                    progress(format!("MCP {server} · {tool}({}) — вызвала модель…", short(args.trim(), 80)));
+                    progress(format!("MCP {server} · {tool}({})…", short(args.trim(), 80)));
                     match mcp.call(name, args).await {
                         Some(r) => (r.text, r.is_error, r.server, r.tool),
                         None => (format!("инструмента «{name}» нет — используй инструменты из списка"), true, server, tool),
