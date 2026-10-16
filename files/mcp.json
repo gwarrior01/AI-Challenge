@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "fs": {
+      "description": "Файлы проекта: список, поиск, чтение, правки через оверлей (на диск — только по /apply) (свой сервер mcp/fs-mcp, stdio: ассистент запускает его сам)",
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "fs-mcp"]
+    },
+    "git": {
+      "description": "Git-репозиторий проекта: ветка, статус, дифф, журнал — только чтение (свой сервер mcp/git-mcp, stdio)",
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "git-mcp"]
+    }
+  }
+}

@@ -34,7 +34,7 @@ pub const DEFAULT_QUESTION: &str =
 
 /// Инструменты поиска — «сервер» `rag` в записях вызовов (не MCP: индексы
 /// ассистент держит сам).
-pub const RAG_SERVER: &str = "rag";
+pub use assistant_tui::feed::RAG_SERVER;
 pub const SEARCH_DOCS: &str = "search_docs";
 pub const SEARCH_CODE: &str = "search_code";
 

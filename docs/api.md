@@ -90,6 +90,21 @@
 | `git_diff` | `staged?`, `base?` (`main`), `path?`, `stat_only?`, `max_chars?` (15000) | `compared`, `files[]` {path, added, deleted}, `added`, `deleted`, `patch`, `truncated`, `untracked[]` |
 | `git_log` | `n?` (10), `path?` | `commits[]` {hash, subject, author, date} |
 
+### `fs` — `mcp/fs-mcp` (stdio; `--http` — `127.0.0.1:8097/mcp`)
+
+Файлы проекта; пути — относительно корня. Правки копятся в оверлее и попадают на диск только через `apply_changes`, который вызывает код ассистента (модели он не выдаётся). Подробно — [day-34-file-assistant.md](day-34-file-assistant.md).
+
+| Инструмент | Аргументы | Возвращает |
+|---|---|---|
+| `list_files` | `path?`, `pattern?` (`*.rs`, `docs/**/*.md`), `depth?`, `limit?` (300) | `total`, `truncated`, `files[]` — или с `depth` `tree[]` {path, files} |
+| `read_file` | `path`, `start_line?`, `max_lines?` (400) | `path`, `start_line`, `end_line`, `total_lines`, `text`, `truncated`, `pending` |
+| `search` | `query`, `regex?`, `case_sensitive?`, `path?`, `pattern?`, `context?`, `max_results?` (50) | `total_matches`, `files[]` {path, matches}, `matches[]` {path, line, text, before, after}, `truncated`, `files_scanned` |
+| `write_file` | `path`, `content` | `path`, `created`, `lines`, `added`, `deleted`, `diff` |
+| `edit_file` | `path`, `old_text`, `new_text`, `replace_all?` | то же + `replacements` |
+| `pending_changes` | — | `files[]` {path, status, added, deleted}, `added`, `deleted`, `patch` |
+| `discard_changes` | `paths?` | `discarded[]` |
+| `apply_changes` | `paths?` | `written[]`, `conflicts[]` {path, reason} |
+
 ### `java-profiler` — `mcp/java-profiler-mcp` (`127.0.0.1:8091/mcp`)
 
 `java_list_processes`, `java_process_info(pid)`, `java_thread_dump(pid, max_threads, include_system)`, `java_heap_histogram(pid, top)`, `java_profile(pid, duration_sec, views)` — всё только чтение, через `jps`/`jcmd`/`jfr`.

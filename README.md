@@ -282,6 +282,18 @@ cargo run -p support-assistant -- tickets
 
 Per question: the ticket id (named in the question, passed as `ticket_id`, or remembered by the session) is looked up by code via MCP `get_ticket` — not left to the model; the knowledge base is searched by the question itself and, with a ticket, also by the question plus the ticket's subject and error code; the model gets both, may search again or call `list_user_tickets`/`get_user` itself, and answers with `[n]` citations. Sessions keep the ticket and recent turns, so follow-ups work without repeating the id. The service starts `support-mcp` itself over stdio (`support/mcp.json`); `support-mcp --http` serves Streamable HTTP on `127.0.0.1:8095` instead. API, settings, demo prompts and the video plan: [`docs/day-33-support-assistant.md`](docs/day-33-support-assistant.md).
 
+#### File assistant: goals, not file names (`file-assistant`, `fs-mcp`)
+
+An assistant that works with the project's files itself: given a goal in words («найди все места, где используется `McpManager`», «обнови таблицу настроек в docs/developer-assistant.md по коду», «сгенерируй CHANGELOG»), it decides which files to list, search, read and change. Files go through its own MCP server `mcp/fs-mcp` (list, content search, read, write, exact-fragment edit), history through `git-mcp`.
+
+```bash
+cargo run -p file-assistant                                   # TUI: goal as plain text, /scenario, /diff, /apply, /discard
+cargo run -p file-assistant -- run --scenario usages          # one task, report + diff to stdout
+cargo run -p file-assistant -- run "обнови README по коду" --apply
+```
+
+The model's edits never hit the disk on their own: `fs-mcp` keeps them in an overlay (reads and searches see them), `pending_changes` turns them into a git-style unified diff, and only the assistant's code — on `/apply` or `--apply`, not the model — writes them, refusing files that changed on disk in the meantime. Every run is saved to `files/runs/<id>/` (goal, report, `changes.patch` for `git apply`, every tool call, model and temperature 0 by default) so it can be checked and repeated; ready-made goals live in `files/scenarios/` (find usages, sync docs with code, generate a changelog, check invariants). Tools, sandbox rules and settings: [`docs/day-34-file-assistant.md`](docs/day-34-file-assistant.md).
+
 #### Own MCP server: documents (tool composition)
 
 `mcp/documents-mcp/` is the third own server: three separate tools that form one chain — the first gets the data, the second processes it, the third saves the result. The server has no "run everything" tool on purpose: the chain is composed by the agent, which plans the three calls and then makes them one after another, passing the id from one result into the next call's arguments.
@@ -735,5 +747,7 @@ tui/              — llm-tui: terminal interface (ratatui)
 gateway/          — llm-gateway: private AI service over a local LLM — src/proxy.rs — the OpenAI-compatible endpoints, src/limits.rs — rpm and the queue to the slots, src/config.rs — gateway.toml, src/loadtest.rs — the network check, src/chat.html — the chat page; deploy/ — server setup, systemd units, push.sh; report.md — measurements
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template
 rag/              — eval.json — control questions for comparing chunking strategies, compare.md — the comparison report (index.db — the index itself, uploads/ — uploaded documents; both git-ignored)
+assistant-tui/    — shared TUI pieces of code-assistant and file-assistant: feed with Markdown and MCP call badges, input line with history, command highlighting
+files/            — file-assistant: assistant/ — the crate (src/task.rs — the goal → tools → report loop, src/session.rs — model and MCP, src/runs.rs — saved runs, src/tui.rs), scenarios/ — ready-made goals, mcp.json — its MCP servers (fs, git), runs/ — saved runs (git-ignored)
 invariants/       — hard invariant markdown files (see "Invariants: hard rules the assistant refuses to break" above), one per rule — this repo ships stack.md/storage.md/secrets.md as filled-in examples
 ```

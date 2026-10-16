@@ -16,8 +16,6 @@
 
 mod context;
 mod help;
-mod input;
-mod markdown;
 mod review;
 mod tui;
 
