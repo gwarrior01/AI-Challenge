@@ -136,7 +136,10 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyCode,
+        KeyEventKind, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -195,6 +198,9 @@ struct HistoryItem {
     /// а не реальная стоимость, которую вернул провайдер. Не имеет значения,
     /// если `cost` — `None`. Показывается как "≈" перед суммой.
     cost_approx: bool,
+    /// У строки вызова инструмента (`Role::Tool`/`ToolError`) — сам вызов: по
+    /// нему строка рисуется в выбранном режиме (см. [`llm_core::CallsView`]).
+    call: Option<llm_core::ToolCallRecord>,
 }
 
 /// Преобразует историю агента (роль + текст + метрики токенов, хранимые в SQLite)
@@ -223,7 +229,7 @@ fn history_items_from_messages(messages: &[(ChatMessage, Option<Usage>)]) -> Vec
                 None
             };
             let cost_approx = usage.map(|u| is_approx(&u)).unwrap_or(false);
-            HistoryItem { role, text: message.content.clone(), debug: None, tokens, cost, cost_approx }
+            HistoryItem { role, text: message.content.clone(), debug: None, tokens, cost, cost_approx, call: None }
         })
         .collect();
     for (i, (_, usage)) in messages.iter().enumerate() {
@@ -540,6 +546,8 @@ struct DrawState<'a> {
     /// вне экрана чата с агентом или если стоимость взять неоткуда.
     agent_dialogue_cost: Option<(f64, bool)>,
     show_debug: bool,
+    /// Как показывать вызовы инструментов в диалогах (Ctrl+O по кругу).
+    calls_view: llm_core::CallsView,
     agents: &'a [AgentInfo],
     agents_selected: usize,
     confirm_delete: Option<&'a str>,
@@ -650,14 +658,16 @@ async fn main() -> Result<()> {
     // Event::Paste целиком, а не потоком отдельных нажатий клавиш — без этого
     // встроенные в буфер обмена переводы строк читались бы как нажатия Enter
     // и обрывали сообщение раньше времени, посреди вставки.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Мышь: колесо прокручивает диалог и списки (выделить текст мышью — с
+    // зажатым Option в iTerm2 или Fn в Terminal.app).
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, client).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -674,6 +684,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
         tokens: None,
         cost: None,
         cost_approx: false,
+        call: None,
     }];
     let mut waiting = false;
     // Строки вызовов инструментов, показанные в истории агента, пока ответ ещё
@@ -696,6 +707,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
     // без нашего суммирования (см. context_bar в draw_chat).
     let mut chat_context_tokens: Option<u64> = None;
     let mut show_debug = false;
+    let mut calls_view = llm_core::CallsView::from_env();
+    // Сколько строк прокручивает один шаг колеса мыши.
+    const WHEEL_STEP: u16 = 3;
     // Текущая позиция скролла чата и флаг "прижато к низу" (авто-прокрутка к новым сообщениям).
     let mut scroll: u16 = 0;
     let mut follow_bottom = true;
@@ -801,7 +815,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
         };
         let mut chat_lines: Vec<Line<'static>> = Vec::new();
         for item in active_history {
-            chat_lines.extend(history_item_to_lines(item, inner_width, show_debug));
+            chat_lines.extend(history_item_to_lines(item, inner_width, show_debug, calls_view));
         }
         let max_scroll = (chat_lines.len() as u16).saturating_sub(visible_height);
         if follow_bottom || scroll >= max_scroll {
@@ -934,6 +948,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
             agent_strategy_badge: screen_agent_strategy_badge,
             agent_dialogue_cost: screen_agent_dialogue_cost,
             show_debug,
+            calls_view,
             agents: &agents_snapshot,
             agents_selected,
             confirm_delete: confirm_delete.as_deref(),
@@ -977,6 +992,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                         // В экране "Чат" Esc всегда завершает программу — как и раньше.
                         if key.code == KeyCode::Esc && matches!(screen, Screen::Chat) {
                             break;
+                        }
+
+                        // Ctrl+O — режим показа вызовов инструментов, с любого экрана и
+                        // даже пока ждём ответа: перерисовываются и уже показанные вызовы.
+                        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            calls_view = calls_view.next();
+                            continue;
                         }
 
                         // F2 переключает экраны даже пока ждём ответа — запрос агенту/модели
@@ -1085,6 +1107,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                     chat_history.clear();
                                     chat_context_tokens = None;
@@ -1113,6 +1136,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                     waiting = true;
 
@@ -1307,6 +1331,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 tokens: None,
                                                 cost: None,
                                                 cost_approx: false,
+                                                call: None,
                                             });
                                             follow_bottom = true;
                                         }
@@ -1328,6 +1353,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 tokens: None,
                                                 cost: None,
                                                 cost_approx: false,
+                                                call: None,
                                             });
                                             follow_bottom = true;
                                         }
@@ -1350,6 +1376,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                                 tokens: None,
                                                 cost: None,
                                                 cost_approx: false,
+                                                call: None,
                                             });
                                             follow_bottom = true;
                                         }
@@ -1731,6 +1758,35 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                     // Вставленный текст приходит одним куском — просто дописываем его в
                     // поле ввода, не трактуя содержащиеся в нём переводы строк как Enter.
                     // Отправка по-прежнему происходит только по явному нажатию Enter.
+                    // Колесо мыши — прокрутка того, что на экране прокручивается.
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        let up = match mouse.kind {
+                            MouseEventKind::ScrollUp => true,
+                            MouseEventKind::ScrollDown => false,
+                            _ => continue,
+                        };
+                        let wheel = |value: u16| if up { value.saturating_sub(WHEEL_STEP) } else { value.saturating_add(WHEEL_STEP) };
+                        match screen {
+                            Screen::Chat | Screen::AgentChat => {
+                                if up {
+                                    follow_bottom = false;
+                                }
+                                scroll = wheel(scroll);
+                            }
+                            Screen::Mcp => mcp_scroll = wheel(mcp_scroll),
+                            Screen::Rag => rag_scroll = wheel(rag_scroll).min(rag_scroll_max.get()),
+                            Screen::Schedule => schedule_scroll = wheel(schedule_scroll).min(schedule_scroll_max.get()),
+                            Screen::AgentMemory => memory_scroll = wheel(memory_scroll).min(memory_scroll_max.get()),
+                            Screen::AgentsList => {
+                                if up {
+                                    agents_selected = agents_selected.saturating_sub(1);
+                                } else if agents_selected + 1 < agent_manager.list().len() {
+                                    agents_selected += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     Some(Ok(Event::Paste(text))) => match screen {
                         Screen::Chat | Screen::AgentChat if !waiting => input.push_str(&text),
                         Screen::AgentMemory => input.push_str(&text),
@@ -1814,6 +1870,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             tokens: response_tokens,
                             cost: None,
                             cost_approx: false,
+                            call: None,
                         });
                     }
                     AppEvent::DirectResponse { result: Err(err), .. } => {
@@ -1824,6 +1881,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             tokens: None,
                             cost: None,
                             cost_approx: false,
+                            call: None,
                         });
                     }
                     // Не ответ на запрос — флаги ожидания не трогаем.
@@ -1873,6 +1931,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     tokens: None,
                                     cost: None,
                                     cost_approx: false,
+                                    call: None,
                                 });
                             }
                             Ok(reply) => {
@@ -1913,6 +1972,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                 }
                                 for call in &reply.tool_calls {
@@ -1923,6 +1983,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: Some(call.clone()),
                                     });
                                 }
                                 entry.push(HistoryItem {
@@ -1935,6 +1996,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     tokens: response_tokens,
                                     cost: response_cost,
                                     cost_approx: cost_approx.unwrap_or(false),
+                                    call: None,
                                 });
                                 // Момент пересчёта сводки сжатого контекста (стратегия
                                 // summary) — показываем его отдельной строкой сразу после
@@ -1950,6 +2012,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                 }
                                 // Задача изменилась — её цель и заметки: видно, что цель
@@ -1962,6 +2025,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                 }
                                 // Момент обновления фактов (стратегия facts) — аналогичная метка.
@@ -1973,6 +2037,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                         tokens: None,
                                         cost: None,
                                         cost_approx: false,
+                                        call: None,
                                     });
                                 }
                             }
@@ -1984,6 +2049,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                                     tokens: None,
                                     cost: None,
                                     cost_approx: false,
+                                    call: None,
                                 });
                             }
                         }
@@ -2020,6 +2086,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, client: LlmC
                             tokens: None,
                             cost: None,
                             cost_approx: false,
+                            call: None,
                         });
                     }
                 }
@@ -2161,7 +2228,7 @@ fn draw_chat(frame: &mut Frame, state: &DrawState) {
     let chat_title = if waiting {
         format!(" Диалог {} ", SPINNER_FRAMES[spinner_frame])
     } else {
-        " Диалог — PageUp/PageDown скролл, End — в конец ".to_string()
+        format!(" Диалог · tools calling: {} (Ctrl+O) ", state.calls_view.label())
     };
 
     // scroll и chat_lines уже посчитаны в run() (там же, где решается, прижат ли вид к низу) —
@@ -2968,8 +3035,7 @@ fn draw_agent_chat(frame: &mut Frame, state: &DrawState) {
     let chat_title = if this_agent_waiting {
         format!(" Диалог {} ", SPINNER_FRAMES[state.spinner_frame])
     } else {
-        " Диалог — PageUp/PageDown скролл, End в конец, Tab JSON запроса/ответа, Esc назад к списку агентов "
-            .to_string()
+        format!(" Диалог — Tab JSON, Esc к списку агентов · tools calling: {} (Ctrl+O) ", state.calls_view.label())
     };
     let chat = Paragraph::new(state.chat_lines.to_vec())
         .block(
@@ -3375,6 +3441,7 @@ fn live_tool_row(call: &llm_core::LiveToolCall) -> HistoryItem {
         tokens: None,
         cost: None,
         cost_approx: false,
+        call: Some(call.call.clone()),
     }
 }
 
@@ -3399,6 +3466,7 @@ fn send_to_agent(
             tokens: None,
             cost: None,
             cost_approx: false,
+            call: None,
         });
     }
     let tx = tx.clone();
@@ -3707,7 +3775,46 @@ fn run_memory_command(agent: &llm_core::Agent, raw: &str) -> Result<String, Stri
     }
 }
 
-fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> Vec<Line<'static>> {
+/// Текст строки вызова инструмента в режиме `view`; `None` — строку не показывать.
+/// Кратко — `сервер › инструмент ✓`, отладка — ещё доводы целиком и результат.
+/// Пока вызов идёт или если он прерван — это видно в любом режиме.
+fn tool_row_text(item: &HistoryItem, call: &llm_core::ToolCallRecord, view: llm_core::CallsView) -> Option<String> {
+    let state = if item.text.ends_with(WAITING_RESULT) {
+        Some(WAITING_RESULT.to_string())
+    } else if item.text.ends_with("→ прервано") {
+        Some("→ прервано".to_string())
+    } else {
+        None
+    };
+    let mark = if call.is_error { "✗" } else { "✓" };
+    match view {
+        llm_core::CallsView::Hidden => None,
+        llm_core::CallsView::Brief => Some(match state {
+            Some(state) => format!("{} {state}", call.brief()),
+            None => format!("{} {mark}", call.brief()),
+        }),
+        llm_core::CallsView::Debug => {
+            let result = state.unwrap_or_else(|| format!("→ {}", call.result_preview(1_500)));
+            let args: Vec<String> = call.arguments_pretty().lines().map(|l| format!("  {l}")).collect();
+            Some(format!("{} {mark}\nдоводы:\n{}\n{result}", call.brief(), args.join("\n")))
+        }
+    }
+}
+
+fn history_item_to_lines(
+    item: &HistoryItem,
+    width: usize,
+    show_debug: bool,
+    calls_view: llm_core::CallsView,
+) -> Vec<Line<'static>> {
+    let tool_text = match &item.call {
+        Some(call) => match tool_row_text(item, call, calls_view) {
+            Some(text) => Some(text),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let text: &str = tool_text.as_deref().unwrap_or(&item.text);
     let (label, color) = match item.role {
         Role::User => ("Вы", Color::Cyan),
         // Ответ, который агент дал сам — по расписанию или доставив событие.
@@ -3723,7 +3830,7 @@ fn history_item_to_lines(item: &HistoryItem, width: usize, show_debug: bool) -> 
 
     let prefix_width = label.chars().count() + 2;
     let wrap_width = width.saturating_sub(prefix_width).max(10);
-    let wrapped = textwrap::wrap(&item.text, wrap_width);
+    let wrapped = textwrap::wrap(text, wrap_width);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(wrapped.len() + 1);
     if wrapped.is_empty() {
@@ -3801,6 +3908,46 @@ fn debug_body_lines(json: &str, width: usize) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_row(running: bool) -> HistoryItem {
+        let call = llm_core::LiveToolCall {
+            call: llm_core::ToolCallRecord {
+                server: Some("fs".into()),
+                tool: "read_file".into(),
+                arguments: r#"{"path":"core/src/lib.rs","start_line":40}"#.into(),
+                result: "{\"text\":\"fn main\"}".into(),
+                is_error: false,
+            },
+            running,
+        };
+        live_tool_row(&call)
+    }
+
+    fn rendered(item: &HistoryItem, view: llm_core::CallsView) -> String {
+        history_item_to_lines(item, 120, false, view)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_rows_follow_calls_view() {
+        use llm_core::CallsView;
+        let done = tool_row(false);
+        let brief = rendered(&done, CallsView::Brief);
+        assert!(brief.contains("fs › read_file ✓"), "{brief}");
+        assert!(!brief.contains("core/src/lib.rs"), "кратко — без доводов: {brief}");
+        let debug = rendered(&done, CallsView::Debug);
+        assert!(debug.contains("\"path\": \"core/src/lib.rs\""), "{debug}");
+        assert!(debug.contains("\"start_line\": 40") && debug.contains("fn main"), "{debug}");
+        assert!(rendered(&done, CallsView::Hidden).is_empty());
+        // Идущий вызов виден как идущий и кратко.
+        assert!(rendered(&tool_row(true), CallsView::Brief).contains("fs › read_file → выполняется…"));
+        // Обычные сообщения режим не трогает.
+        let user = HistoryItem { role: Role::User, text: "привет".into(), debug: None, tokens: None, cost: None, cost_approx: false, call: None };
+        assert!(rendered(&user, CallsView::Hidden).contains("привет"));
+    }
 
     /// usage приходит от API одной суммой на весь обмен и хранится в БД только на
     /// сообщении ассистента (см. Db::append_message в agent.rs) — эта проверка

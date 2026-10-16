@@ -61,8 +61,26 @@
 
 | Переменная | По умолчанию | Что |
 |---|---|---|
-| `DEVHELP_DOCS` | `README.md,docs` | Корпус документации |
-| `DEVHELP_DB` | `rag/project.db` | Индекс документации |
-| `DEVHELP_GIT_SERVER` | `git` | Имя сервера git в `mcp.json` |
+| `ASSISTANT_MCP_CONFIG` | `assistant/mcp.json` | Конфигурация MCP ассистента (свой сервер git) |
+| `ASSISTANT_GIT_SERVER` | `git` | Имя сервера git в конфигурации MCP |
+| `ASSISTANT_DOCS` | `README.md,docs` | Корпус документации |
+| `ASSISTANT_DOCS_DB` | `rag/project.db` | Индекс документации |
+| `ASSISTANT_CODE` | `core/src,cli/src,tui/src,web/src,assistant/src,gateway/src,mcp` | Корпус кода |
+| `ASSISTANT_CODE_DB` | `rag/code.db` | Индекс кода |
+| `ASSISTANT_REVIEW_BASE` | `main` | Базовая ветка ревью по умолчанию |
+| `ASSISTANT_REVIEW_MAX_CHARS` | `48000` | Бюджет символов диффа на один запрос ревью |
+| `ASSISTANT_REVIEW_REASONING` | `off` | Рассуждения модели при ревью (`on`/`1`/`true` — включить) |
+| `ASSISTANT_LLM_TIMEOUT` | `180` | Сколько секунд ждать ответ модели на запрос |
+| `ASSISTANT_DUMP_DIR` | — | Отладка: каждый запрос к модели пишется туда JSON-файлом |
 | `GIT_MCP_REPO` | рабочая директория | Репозиторий для `git-mcp` |
-| `LLM_EMBEDDING_MODEL` | — | Модель эмбеддингов (обязательна для поиска по документации) |
+| `GIT_MCP_ADDR` | `127.0.0.1:8094` | Адрес `git-mcp` в режиме `--http` |
+| `LLM_API_URL` | — | Адрес LLM API (обязательна) |
+| `LLM_API_KEY` | — | Ключ API (обязателен) |
+| `LLM_MODEL` | `gpt-4o-mini` | Модель для чата |
+| `LLM_CONTEXT_WINDOW` | — | Размер контекстного окна в токенах (иначе 262000) |
+| `LLM_EMBEDDING_MODEL` | — | Модель эмбеддингов (обязательна для поиска по документации и коду) |
+| `LLM_EMBEDDING_API_URL` | как `LLM_API_URL` | Адрес API эмбеддингов, если не тот же, что у чата |
+| `LLM_EMBEDDING_API_KEY` | как `LLM_API_KEY` | Ключ API эмбеддингов |
+| `LLM_EMBEDDING_BATCH` | `32` | Сколько текстов в одном запросе `/embeddings` |
+| `LLM_EMBEDDING_DOC_PREFIX` | — | Префикс документов для моделей, которые его ждут |
+| `LLM_EMBEDDING_QUERY_PREFIX` | — | Префикс запросов для моделей, которые его ждут |

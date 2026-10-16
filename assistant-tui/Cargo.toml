@@ -1,0 +1,15 @@
+[package]
+name = "assistant-tui"
+version = "0.1.0"
+edition = "2021"
+
+# Общие куски TUI ассистентов (code-assistant, file-assistant): лента с
+# Markdown и плашками вызовов MCP, строка ввода с историей, подсветка команд.
+[dependencies]
+llm-core = { path = "../core" }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+textwrap = "0.16"
+# Разбор Markdown ответов для отрисовки в TUI (см. src/markdown.rs).
+pulldown-cmark = { version = "0.12", default-features = false }
+anyhow = "1"

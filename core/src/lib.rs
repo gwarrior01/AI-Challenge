@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub use agent::{
-    Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CompressionInfo,
+    Agent, AgentConfig, AgentCost, AgentInfo, AgentManager, AgentReply, BranchingInfo, CallsView, CompressionInfo,
     FactsInfo, LiveToolCall, LiveToolCalls, ProfileStatus, ScheduledOutcome, SlidingWindowInfo, ToolCallRecord,
     SCHEDULED_MARK,
 };

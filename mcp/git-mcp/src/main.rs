@@ -37,7 +37,7 @@ const MAX_DIFF_CHARS: usize = 19_000;
 const DEFAULT_LOG: usize = 10;
 const DEFAULT_FILE_LINES: usize = 400;
 const MAX_FILE_LINES: usize = 2_000;
-const MAX_LOG: usize = 50;
+const MAX_LOG: usize = 200;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct FilesParams {
@@ -100,7 +100,7 @@ struct ReadParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LogParams {
-    /// Сколько последних коммитов, по умолчанию 10.
+    /// Сколько последних коммитов, по умолчанию 10, не больше 200.
     #[serde(default)]
     n: Option<usize>,
     /// Только коммиты, затронувшие этот каталог или файл.
