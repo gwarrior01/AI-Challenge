@@ -68,6 +68,9 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "textwrap",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -1489,6 +1492,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]

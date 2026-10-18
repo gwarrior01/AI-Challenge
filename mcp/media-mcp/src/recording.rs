@@ -3,7 +3,8 @@
 //! ```text
 //! webm / mp4 → output.mp4 → output.mp3 → transcript-chunks/chunk-NNN.mp3
 //!            → transcript-chunks/chunk-NNN.txt → output-transcript.md
-//!            → output-summary.md  или  output-summary-prompt.md
+//!            → output-summary.md → output-summary-telegram.md (MarkdownV2)
+//!              или output-summary-prompt.md
 //! ```
 //!
 //! [`inspect`] смотрит чекпоинты от самого позднего к раннему и называет
@@ -16,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::jobs::JobView;
 use crate::media;
@@ -26,6 +28,8 @@ pub const CHUNKS_DIR: &str = "transcript-chunks";
 pub const TRANSCRIPT: &str = "output-transcript.md";
 pub const SUMMARY: &str = "output-summary.md";
 pub const SUMMARY_PROMPT: &str = "output-summary-prompt.md";
+/// Саммари в MarkdownV2 для Telegram — производное от `output-summary.md`.
+pub const TELEGRAM_SUMMARY: &str = "output-summary-telegram.md";
 /// Сюда переезжают негодные артефакты перед повторной работой: на них можно
 /// посмотреть, но в выбор чекпоинта они не попадают.
 pub const DIAGNOSTICS_DIR: &str = "diagnostics";
@@ -144,6 +148,8 @@ pub enum FileState {
     Valid,
     Empty,
     NotAFile,
+    /// Производный файл старше исходного (исходный пересоздан) — сделать заново.
+    Stale,
 }
 
 pub fn file_state(path: &Path) -> FileState {
@@ -152,6 +158,20 @@ pub fn file_state(path: &Path) -> FileState {
         Ok(m) if !m.is_file() => FileState::NotAFile,
         Ok(m) if m.len() == 0 => FileState::Empty,
         Ok(_) => FileState::Valid,
+    }
+}
+
+/// Производный файл (`derived` из `source`): годен, если не старше исходного.
+pub fn derived_state(derived: &Path, source: &Path) -> FileState {
+    match file_state(derived) {
+        FileState::Valid => {
+            let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            match (modified(derived), modified(source)) {
+                (Some(d), Some(s)) if d < s => FileState::Stale,
+                _ => FileState::Valid,
+            }
+        }
+        other => other,
     }
 }
 
@@ -273,7 +293,7 @@ pub async fn check_mp4(dir: &Path, webms: &[String], chosen: Option<&str>) -> Mp
     match file_state(&dir.join(MP4)) {
         FileState::Missing => return Mp4Check::Missing,
         FileState::Empty => return Mp4Check::Empty,
-        FileState::NotAFile => return Mp4Check::NotAFile,
+        FileState::NotAFile | FileState::Stale => return Mp4Check::NotAFile,
         FileState::Valid => {}
     }
     let webm = match (webms, chosen.filter(|c| webms.iter().any(|w| w == c))) {
@@ -300,7 +320,7 @@ pub async fn durations(webm: &Path, mp4: &Path) -> Result<(i64, i64)> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Next {
     /// `wait_job`, `transcribe`, `split_audio`, `extract_mp3`, `convert_to_mp4`,
-    /// `choose_source`, `ask_summary`, `done`, `nothing`.
+    /// `choose_source`, `ask_summary`, `telegram_summary`, `done`, `nothing`.
     pub step: &'static str,
     /// Инструмент и доводы для этого шага (если шаг — вызов инструмента).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,6 +365,7 @@ pub struct Inspection {
     pub sources: Sources,
     pub summary: FileState,
     pub summary_prompt: FileState,
+    pub telegram_summary: FileState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<JobView>,
     pub next: Next,
@@ -355,15 +376,19 @@ pub struct Inspection {
 /// извлечения звука).
 pub async fn inspect(root: &Root, dir: &Path, source: Option<&str>, job: Option<JobView>) -> Result<Inspection> {
     let sources = sources(dir);
-    if let Some(s) = source {
-        if !sources.webm.iter().chain(&sources.mp4).any(|n| n == s) {
-            bail!(
+    // Выбор пользователя — к имени файла как на диске (NFC/NFD не важны).
+    let source = match source {
+        None => None,
+        Some(s) => match sources.webm.iter().chain(&sources.mp4).find(|n| same_name(n, s)) {
+            Some(n) => Some(n.clone()),
+            None => bail!(
                 "«{s}» — не исходник в этом каталоге; есть WebM: {}, MP4: {}",
                 list_or_none(&sources.webm),
                 list_or_none(&sources.mp4)
-            );
-        }
-    }
+            ),
+        },
+    };
+    let source = source.as_deref();
     let transcript = file_state(&dir.join(TRANSCRIPT));
     let chunks = scan_chunks(dir);
     let mp3 = file_state(&dir.join(MP3));
@@ -377,15 +402,16 @@ pub async fn inspect(root: &Root, dir: &Path, source: Option<&str>, job: Option<
         match file_state(&dir.join(MP4)) {
             FileState::Missing => Mp4Check::Missing,
             FileState::Empty => Mp4Check::Empty,
-            FileState::NotAFile => Mp4Check::NotAFile,
+            FileState::NotAFile | FileState::Stale => Mp4Check::NotAFile,
             FileState::Valid => Mp4Check::Unverified,
         }
     };
     let summary = file_state(&dir.join(SUMMARY));
     let summary_prompt = file_state(&dir.join(SUMMARY_PROMPT));
+    let telegram_summary = derived_state(&dir.join(TELEGRAM_SUMMARY), &dir.join(SUMMARY));
     let next = match &job {
         Some(j) => Next::say("wait_job", format!("идёт задание {} ({}): {}", j.id, j.kind, j.progress)),
-        None => next_step(transcript, &chunks, mp3, &mp4, &sources, source, summary),
+        None => next_step(transcript, &chunks, mp3, &mp4, &sources, source, (summary, telegram_summary)),
     };
     Ok(Inspection {
         root: root.path().display().to_string(),
@@ -397,6 +423,7 @@ pub async fn inspect(root: &Root, dir: &Path, source: Option<&str>, job: Option<
         sources,
         summary,
         summary_prompt,
+        telegram_summary,
         job,
         next,
     })
@@ -410,13 +437,26 @@ fn next_step(
     mp4: &Mp4Check,
     sources: &Sources,
     source: Option<&str>,
-    summary: FileState,
+    (summary, telegram): (FileState, FileState),
 ) -> Next {
     if transcript == FileState::Valid {
-        return if summary == FileState::Valid {
-            Next::say("done", format!("{TRANSCRIPT} и {SUMMARY} уже есть — саммари переиспользуется; заново — только по явной просьбе (summarize с force)"))
-        } else {
-            Next::say("ask_summary", format!("{TRANSCRIPT} готов — спросить пользователя, делать ли саммари"))
+        return match (summary, telegram) {
+            (FileState::Valid, FileState::Valid) => Next::say(
+                "done",
+                format!(
+                    "{TRANSCRIPT}, {SUMMARY} и {TELEGRAM_SUMMARY} уже есть — саммари переиспользуется; заново — только по \
+                     явной просьбе (summarize с force)"
+                ),
+            ),
+            (FileState::Valid, t) => Next::tool(
+                "telegram_summary",
+                json!({}),
+                format!(
+                    "{SUMMARY} есть — подготовить {TELEGRAM_SUMMARY} (MarkdownV2 для Telegram){}",
+                    if t == FileState::Stale { "; прежний устарел — саммари пересоздано" } else { "" }
+                ),
+            ),
+            _ => Next::say("ask_summary", format!("{TRANSCRIPT} готов — спросить пользователя, делать ли саммари")),
         };
     }
     if chunks.state == SetState::Valid {
@@ -479,6 +519,12 @@ fn next_step(
         ([], None) => Next::say("nothing", "нет ни транскрипта, ни чанков, ни MP3, ни видео (.mp4, .webm) — обрабатывать нечего"),
         (many, None) => Next::choose(many.to_vec(), "несколько WebM — какой обработать?"),
     }
+}
+
+/// Одно и то же имя файла: macOS хранит имена в NFD («й» = «и» + U+0306),
+/// а из строки ввода и от модели они приходят в NFC.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.nfc().eq(b.nfc())
 }
 
 fn list_or_none(items: &[String]) -> String {
@@ -594,7 +640,17 @@ mod tests {
         put(&dir, "output-transcript.md", "текст");
         assert_eq!(next(&dir, None).await.step, "ask_summary");
         put(&dir, "output-summary.md", "саммари");
+        assert_eq!(next(&dir, None).await.step, "telegram_summary");
+        put(&dir, "output-summary-telegram.md", "*саммари*");
         assert_eq!(next(&dir, None).await.step, "done");
+
+        // Саммари пересоздали позже Telegram-версии — она устарела.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(dir.join("output-summary-telegram.md")).unwrap().set_modified(old).unwrap();
+        let root = Root::open(&dir).unwrap();
+        let i = inspect(&root, &root.recording(None).unwrap(), None, None).await.unwrap();
+        assert_eq!((i.telegram_summary, i.next.step), (FileState::Stale, "telegram_summary"));
+        assert!(i.next.why.contains("устарел"), "{}", i.next.why);
     }
 
     #[tokio::test]
@@ -606,6 +662,17 @@ mod tests {
         assert!(matches!(i.mp4, Mp4Check::Unverified));
         assert_eq!((i.next.step, i.next.arg("source").as_deref()), ("extract_mp3", Some("output.mp4")));
         assert!(inspect(&root, &dir, Some("чужой.webm"), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn source_choice_ignores_unicode_form() {
+        let dir = tmp("nfd");
+        let nfd: String = "Май.webm".nfd().collect();
+        put(&dir, &nfd, "w");
+        put(&dir, "Июнь.webm", "w");
+        let n = next(&dir, Some("Май.webm")).await;
+        assert_eq!((n.step, n.arg("source")), ("convert_to_mp4", Some(nfd)), "имя — как на диске");
+        assert!(same_name("Май", &"Май".nfd().collect::<String>()) && !same_name("Май", "Маи"));
     }
 
     #[test]

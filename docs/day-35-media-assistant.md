@@ -1,6 +1,6 @@
 # День 35: ассистент для обработки записей встреч
 
-`media-assistant` — ассистент, который доводит запись встречи книжного клуба от видео до саммари: WebM или MP4 → `output.mp4` → `output.mp3` → MP3-чанки → транскрипт → саммари. Раньше это был скилл `convert-summarize` для Claude Code или Codex. Больше половины его текста уговаривала агента не ошибаться: дождаться `ffmpeg`, а не верить появившемуся файлу; не пропускать чанки с готовыми TXT; сверять длительность MP4 с WebM. Теперь эти правила — код:
+`media-assistant` — ассистент, который доводит запись встречи книжного клуба от видео до саммари: WebM или MP4 → `output.mp4` → `output.mp3` → MP3-чанки → транскрипт → саммари в Markdown → версия саммари для Telegram (для вставки руками и MarkdownV2 для бота). Раньше это был скилл `convert-summarize` для Claude Code или Codex. Больше половины его текста уговаривала агента не ошибаться: дождаться `ffmpeg`, а не верить появившемуся файлу; не пропускать чанки с готовыми TXT; сверять длительность MP4 с WebM. Теперь эти правила — код:
 
 - **MCP `media`** — свой сервер `mcp/media-mcp`. Он разбирает каталог записи, находит последний годный чекпоинт и называет следующий шаг. Шаги вне очереди отклоняет. Долгую работу запускает заданиями и сам ждёт выхода процесса;
 - **модель** (общая для проекта, `LLM_MODEL`) ведёт процесс по подсказкам сервера, задаёт вопросы, где нужен выбор («какой WebM?», «Сделать саммари? (да/нет)»), и пишет отчёт;
@@ -18,6 +18,8 @@
       media · split_audio            │ wait_job по 5 с и показывает ход; модель получает
       media · transcribe             │ итог: succeeded (result) или failed (error)
       media · summarize              ┘
+      media · telegram_summary       — output-summary.md → output-summary-telegram.md (вставить в Telegram)
+                                       и output-summary-telegram-bot.md (MarkdownV2 для бота)
       media · list_llm_models, write_summary_prompt, probe, list_recordings
   → вопрос пользователю (choose_source, ask_summary) — диалог продолжается следующей репликой
   → или отчёт: что переиспользовано, что сделано, длительности, итоговые файлы, модель LM Studio
@@ -27,7 +29,7 @@
 
 | Чекпоинт | Годен, когда | Следующий шаг |
 |---|---|---|
-| `output-transcript.md` | обычный непустой файл | `ask_summary` или `done`, если `output-summary.md` уже есть |
+| `output-transcript.md` | обычный непустой файл | `ask_summary`; если `output-summary.md` уже есть — `telegram_summary`, а когда есть и `output-summary-telegram.md` не старше саммари — `done` |
 | `transcript-chunks/chunk-*.mp3` | хотя бы один, все непустые, имена `chunk-NNN.mp3` | `transcribe` — **все** чанки, TXT перезаписываются |
 | `output.mp3` | непустой | `split_audio` |
 | `output.mp4` | непустой и совпал по длительности (целые секунды) с WebM; если WebM рядом нет — без сверки | `extract_mp3`. При несовпадении — `convert_to_mp4`: старый файл переезжает в `diagnostics/` |
@@ -47,7 +49,31 @@ TXT чанков в выборе не участвуют: это не чекпо
 | Прерванная запись не выглядит готовой | MP3 пишется в `.output.mp3.partial`, чанки — во временный каталог, TXT, транскрипт и саммари — через временный файл с переименованием. Недописанный `output.mp4` ловит сверка длительности |
 | Все чанки, не больше двух запросов, повторы | `transcribe.rs`: 30 с на соединение, 1800 с на ответ, ещё 2 попытки через 5 с при любой ошибке. Транскрипт собирается только из чанков, расшифрованных в **этом** запуске: старый TXT не делает неполную транскрипцию полной |
 | Склейка без правок | байты TXT по порядку номеров, без заголовков |
-| Саммари: шаблон, без обрезки, без другого LLM | `summary.rs`: шаблон из скилла (`summary-prompt.md`), полный транскрипт. Сохраняется только ответ модели, без рассуждений `<think>`. Готовое саммари перезаписывается только с `force` |
+| Саммари: шаблон, без обрезки, без другого LLM | `summary.rs`: шаблон из скилла (`summary-prompt.md`), полный транскрипт. Сохраняется только ответ модели, без рассуждений `<think>` и без обёртки в блок кода. Готовое саммари перезаписывается только с `force` |
+
+## Саммари для Telegram
+
+Шаблон просит модель ответить в Markdown: `## Краткое резюме` (абзац) и `## Ключевые мысли` (список, главное в пункте — **жирным**). Шаблон из скилла изменён только в части «Формат».
+
+`telegram_summary` разбирает `output-summary.md` Python-библиотекой [telegramify-markdown](https://github.com/sudoskys/telegramify-markdown) и пишет два файла. **Сервер ничего не отправляет.**
+
+| Файл | Для чего | Как выглядит |
+|---|---|---|
+| `output-summary-telegram.md` | Вставить в приложение Telegram руками и отправить | Разметка, которую приложение само разбирает при отправке: `**жирный**`, `__курсив__`, `~~зачёркнутый~~`, `` `код` ``, `\|\|спойлер\|\|`. Без экранирования. Ссылка — «текст (url)», подчёркивания нет |
+| `output-summary-telegram-bot.md` | Bot API: `sendMessage` с `parse_mode="MarkdownV2"` | MarkdownV2 (`markdownify`): `__*заголовок*__`, экранирование `\.`, `\(`, `\!`. Вставленный руками, показывается как есть, с обратными слэшами |
+
+Заголовки в обоих — жирные с эмодзи `✏`, пункты — `⦁`. Версия для вставки собирается из сущностей `convert()` (текст + смещения в UTF-16): маркеры приложения ставятся по их позициям, эмодзи позиции не сбивают. В ответе инструмента — длина отправленного сообщения в единицах UTF-16 (так считает Telegram) и `fits_one_message`: помещается ли оно в одно сообщение (4096).
+
+**Ограничение библиотеки.** `telegramify-markdown` 1.4.0 вместе с `pyromark` 0.10 молча возвращает пустой текст, если во входе есть `~` или `$` («около ~20 человек», «$10»). В `pyromark` 0.10 события — одноразовый итератор, а библиотека проходит по ним дважды. Поэтому в `media/requirements.txt` закреплён `pyromark==0.9.14`, а сервер не записывает пустой результат: он завершается ошибкой с подсказкой про версии.
+
+Шаг встроен в пайплайн: после `summarize` `inspect` называет `telegram_summary`. Если саммари пересоздали (`force`), прежняя версия для Telegram считается устаревшей (`stale`) и делается заново.
+
+Скрипт `telegram.py` встроен в сервер и запускается Python из `MEDIA_PYTHON`. По умолчанию это `media/.venv/bin/python`, если он есть, иначе `python3`. Установка:
+
+```bash
+python3 -m venv media/.venv
+media/.venv/bin/pip install -r media/requirements.txt      # telegramify-markdown==1.4.0, pyromark==0.9.14
+```
 
 Модель LM Studio для саммари выбирается так. Если модель не указана и пригодная для чата всего одна или загружена в память всего одна, сервер берёт её сам (`obvious` в `list_llm_models`). Иначе ассистент спрашивает пользователя. Это расширение правила скилла: на прогонах в LM Studio было 9 чат-моделей и одна загруженная, а незагруженная отвечает «Model is unloaded».
 
@@ -56,7 +82,7 @@ TXT чанков в выборе не участвуют: это не чекпо
 | Интерфейс | Как |
 |---|---|
 | TUI (основной) | `cargo run -p media-assistant [каталог]`. Реплики — просто текстом: «обработай», «да», «возьми meeting-2.webm». В шапке: сервер `media`, каталог записи, следующий шаг. Внизу — ход идущего задания (`convert_to_mp4 j1 · 12:01 из 58:10 (20%)`, `transcribe j4 · чанки: 7 из 14 готово`) |
-| CLI | `media-assistant run [каталог] [--summary да\|нет] [--quiet]`. Ответ — в stdout, вызовы и ход заданий — в stderr. Без `--summary` прогон остановится на вопросе о саммари |
+| CLI | `media-assistant run [каталог] [--summary yes\|no] [--quiet]`. Ответ — в stdout, вызовы и ход заданий — в stderr. Без `--summary` прогон остановится на вопросе о саммари |
 | Claude Code / Codex и другие клиенты MCP | `cargo run -p media-mcp -- --http` → `http://127.0.0.1:8098/mcp`. Клиент сам вызывает `wait_job` (инструкции сервера это объясняют) |
 
 ### Команды TUI
@@ -77,8 +103,8 @@ TXT чанков в выборе не участвуют: это не чекпо
 
 Запись: 24 секунды русской речи (`say -v Milena`) на тестовом видео, `MEDIA_CHUNK_SECONDS=10`, модель `qwen3.8-27b-fable-distill` в LM Studio, транскрибатор `192.168.0.44:8000`.
 
-1. `run 2026-10-15 --summary нет`: inspect → convert_to_mp4 (WebM 24 с = MP4 24 с, Duration check: OK) → extract_mp3 → split_audio (3 чанка) → transcribe (3 из 3 с первой попытки) → write_summary_prompt. 12 вызовов, 1 мин 50 с.
-2. `run 2026-10-15 --summary да` на том же каталоге: inspect сразу отдал `ask_summary` (транскрипт переиспользован) → list_llm_models (9 чат-моделей, загружена одна — `obvious`) → summarize (39 с) → отчёт с моделью.
+1. `run 2026-10-15 --summary no`: inspect → convert_to_mp4 (WebM 24 с = MP4 24 с, Duration check: OK) → extract_mp3 → split_audio (3 чанка) → transcribe (3 из 3 с первой попытки) → write_summary_prompt. 12 вызовов, 1 мин 50 с.
+2. `run 2026-10-15 --summary yes` на том же каталоге: inspect сразу отдал `ask_summary` (транскрипт переиспользован) → list_llm_models (9 чат-моделей, загружена одна — `obvious`) → summarize (39 с) → отчёт с моделью.
 
 ## Сохранённые диалоги
 
@@ -106,6 +132,7 @@ TXT чанков в выборе не участвуют: это не чекпо
 | `list_llm_models` | — | `models`, `chat_models`, `loaded_chat_models`, `obvious` |
 | `summarize` | `dir?`, `model?`, `force?` | `job`. Итог: `created`, `model`, `chars` |
 | `write_summary_prompt` | `dir?` | `created`, `chars`, `lm_studio_called: false` |
+| `telegram_summary` | `dir?` | `created[]`, `paste` {file, use}, `bot` {file, use}, `utf16_len`, `fits_one_message`, `library`, `sent: false` |
 | `wait_job` | `id`, `seconds?` (60, до 600) | задание: `state` running/succeeded/failed, `progress`, `elapsed_sec`, `result`/`error`. **Модели ассистента не выдаётся**: ждёт код |
 | `job_status` | `id?` | задание или `jobs[]`. Модели ассистента тоже не выдаётся |
 
@@ -118,6 +145,7 @@ TXT чанков в выборе не участвуют: это не чекпо
 | `mcp/media-mcp/src/media.rs` | `ffprobe`, `ffmpeg` с `-progress` и последними строками stderr при ошибке |
 | `mcp/media-mcp/src/steps.rs` | Шаги: проверка очереди, задания конвертации, извлечения, нарезки, транскрипции, саммари |
 | `mcp/media-mcp/src/transcribe.rs`, `summary.rs` | Транскрибатор (multipart, 2 параллельно, повторы) и LM Studio (модели, шаблон, ответ) |
+| `mcp/media-mcp/src/telegram.rs`, `telegram.py` | Саммари для Telegram через `telegramify-markdown`: версия для вставки (из сущностей `convert`) и MarkdownV2; `media/requirements.txt` — версии библиотек |
 | `media/assistant/src/dialog.rs` | Диалог: промпт, цикл «модель → инструменты», ожидание заданий кодом, подстановка `dir` |
 | `media/assistant/src/session.rs` | Модель и MCP. Инструменты модели — без `wait_job` и `job_status` |
 | `media/assistant/src/runs.rs`, `tui.rs`, `main.rs` | Сохранение диалогов, TUI и CLI |
@@ -144,6 +172,7 @@ TXT чанков в выборе не участвуют: это не чекпо
 | `MEDIA_SUMMARY_TIMEOUT` | `7200` | Секунд на ответ LM Studio — без короткого предела |
 | `MEDIA_SUMMARY_TEMPLATE` | встроенный | Свой шаблон промпта саммари (с `<TRANSCRIPT>`) |
 | `MEDIA_FFMPEG` / `MEDIA_FFPROBE` | `ffmpeg` / `ffprobe` | Пути к программам |
+| `MEDIA_PYTHON` | `media/.venv/bin/python`, иначе `python3` | Python с `telegramify-markdown` для `telegram_summary` |
 
 ## Проверка
 
@@ -152,7 +181,9 @@ cargo test -p media-mcp                         # чекпоинты, задан
                                                 #   поддельные транскрибатор и LM Studio
 cargo test -p media-assistant                   # подстановка dir, ожидание заданий, диалоги, TUI
 cargo test -p media-assistant -- --ignored      # живой media-mcp по stdio через McpManager
-MEDIA_ROOT=~/Recordings cargo run -p media-assistant -- run 2026-10-15 --summary нет
+MEDIA_ROOT=~/Recordings cargo run -p media-assistant -- run 2026-10-15 --summary no
 ```
 
-Тесты с `ffmpeg` сами генерируют короткие WebM (`lavfi`). Если `ffmpeg` не установлен, они пропускаются с сообщением.
+Тесты с `ffmpeg` сами генерируют короткие WebM (`lavfi`). Если `ffmpeg` не установлен, они пропускаются с сообщением. Так же пропускается тест Telegram-версии, если нет Python с `telegramify-markdown` (`MEDIA_PYTHON` или `media/.venv`).
+
+Прогон Telegram-версии на реальных сервисах: `run 2026-10-15 --summary yes` после удаления старого саммари — summarize (38 с, Markdown по новому шаблону) → inspect назвал `telegram_summary` → `output-summary-telegram.md`, 1286 единиц UTF-16, одно сообщение. Вставленный руками в приложение, MarkdownV2 показывался с обратными слэшами. Отсюда отдельная версия для вставки, а MarkdownV2 переехал в `output-summary-telegram-bot.md`.

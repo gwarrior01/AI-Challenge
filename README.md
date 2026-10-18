@@ -296,11 +296,11 @@ The model's edits never hit the disk on their own: `fs-mcp` keeps them in an ove
 
 #### Media assistant: meeting recording → transcript → summary (`media-assistant`, `media-mcp`)
 
-An assistant that takes a book-club recording from video to summary: WebM/MP4 → `output.mp4` → `output.mp3` → 5-minute MP3 chunks → `output-transcript.md` (local transcription service) → `output-summary.md` (LM Studio) or `output-summary-prompt.md`. It replaces a Claude Code/Codex skill whose rules — resume from the latest valid checkpoint, wait for `ffmpeg` to exit rather than trust a growing file, check the MP4 duration against the WebM, always transcribe every chunk — now live in code of its own MCP server `mcp/media-mcp`, not in the model's memory.
+An assistant that takes a book-club recording from video to summary: WebM/MP4 → `output.mp4` → `output.mp3` → 5-minute MP3 chunks → `output-transcript.md` (local transcription service) → `output-summary.md` (LM Studio, Markdown) → Telegram versions via the Python library [telegramify-markdown](https://github.com/sudoskys/telegramify-markdown): `output-summary-telegram.md` to paste into the Telegram app (`**bold**`, `__italic__` — the app formats them on send) and `output-summary-telegram-bot.md` in MarkdownV2 for the Bot API — nothing is sent or `output-summary-prompt.md`. It replaces a Claude Code/Codex skill whose rules — resume from the latest valid checkpoint, wait for `ffmpeg` to exit rather than trust a growing file, check the MP4 duration against the WebM, always transcribe every chunk — now live in code of its own MCP server `mcp/media-mcp`, not in the model's memory.
 
 ```bash
 MEDIA_ROOT=~/Recordings cargo run -p media-assistant 2026-10-15        # TUI: «обработай», answers, /dir, /status, /jobs
-MEDIA_ROOT=~/Recordings cargo run -p media-assistant -- run 2026-10-15 --summary да
+MEDIA_ROOT=~/Recordings cargo run -p media-assistant -- run 2026-10-15 --summary yes
 cargo run -p media-mcp -- --http                                        # the same tools for Claude Code & co: 127.0.0.1:8098/mcp
 ```
 

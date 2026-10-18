@@ -15,6 +15,7 @@ use crate::jobs::{Failure, JobCtx, JobView, Jobs};
 use crate::media;
 use crate::recording::{self, file_state, FileState, Inspection, Root, SetState, CHUNKS_DIR, MP3, MP4, SUMMARY, SUMMARY_PROMPT, TRANSCRIPT};
 use crate::summary;
+use crate::telegram;
 use crate::transcribe::{self, write_atomic};
 
 /// Длина чанка, секунды (`MEDIA_CHUNK_SECONDS`).
@@ -26,6 +27,8 @@ pub struct Media {
     pub transcribe: transcribe::Config,
     pub lm: summary::Config,
     pub chunk_seconds: u32,
+    /// Python с `telegramify-markdown` (см. [`telegram::python`]).
+    pub python: PathBuf,
 }
 
 /// Ответ инструмента, запустившего задание.
@@ -45,6 +48,7 @@ impl Media {
             transcribe: transcribe::Config::from_env(),
             lm: summary::Config::from_env(),
             chunk_seconds: media::env_or("MEDIA_CHUNK_SECONDS", "").parse().unwrap_or(DEFAULT_CHUNK_SECONDS).max(1),
+            python: telegram::python(),
         }
     }
 
@@ -72,7 +76,7 @@ impl Media {
     pub async fn convert_to_mp4(&self, dir: Option<&str>, source: Option<&str>) -> Result<Value, String> {
         let (path, i) = self.expect(dir, source, "convert_to_mp4").await?;
         let webm = i.next.arg("source").expect("у convert_to_mp4 всегда есть source");
-        if let Some(s) = source.filter(|s| *s != webm) {
+        if let Some(s) = source.filter(|s| !recording::same_name(s, &webm)) {
             return Err(format!("сейчас конвертируется {webm}, а не {s}"));
         }
         // Негодный или недописанный output.mp4 — не затирать, а убрать для разбора.
@@ -92,10 +96,10 @@ impl Media {
     /// `output.mp4` или исходный MP4 → `output.mp3`.
     pub async fn extract_mp3(&self, dir: Option<&str>, source: Option<&str>, webm: Option<&str>) -> Result<Value, String> {
         // Выбор для inspect — исходник: WebM для сверки output.mp4 или исходный MP4.
-        let choice = webm.or(source.filter(|s| *s != MP4));
+        let choice = webm.or(source.filter(|s| !recording::same_name(s, MP4)));
         let (path, i) = self.expect(dir, choice, "extract_mp3").await?;
         let input = i.next.arg("source").expect("у extract_mp3 всегда есть source");
-        if let Some(s) = source.filter(|s| *s != input) {
+        if let Some(s) = source.filter(|s| !recording::same_name(s, &input)) {
             return Err(format!("звук сейчас извлекается из {input}, а не из {s} ({})", i.next.why));
         }
         let label = i.dir.clone();
@@ -188,6 +192,18 @@ impl Media {
         let prompt = summary::prompt(&path.join(TRANSCRIPT)).map_err(text)?;
         write_atomic(&path.join(SUMMARY_PROMPT), prompt.as_bytes()).map_err(text)?;
         Ok(json!({ "created": SUMMARY_PROMPT, "chars": prompt.chars().count(), "lm_studio_called": false }))
+    }
+
+    /// `output-summary.md` → `output-summary-telegram.md` (MarkdownV2). Ничего не отправляет.
+    pub async fn telegram_summary(&self, dir: Option<&str>) -> Result<Value, String> {
+        let (path, i) = self.inspect(dir, None).await.map_err(text)?;
+        if let Some(j) = &i.job {
+            return Err(format!("в каталоге идёт задание {} ({}) — дождись его", j.id, j.kind));
+        }
+        if i.summary != FileState::Valid {
+            return Err(format!("{SUMMARY} ещё нет — преобразовывать нечего; следующий шаг — {} ({})", i.next.step, i.next.why));
+        }
+        telegram::write(&self.python, &path).await.map_err(text)
     }
 
     /// Длительность файла каталога записи.
@@ -353,6 +369,7 @@ mod tests {
             transcribe: crate::transcribe::tests::config(transcriber),
             lm: summary::Config { url: lm.into(), timeout: Duration::from_secs(10) },
             chunk_seconds: 2,
+            python: telegram::python(),
         }
     }
 
@@ -411,7 +428,7 @@ mod tests {
         assert_eq!(s.state, JobState::Succeeded, "{s:?}");
         assert!(std::fs::read_to_string(dir.join("rec/output-summary.md")).unwrap().starts_with("Краткое резюме"));
         assert!(m.summarize(rec, None, false).await.unwrap_err().contains("force=true"));
-        assert_eq!(m.inspect(rec, None).await.unwrap().1.next.step, "done");
+        assert_eq!(m.inspect(rec, None).await.unwrap().1.next.step, "telegram_summary");
     }
 
     /// `output.mp4` не совпал с WebM по длительности: в MP3 не идём, старый

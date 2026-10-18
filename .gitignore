@@ -37,3 +37,4 @@ rag/support.db-shm
 review.md
 files/runs/
 media/runs/
+media/.venv/

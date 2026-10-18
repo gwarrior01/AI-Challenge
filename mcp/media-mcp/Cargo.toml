@@ -19,6 +19,8 @@ serde_json = "1"
 anyhow = "1"
 # Транскрибатор (multipart) и LM Studio (OpenAI-совместимый API).
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# Имена файлов macOS — в NFD, выбор пользователя — в NFC: сравнение без учёта формы.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 # Поддельный сервис распознавания в тестах принимает multipart.

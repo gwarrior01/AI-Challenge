@@ -332,6 +332,7 @@ fn stage_line(text: &str) -> String {
         "done" => "готово: транскрипт и саммари есть".to_string(),
         "nothing" => "нечего обрабатывать".to_string(),
         "ask_summary" => "транскрипт готов · саммари?".to_string(),
+        "telegram_summary" => "дальше: версия для Telegram".to_string(),
         "choose_source" => "нужно выбрать исходник".to_string(),
         "wait_job" => format!("идёт {}", v["job"]["kind"].as_str().unwrap_or("задание")),
         other => format!("дальше: {other}"),
@@ -343,6 +344,7 @@ fn state_word(v: &Value) -> &'static str {
         Some("valid") => "есть",
         Some("empty") => "пустой — не годится",
         Some("not_a_file") => "не файл",
+        Some("stale") => "устарел — саммари новее",
         _ => "нет",
     }
 }
@@ -387,6 +389,7 @@ fn format_inspection(text: &str) -> String {
     out.push_str(&format!("  output.mp4   {mp4_line}\n"));
     out.push_str(&format!("  исходники    WebM: {} · MP4: {}\n", list("webm"), list("mp4")));
     out.push_str(&format!("  саммари      {} · промпт саммари: {}\n", state_word(&v["summary"]), state_word(&v["summary_prompt"])));
+    out.push_str(&format!("  для Telegram {}\n", state_word(&v["telegram_summary"])));
     let next = &v["next"];
     out.push_str(&format!("Дальше: {} — {}", next["step"].as_str().unwrap_or("?"), next["why"].as_str().unwrap_or("")));
     if let Some(choices) = next["choices"].as_array().filter(|c| !c.is_empty()) {
@@ -496,7 +499,7 @@ mod tests {
     const INSPECTION: &str = r#"{"root":"/rec","dir":"2026-10-15","transcript":"missing",
         "chunks":{"state":"missing","files":[]},"mp3":"missing",
         "mp4":{"state":"mismatch","webm":"meeting.webm","webm_seconds":3605,"mp4_seconds":3401},
-        "sources":{"webm":["meeting.webm"],"mp4":[]},"summary":"missing","summary_prompt":"missing",
+        "sources":{"webm":["meeting.webm"],"mp4":[]},"summary":"valid","summary_prompt":"missing","telegram_summary":"stale",
         "next":{"step":"convert_to_mp4","tool":"convert_to_mp4","args":{"source":"meeting.webm"},"why":"output.mp4 негоден"}}"#;
 
     #[test]
@@ -505,6 +508,7 @@ mod tests {
         assert!(text.starts_with("Каталог: 2026-10-15 (корень /rec)\n"), "{text}");
         assert!(text.contains("output.mp4   НЕ совпал с meeting.webm: WebM 3605 с, MP4 3401 с"), "{text}");
         assert!(text.contains("исходники    WebM: meeting.webm · MP4: —"), "{text}");
+        assert!(text.contains("для Telegram устарел — саммари новее"), "{text}");
         assert!(text.ends_with("Дальше: convert_to_mp4 — output.mp4 негоден"), "{text}");
         assert_eq!(stage_line(INSPECTION), "дальше: convert_to_mp4");
         assert_eq!(stage_line(r#"{"next":{"step":"ask_summary"}}"#), "транскрипт готов · саммари?");

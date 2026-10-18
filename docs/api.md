@@ -118,6 +118,7 @@
 | `list_llm_models` | — | `models`, `chat_models`, `loaded_chat_models`, `obvious` |
 | `summarize` | `dir?`, `model?`, `force?` | `job` |
 | `write_summary_prompt` | `dir?` | `created`, `chars`, `lm_studio_called` |
+| `telegram_summary` | `dir?` | `created[]` (`output-summary-telegram.md` — вставить в приложение, `output-summary-telegram-bot.md` — MarkdownV2 для бота), `utf16_len`, `fits_one_message`, `library`, `sent: false` |
 | `wait_job` | `id`, `seconds?` (60, до 600) | задание: `state`, `progress`, `result` / `error` |
 | `job_status` | `id?` | задание или `jobs[]` |
 

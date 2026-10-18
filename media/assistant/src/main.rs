@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! media-assistant [каталог]                       — TUI: реплики, /dir, /status, /jobs
-//! media-assistant run [каталог] [--summary да|нет] — одна обработка без интерфейса
+//! media-assistant run [каталог] [--summary yes|no] — одна обработка без интерфейса
 //! ```
 //!
 //! Каталог записи — от корня `MEDIA_ROOT` сервера (по умолчанию корень,
@@ -33,7 +33,7 @@ const USAGE: &str = "media-assistant — обработка записей вс�
 Каталог записи — от корня MEDIA_ROOT (по умолчанию — сам корень).
 
 Флаги run:
-  --summary да|нет   ответ на вопрос о саммари заранее (иначе run остановится на вопросе)
+  --summary yes|no   ответ на вопрос о саммари заранее (иначе run остановится на вопросе)
   --quiet            не печатать вызовы инструментов и ход заданий в stderr
 
 Результат: ответ ассистента — в stdout, диалог — в media/runs/<id>/.
@@ -85,10 +85,12 @@ impl RunArgs {
             match a.as_str() {
                 "--quiet" | "-q" => r.quiet = true,
                 "--summary" => {
+                    // Основная форма — yes/no; y/n и да/нет — синонимы.
                     r.summary = match it.next().map(|s| s.to_lowercase()).as_deref() {
-                        Some("да" | "yes" | "y") => Some(true),
-                        Some("нет" | "no" | "n") => Some(false),
-                        _ => bail!("--summary да|нет"),
+                        Some("yes" | "y" | "да") => Some(true),
+                        Some("no" | "n" | "нет") => Some(false),
+                        Some(other) => bail!("--summary yes|no, а не «{other}»"),
+                        None => bail!("--summary yes|no — нужно значение"),
                     }
                 }
                 flag if flag.starts_with("--") => bail!("неизвестный флаг {flag}\n\n{USAGE}"),
@@ -158,10 +160,13 @@ mod tests {
 
     #[test]
     fn run_arguments() {
-        let r = parse(&["2026-10-15", "--summary", "да", "-q"]).unwrap();
+        let r = parse(&["2026-10-15", "--summary", "yes", "-q"]).unwrap();
         assert_eq!(r, RunArgs { dir: Some("2026-10-15".into()), summary: Some(true), quiet: true });
         assert!(r.request().contains("да — делай саммари"));
         assert_eq!(parse(&["--summary", "no"]).unwrap().summary, Some(false));
+        assert_eq!(parse(&["--summary", "YES"]).unwrap().summary, Some(true));
+        assert_eq!(parse(&["--summary", "нет"]).unwrap().summary, Some(false));
+        assert!(parse(&["--summary"]).unwrap_err().to_string().contains("нужно значение"));
         assert!(parse(&[]).unwrap().request().contains("задай его и остановись"));
         assert!(parse(&["--summary", "может"]).is_err());
         assert!(parse(&["a", "b"]).is_err());

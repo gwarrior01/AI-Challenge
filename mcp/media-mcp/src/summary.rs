@@ -118,7 +118,7 @@ pub async fn complete(cfg: &Config, model: &str, prompt: &str) -> Result<String>
     }
     let body: Value = serde_json::from_str(&text).context("LM Studio: ответ не JSON")?;
     let content = body["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-    let answer = strip_think(content);
+    let answer = strip_fence(&strip_think(content));
     if answer.is_empty() {
         bail!("LM Studio вернула пустой ответ");
     }
@@ -130,6 +130,20 @@ pub fn strip_think(text: &str) -> String {
     let t = text.trim();
     match (t.find("<think>"), t.find("</think>")) {
         (Some(0), Some(end)) => t[end + "</think>".len()..].trim().to_string(),
+        _ => t.to_string(),
+    }
+}
+
+/// Ответ целиком в блоке кода (```markdown … ```) — снять обёртку: это не часть саммари.
+pub fn strip_fence(text: &str) -> String {
+    let t = text.trim();
+    let Some(rest) = t.strip_prefix("```") else { return t.to_string() };
+    let Some((lang, body)) = rest.split_once('\n') else { return t.to_string() };
+    if !matches!(lang.trim(), "" | "markdown" | "md") {
+        return t.to_string();
+    }
+    match body.trim_end().strip_suffix("```") {
+        Some(inner) if !inner.contains("```") => inner.trim().to_string(),
         _ => t.to_string(),
     }
 }
@@ -183,6 +197,7 @@ pub mod tests {
         let p = prompt(&dir.join("t.md")).unwrap();
         assert!(p.starts_with("Тебе дана расшифровка"));
         assert!(p.ends_with("Расшифровка:\n\nпервая\nвторая\n"), "{p}");
+        assert!(p.contains("Формат — Markdown") && p.contains("## Ключевые мысли"), "{p}");
         assert!(!p.contains(PLACEHOLDER));
     }
 
@@ -197,6 +212,15 @@ pub mod tests {
         assert_eq!(m.obvious().map(String::as_str), Some("a"), "единственная пригодная");
         let m = Models { all: s(&["a", "b"]), chat: s(&["a", "b"]), loaded: Some(s(&["a", "b"])) };
         assert_eq!(m.obvious(), None, "две загружены — спросить");
+    }
+
+    #[test]
+    fn code_fence_around_answer_is_removed() {
+        assert_eq!(strip_fence("```markdown\n## Краткое резюме\n\nТекст\n```"), "## Краткое резюме\n\nТекст");
+        assert_eq!(strip_fence("```\n- пункт\n```\n"), "- пункт");
+        let code = "```rust\nfn main() {}\n```";
+        assert_eq!(strip_fence(code), code, "чужой язык — не обёртка");
+        assert_eq!(strip_fence("## Итог\n\n```\nx\n```"), "## Итог\n\n```\nx\n```");
     }
 
     #[test]

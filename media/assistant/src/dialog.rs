@@ -274,12 +274,16 @@ fn system_prompt() -> String {
      list_llm_models: если obvious не null — summarize без model (сервер возьмёт её сам); если null — \
      спроси, какую из chat_models взять (загруженные — loaded_chat_models), и остановись. «нет», «no», «n» — \
      write_summary_prompt; LM Studio не вызывай.\n\
-     5. next.step = done — саммари уже есть и переиспользуется. summarize с force=true — только если пользователь \
+     5. next.step = telegram_summary — после саммари вызови telegram_summary: он делает \
+     output-summary-telegram.md (вставить в приложение Telegram и отправить — оформление появится само) и \
+     output-summary-telegram-bot.md (MarkdownV2 для бота, руками не вставлять), ничего никуда не отправляет; в \
+     отчёте скажи, какой файл для чего и помещается ли саммари в одно сообщение.\n\
+     6. next.step = done — саммари уже есть и переиспользуется. summarize с force=true — только если пользователь \
      прямо попросил сделать саммари заново.\n\
-     6. Ошибка инструмента или задание failed — не обходи её: не меняй порядок шагов, не запускай шаг повторно сам, \
+     7. Ошибка инструмента или задание failed — не обходи её: не меняй порядок шагов, не запускай шаг повторно сам, \
      не выдумывай файлы. Скажи пользователю, что случилось (с цифрами из ответа: длительности, какие чанки) и что \
      сохранено; повторить шаг — только если он попросит.\n\
-     7. next.step = nothing — обрабатывать нечего: скажи это; list_recordings покажет, где есть записи.\n\
+     8. next.step = nothing — обрабатывать нечего: скажи это; list_recordings покажет, где есть записи.\n\
      Опирайся только на ответы инструментов.\n\n\
      Итоговый отчёт (когда обработка закончена или остановилась) — Markdown на русском:\n\
      - Переиспользовано — какие чекпоинты уже были (output.mp3, transcript-chunks/chunk-*.mp3, …).\n\
@@ -287,8 +291,9 @@ fn system_prompt() -> String {
      output-transcript.md»).\n\
      - Если конвертировали WebM или сверяли output.mp4 с WebM — строки «WebM duration: N seconds», «MP4 duration: N \
      seconds», «Duration check: OK» (или несовпадение).\n\
-     - Итоговые файлы — только те, что действительно есть по последнему inspect: output.mp4, output.mp3, \
-     transcript-chunks/, output-transcript.md, output-summary.md, output-summary-prompt.md.\n\
+     - Итоговые файлы — только те, что действительно есть по последнему inspect (файл есть, если его состояние \
+     не missing и не empty; output.mp4 в состоянии unverified тоже есть — он просто не сверялся заново): output.mp4, output.mp3, \
+     transcript-chunks/, output-transcript.md, output-summary.md, output-summary-telegram.md, output-summary-telegram-bot.md, output-summary-prompt.md.\n\
      - Модель LM Studio, если саммари делалось; если создан только промпт — «LM Studio не вызывался».\n\
      Вопрос пользователю — коротко, без отчёта."
         .to_string()
@@ -325,6 +330,7 @@ mod tests {
         let p = system_prompt();
         assert!(p.contains("Начинай с inspect"));
         assert!(p.contains("«Сделать саммари? (да/нет)»"));
+        assert!(p.contains("telegram_summary") && p.contains("ничего никуда не отправляет"));
         assert!(p.contains("LM Studio не вызывай"));
         assert!(p.contains("Duration check: OK"));
         assert!(user_message("обработай", "rec", true).starts_with("Каталог записи: `rec`"));

@@ -21,6 +21,7 @@ mod media;
 mod recording;
 mod steps;
 mod summary;
+mod telegram;
 mod transcribe;
 
 use std::path::PathBuf;
@@ -170,8 +171,9 @@ impl MediaServer {
         name = "inspect",
         description = "Состояние каталога записи и СЛЕДУЮЩИЙ ШАГ (`next`): чекпоинты от позднего к раннему — \
             output-transcript.md, transcript-chunks/chunk-*.mp3, output.mp3, output.mp4 (сверка длительности с WebM), \
-            исходные MP4 и WebM; идущее задание. `next.step`: tool-шаг (`next.tool` + `next.args`), `choose_source` \
-            (спросить пользователя, варианты в `next.choices`), `ask_summary`, `done`, `wait_job`, `nothing`.",
+            исходные MP4 и WebM; output-summary.md и его версия для Telegram; идущее задание. `next.step`: tool-шаг \
+            (`next.tool` + `next.args`, в том числе `telegram_summary`), `choose_source` (спросить пользователя, \
+            варианты в `next.choices`), `ask_summary`, `done`, `wait_job`, `nothing`.",
         annotations(read_only_hint = true)
     )]
     async fn inspect(&self, Parameters(p): Parameters<InspectParams>) -> Result<String, String> {
@@ -263,6 +265,18 @@ impl MediaServer {
     }
 
     #[tool(
+        name = "telegram_summary",
+        description = "Саммари для Telegram из output-summary.md (библиотека telegramify-markdown): \
+            output-summary-telegram.md — для вставки в приложение Telegram руками (**жирный**, __курсив__ — \
+            приложение оформит при отправке), output-summary-telegram-bot.md — MarkdownV2 для Bot API. Никуда не \
+            отправляет. Возвращает длину в UTF-16 и помещается ли в одно сообщение.",
+        annotations(destructive_hint = false, idempotent_hint = true)
+    )]
+    async fn telegram_summary(&self, Parameters(p): Parameters<DirParams>) -> Result<String, String> {
+        out(self.media.telegram_summary(p.dir.as_deref()).await)
+    }
+
+    #[tool(
         name = "wait_job",
         description = "Ждать завершения задания (не дольше `seconds`). Возвращает задание: `state` running / \
             succeeded / failed, `progress`, `result` или `error`. Пока running — вызывай снова: долгая работа — \
@@ -302,7 +316,8 @@ impl ServerHandler for MediaServer {
                  summarize — задания: ответ сразу, итог — через wait_job(id); долгое выполнение не ошибка, не \
                  перезапускай. После задания снова inspect. choose_source — спроси пользователя, какой файл; \
                  ask_summary — спроси, делать ли саммари: да → summarize (модель из list_llm_models), нет → \
-                 write_summary_prompt. Пути — от корня MEDIA_ROOT.",
+                 write_summary_prompt. После саммари — telegram_summary: версия для вставки в Telegram и MarkdownV2 для \
+                 бота (ничего не отправляет). Пути — от корня MEDIA_ROOT.",
             )
     }
 }

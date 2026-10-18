@@ -1,0 +1,7 @@
+# Python-зависимости media-mcp: саммари для Telegram (src/telegram.rs, src/telegram.py).
+# python3 -m venv media/.venv && media/.venv/bin/pip install -r media/requirements.txt
+telegramify-markdown==1.4.0
+# telegramify-markdown 1.4.0 с pyromark 0.10 молча возвращает пустой текст, если во входе
+# есть `~` или `$` (события pyromark 0.10 — одноразовый итератор, а библиотека проходит
+# по ним дважды). С 0.9.x всё верно.
+pyromark==0.9.14
