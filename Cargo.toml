@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "web", "tui", "mcp/java-profiler-mcp", "mcp/scheduler-mcp", "mcp/documents-mcp", "mcp/git-mcp", "mcp/fs-mcp", "mcp/support-mcp", "assistant-tui", "assistant", "support/assistant", "files/assistant", "gateway"]
+members = ["core", "cli", "web", "tui", "mcp/java-profiler-mcp", "mcp/scheduler-mcp", "mcp/documents-mcp", "mcp/git-mcp", "mcp/fs-mcp", "mcp/support-mcp", "mcp/media-mcp", "assistant-tui", "assistant", "support/assistant", "files/assistant", "media/assistant", "gateway"]

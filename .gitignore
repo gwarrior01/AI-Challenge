@@ -10,6 +10,7 @@ agents.db-shm
 mcp.json
 !support/mcp.json
 !files/mcp.json
+!media/mcp.json
 scheduler.db
 scheduler.db-journal
 scheduler.db-wal
@@ -35,3 +36,4 @@ rag/support.db-wal
 rag/support.db-shm
 review.md
 files/runs/
+media/runs/

@@ -105,6 +105,22 @@
 | `discard_changes` | `paths?` | `discarded[]` |
 | `apply_changes` | `paths?` | `written[]`, `conflicts[]` {path, reason} |
 
+### `media` — `mcp/media-mcp` (stdio; `--http` — `127.0.0.1:8098/mcp`)
+
+Записи встреч; каталоги — от корня `MEDIA_ROOT`. `inspect` называет следующий шаг, остальные шаги вне очереди отказывают; долгие шаги возвращают задание (`job`), итог — `wait_job`. Подробно — [day-35-media-assistant.md](day-35-media-assistant.md).
+
+| Инструмент | Аргументы | Возвращает |
+|---|---|---|
+| `list_recordings` | `dir?`, `depth?` (3) | `root`, `recordings[]` {dir, stage} |
+| `inspect` | `dir?`, `source?` | чекпоинты (`transcript`, `chunks`, `mp3`, `mp4`, `sources`, `summary`, `summary_prompt`), `job`, `next` {step, tool, args, why, choices} |
+| `probe` | `dir?`, `file` | `duration`, `seconds`, `clock` |
+| `convert_to_mp4` / `extract_mp3` / `split_audio` / `transcribe` | `dir?` (+ `source?`, `webm?`) | `job` {id, kind, dir, state, progress, elapsed_sec} |
+| `list_llm_models` | — | `models`, `chat_models`, `loaded_chat_models`, `obvious` |
+| `summarize` | `dir?`, `model?`, `force?` | `job` |
+| `write_summary_prompt` | `dir?` | `created`, `chars`, `lm_studio_called` |
+| `wait_job` | `id`, `seconds?` (60, до 600) | задание: `state`, `progress`, `result` / `error` |
+| `job_status` | `id?` | задание или `jobs[]` |
+
 ### `java-profiler` — `mcp/java-profiler-mcp` (`127.0.0.1:8091/mcp`)
 
 `java_list_processes`, `java_process_info(pid)`, `java_thread_dump(pid, max_threads, include_system)`, `java_heap_histogram(pid, top)`, `java_profile(pid, duration_sec, views)` — всё только чтение, через `jps`/`jcmd`/`jfr`.

@@ -11,4 +11,5 @@
 | [api.md](api.md) | HTTP API веб-интерфейса, инструменты собственных MCP-серверов, API шлюза `llm-gateway` |
 | [development.md](development.md) | Сборка, тесты, запуск, переменные окружения, соглашения по коду, как добавить MCP-сервер |
 | [developer-assistant.md](developer-assistant.md) | Ассистент разработчика: `/help`, RAG по документации, MCP-сервер git |
+| [day-35-media-assistant.md](day-35-media-assistant.md) | Ассистент записей `media-assistant`: видео → MP3 → транскрипт → саммари через MCP-сервер `media`; чекпоинты и ожидание `ffmpeg` — в коде сервера, вопросы и отчёт — модель |
 | [day-34-file-assistant.md](day-34-file-assistant.md) | Ассистент файлов `file-assistant`: цель словами → поиск, чтение, правки через MCP-сервер `fs`, дифф, `/apply`, сохранённые запуски |
