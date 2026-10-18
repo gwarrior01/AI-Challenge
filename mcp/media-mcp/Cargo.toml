@@ -1,0 +1,27 @@
+[package]
+name = "media-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Серверная часть rmcp: по умолчанию stdio (клиент сам запускает сервер
+# дочерним процессом), с `--http` — Streamable HTTP, как у остальных своих серверов.
+rmcp = { version = "3.4", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "io-std", "io-util", "fs", "sync", "time", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Транскрибатор (multipart) и LM Studio (OpenAI-совместимый API).
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# Имена файлов macOS — в NFD, выбор пользователя — в NFC: сравнение без учёта формы.
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+# Поддельный сервис распознавания в тестах принимает multipart.
+axum = { version = "0.7", features = ["multipart"] }

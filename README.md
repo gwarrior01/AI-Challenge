@@ -294,6 +294,18 @@ cargo run -p file-assistant -- run "обнови README по коду" --apply
 
 The model's edits never hit the disk on their own: `fs-mcp` keeps them in an overlay (reads and searches see them), `pending_changes` turns them into a git-style unified diff, and only the assistant's code — on `/apply` or `--apply`, not the model — writes them, refusing files that changed on disk in the meantime. Every run is saved to `files/runs/<id>/` (goal, report, `changes.patch` for `git apply`, every tool call, model and temperature 0 by default) so it can be checked and repeated; only the latest `FILES_RUNS_KEEP` (50) runs are kept, older ones are pruned; ready-made goals live in `files/scenarios/` (find usages, sync docs with code, generate a changelog, check invariants). Tools, sandbox rules and settings: [`docs/day-34-file-assistant.md`](docs/day-34-file-assistant.md).
 
+#### Media assistant: meeting recording → transcript → summary (`media-assistant`, `media-mcp`)
+
+An assistant that takes a book-club recording from video to summary: WebM/MP4 → `output.mp4` → `output.mp3` → 5-minute MP3 chunks → `output-transcript.md` (local transcription service) → `output-summary.md` (LM Studio, Markdown) → Telegram versions via the Python library [telegramify-markdown](https://github.com/sudoskys/telegramify-markdown): `output-summary-telegram.md` to paste into the Telegram app (`**bold**`, `__italic__` — the app formats them on send) and `output-summary-telegram-bot.md` in MarkdownV2 for the Bot API — nothing is sent or `output-summary-prompt.md`. It replaces a Claude Code/Codex skill whose rules — resume from the latest valid checkpoint, wait for `ffmpeg` to exit rather than trust a growing file, check the MP4 duration against the WebM, always transcribe every chunk — now live in code of its own MCP server `mcp/media-mcp`, not in the model's memory.
+
+```bash
+MEDIA_ROOT=~/Recordings cargo run -p media-assistant 2026-10-15        # TUI: «обработай», answers, /dir, /status, /jobs
+MEDIA_ROOT=~/Recordings cargo run -p media-assistant -- run 2026-10-15 --summary yes
+cargo run -p media-mcp -- --http                                        # the same tools for Claude Code & co: 127.0.0.1:8098/mcp
+```
+
+`inspect` finds the latest valid checkpoint and names the next step; every other tool refuses to run out of turn. Conversion, extraction, splitting, transcription and summary are server jobs — one per recording folder, success only on exit code 0; the assistant's code (not the model) waits for them via `wait_job`, shows the progress (`12:01 из 58:10`, `чанки: 7 из 14`) and hands the model the outcome. The model drives the steps, asks where a choice is needed (which WebM, «Сделать саммари? (да/нет)», which LM Studio model unless exactly one is loaded) and writes the report. Dialogues are saved to `media/runs/<id>/`. Tools, checkpoint rules and settings: [`docs/day-35-media-assistant.md`](docs/day-35-media-assistant.md).
+
 #### Own MCP server: documents (tool composition)
 
 `mcp/documents-mcp/` is the third own server: three separate tools that form one chain — the first gets the data, the second processes it, the third saves the result. The server has no "run everything" tool on purpose: the chain is composed by the agent, which plans the three calls and then makes them one after another, passing the id from one result into the next call's arguments.
@@ -742,13 +754,15 @@ mcp.example.json  — example MCP server config (copy to mcp.json)
 mcp/              — this repo's own MCP servers, one folder each:
   java-profiler-mcp/ — profiling Java apps (Streamable HTTP): src/jvm.rs — JDK tools and JVM access, src/parse.rs — output parsing, demo/Busy.java — demo app to profile
   scheduler-mcp/     — deferred and periodic jobs (Streamable HTTP): src/store.rs — SQLite, src/scheduler.rs — the run loop, src/actions.rs — reminder/http/mcp_tool, src/metrics.rs — metric extraction and aggregation, src/time.rs — durations and moments
+  media-mcp/      — meeting recordings: video → MP3 → chunks → transcript → summary (stdio or HTTP 8098): src/recording.rs — checkpoints and the next step, src/jobs.rs — background jobs, src/steps.rs — the steps, src/transcribe.rs, src/summary.rs
   documents-mcp/  — PDF → Markdown → summary → file (Streamable HTTP): src/summarize.rs — LLM/extractive summary, src/store.rs — content-addressed artifacts, src/steps.rs — the steps (PDF or the agent's own Markdown → summary → file), demo/mcp-report.pdf — sample PDF
 web/              — llm-web: web interface (axum), src/index.html: chat/tasks/agents page, src/rag.rs: the RAG tab's API
 tui/              — llm-tui: terminal interface (ratatui)
 gateway/          — llm-gateway: private AI service over a local LLM — src/proxy.rs — the OpenAI-compatible endpoints, src/limits.rs — rpm and the queue to the slots, src/config.rs — gateway.toml, src/loadtest.rs — the network check, src/chat.html — the chat page; deploy/ — server setup, systemd units, push.sh; report.md — measurements
 profiles/         — personalization profile markdown files (see "Personalization: profiles" above), one per person/persona — profiles/default.md ships as an editable template
 rag/              — eval.json — control questions for comparing chunking strategies, compare.md — the comparison report (index.db — the index itself, uploads/ — uploaded documents; both git-ignored)
-assistant-tui/    — shared TUI pieces of code-assistant and file-assistant: feed with Markdown and MCP call badges, input line with history, command highlighting
+assistant-tui/    — shared TUI pieces of code-assistant, file-assistant and media-assistant: feed with Markdown and MCP call badges, input line with history, command highlighting
 files/            — file-assistant: assistant/ — the crate (src/task.rs — the goal → tools → report loop, src/session.rs — model and MCP, src/runs.rs — saved runs, src/tui.rs), scenarios/ — ready-made goals, mcp.json — its MCP servers (fs, git), runs/ — saved runs (git-ignored)
+media/            — media-assistant: assistant/ — the crate (src/dialog.rs — the conversation loop that waits for jobs itself, src/session.rs — model and MCP, src/runs.rs — saved dialogues, src/tui.rs), mcp.json — its MCP server (media), runs/ — saved dialogues (git-ignored)
 invariants/       — hard invariant markdown files (see "Invariants: hard rules the assistant refuses to break" above), one per rule — this repo ships stack.md/storage.md/secrets.md as filled-in examples
 ```
